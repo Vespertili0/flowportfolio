@@ -1,0 +1,146 @@
+name: Tests
+
+on:
+  pull_request:
+    branches: [ dev ]
+    types: [ opened, synchronize, labeled ]
+
+# Prevent redundant pipeline runs on rapid force-pushes
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Ensure linting and auto-fix immediately
+  lint-and-auto-fix:
+    name: Lint & Auto-fix
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout Feature Branch
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.head_ref || github.event.pull_request.head.ref }}
+          token: ${{ secrets.BOT_PAT_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv pip install pre-commit
+
+      - name: Run pre-commit auto-fixes
+        run: uv run pre-commit run --all-files || true
+
+      - name: Commit and push pre-commit auto-fixes
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff-index --quiet HEAD || (git commit -m "style: pre-commit auto-fixes" && git push)
+
+      - name: Verify pre-commit check passes
+        uses: pre-commit/action@v3.0.1
+
+  # Pytest runs, and conditionally uploads coverage
+  pytest:
+    name: Pytest (Python ${{ matrix.python-version }})
+    needs: lint-and-auto-fix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - name: Checkout fresh code
+        uses: actions/checkout@v7
+
+      - name: Install uv & Set up Python ${{ matrix.python-version }}
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          uv pip install pytest pytest-cov
+          uv pip install -e .
+
+      - name: Set coverage core
+        run: |
+          echo "COVERAGE_CORE=sysmon" >> $GITHUB_ENV
+
+      - name: Run Pytest (Coverage on 3.12 only)
+        run: |
+          if [ "${{ matrix.python-version }}" == "3.12" ]; then
+            uv run pytest --cov=flowportfolio --cov-branch --cov-report=xml
+          else
+            uv run pytest
+          fi
+
+      - name: Upload coverage reports to Codecov
+        if: matrix.python-version == '3.12'
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          verbose: true
+          fail_ci_if_error: true
+          skip_validation: true
+
+  # Conditional Jules assessment
+  jules:
+    needs: pytest
+    if: contains(github.event.pull_request.labels.*.name, 'gatecheck')
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+      statuses: write
+    steps:
+      # Sparse-checkout: fetch ONLY .github/scripts/ from the trusted base branch
+      # (refs/heads/dev). This ensures the script executed with privileged secrets
+      # is always the maintainer-approved version on dev, never the PR author's copy.
+      - name: Checkout trusted scripts from base branch
+        uses: actions/checkout@v7
+        with:
+          ref: refs/heads/dev
+          sparse-checkout: .github/scripts/
+          sparse-checkout-cone-mode: false
+
+      # Soft-skip: if the script hasn't landed on dev yet (e.g. this PR introduces it),
+      # emit a warning and skip the review rather than blocking the job entirely.
+      - name: Verify trusted script is present
+        id: check-script
+        run: |
+          if [ ! -f .github/scripts/jules_dev_pr_review.mjs ]; then
+            echo "::warning::jules_dev_pr_review.mjs not found on dev — jules review skipped."
+            echo "script_exists=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "script_exists=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Node.js
+        if: steps.check-script.outputs.script_exists == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install dependencies
+        if: steps.check-script.outputs.script_exists == 'true'
+        run: npm install @google/jules-sdk
+
+      - name: Run custom Jules review script
+        if: steps.check-script.outputs.script_exists == 'true'
+        run: node .github/scripts/jules_dev_pr_review.mjs
+        env:
+          JULES_API_KEY: ${{ secrets.JULES_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_HEAD_REF: ${{ github.head_ref }}
+          GITHUB_BASE_REF: ${{ github.base_ref }}

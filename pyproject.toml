@@ -1,0 +1,23 @@
+[project]
+name = "flowportfolio"
+version = "0.1.0"
+description = "A fluent portfolio experimentation API built on top of skfolio."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "Vespertili0", email = "[EMAIL_ADDRESS]" },
+]
+
+dependencies = [
+    "numpy>=2.4.6",
+    "pandas>=3.0.3",
+    "scikit-learn>=1.9.0",
+    "skfolio>=0.20.1",
+    "yfinance>=1.5.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/Vespertili0/flowportfolio"
+Repository = "https://github.com/Vespertili0/flowportfolio"
+Issues = "https://github.com/Vespertili0/flowportfolio/issues"
