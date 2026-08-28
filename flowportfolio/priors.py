@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import re
-import pandas as pd
-from skfolio.prior import EmpiricalPrior, EntropyPooling, SyntheticData, BasePrior
+from skfolio.prior import EmpiricalPrior, EntropyPooling, SyntheticData
 from skfolio.moments import DenoiseCovariance, ShrunkMu
 from skfolio.distribution import VineCopula
 
@@ -37,7 +36,9 @@ class PriorSynthesiser:
 
     def __init__(self, universe: Universe) -> None:
         if not isinstance(universe, Universe):
-            raise TypeError("universe must be an instance of flowportfolio.core.universe.Universe")
+            raise TypeError(
+                "universe must be an instance of flowportfolio.core.universe.Universe"
+            )
         self._universe = universe
         self._views: list[dict] = []
 
@@ -69,7 +70,7 @@ class PriorSynthesiser:
             raise ValueError("confidence must be between 0.0 and 1.0")
 
         # Extract uppercase alphanumeric identifiers resembling tickers.
-        extracted_tickers = re.findall(r'[A-Z][A-Z0-9_.]*', view_str)
+        extracted_tickers = re.findall(r"[A-Z][A-Z0-9_.]*", view_str)
         valid_tickers = set(self._universe.tickers)
 
         # Check that the view references at least one known ticker — catches
@@ -119,8 +120,7 @@ class PriorSynthesiser:
             mu_estimator = ShrunkMu()
 
         return EmpiricalPrior(
-            covariance_estimator=covariance_estimator,
-            mu_estimator=mu_estimator
+            covariance_estimator=covariance_estimator, mu_estimator=mu_estimator
         )
 
     def build_entropy_prior(self) -> EntropyPooling:
@@ -142,7 +142,7 @@ class PriorSynthesiser:
 
         views = [v["view"] for v in self._views]
         tau = [v["confidence"] for v in self._views]
-        
+
         return EntropyPooling(views=views, tau=tau)
 
     def build_synthetic_prior(self, n_samples: int = 5000) -> SyntheticData:
@@ -168,8 +168,5 @@ class PriorSynthesiser:
         """
         if n_samples < 100:
             raise ValueError(f"n_samples must be at least 100, got {n_samples}")
-            
-        return SyntheticData(
-            distribution_estimator=VineCopula(),
-            n_samples=n_samples
-        )
+
+        return SyntheticData(distribution_estimator=VineCopula(), n_samples=n_samples)

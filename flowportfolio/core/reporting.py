@@ -51,10 +51,10 @@ class Reporter:
             is narrow.
         """
         # 1. Derive tag_list ensuring baseline is included
-        tag_list = list(dict.fromkeys(
-            p.tag for p in self._population if p.tag is not None
-        ))
-        
+        tag_list = list(
+            dict.fromkeys(p.tag for p in self._population if p.tag is not None)
+        )
+
         if baseline_tag not in tag_list:
             tag_list.insert(0, baseline_tag)
 
@@ -76,14 +76,12 @@ class Reporter:
         # Find the strategy (tag) with the highest median CVAR_RATIO
         best_tag = max(
             set(tag_list),
-            key=lambda t: np.median([
-                p.cvar_ratio for p in self._population if p.tag == t
-            ])
+            key=lambda t: np.median(
+                [p.cvar_ratio for p in self._population if p.tag == t]
+            ),
         )
-        
-        best_portfolios = Population([
-            p for p in self._population if p.tag == best_tag
-        ])
+
+        best_portfolios = Population([p for p in self._population if p.tag == best_tag])
         fig3 = best_portfolios.plot_composition()
         fig3.show()
 
@@ -123,11 +121,17 @@ class Reporter:
         """
         stress_pop = Population([p for p in self._population if p.tag == stress_tag])
         if not stress_pop:
-            raise ValueError(f"Tag '{stress_tag}' matched no portfolios in the population.")
+            raise ValueError(
+                f"Tag '{stress_tag}' matched no portfolios in the population."
+            )
 
-        baseline_pop = Population([p for p in self._population if p.tag == baseline_tag])
+        baseline_pop = Population(
+            [p for p in self._population if p.tag == baseline_tag]
+        )
         if not baseline_pop:
-            raise ValueError(f"Tag '{baseline_tag}' matched no portfolios in the population.")
+            raise ValueError(
+                f"Tag '{baseline_tag}' matched no portfolios in the population."
+            )
 
         combined = stress_pop + baseline_pop
 
@@ -142,5 +146,7 @@ class Reporter:
             measure_list=[RiskMeasure.MAX_DRAWDOWN],
             tag_list=[stress_tag, baseline_tag],
         )
-        fig2.update_layout(title=f"Max Drawdown Distribution: {stress_tag} vs {baseline_tag}")
+        fig2.update_layout(
+            title=f"Max Drawdown Distribution: {stress_tag} vs {baseline_tag}"
+        )
         fig2.show()

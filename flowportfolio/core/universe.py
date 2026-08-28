@@ -78,23 +78,17 @@ class Universe:
         if not isinstance(metadata, dict):
             raise TypeError("metadata must be a dict.")
         if not all(
-            isinstance(k, str) and isinstance(v, str)
-            for k, v in metadata.items()
+            isinstance(k, str) and isinstance(v, str) for k, v in metadata.items()
         ):
-            raise TypeError(
-                "metadata must map string keys to string values."
-            )
+            raise TypeError("metadata must map string keys to string values.")
 
         # --- fees validation ---
         if not isinstance(fees, dict):
             raise TypeError("fees must be a dict.")
         if not all(
-            isinstance(k, str) and isinstance(v, (int, float))
-            for k, v in fees.items()
+            isinstance(k, str) and isinstance(v, (int, float)) for k, v in fees.items()
         ):
-            raise TypeError(
-                "fees must map string keys to numeric values."
-            )
+            raise TypeError("fees must map string keys to numeric values.")
 
         # --- coverage checks ---
         missing_metadata = set(tickers) - set(metadata.keys())
@@ -105,9 +99,7 @@ class Universe:
 
         missing_fees = set(tickers) - set(fees.keys())
         if missing_fees:
-            raise ValueError(
-                f"Missing fees entries for tickers: {missing_fees}"
-            )
+            raise ValueError(f"Missing fees entries for tickers: {missing_fees}")
 
         self._tickers: list[str] = list(tickers)
         self._metadata: dict[str, str] = dict(metadata)
@@ -175,9 +167,7 @@ class Universe:
             If ``fetch_data()`` has not yet been called.
         """
         if self._returns is None:
-            raise ValueError(
-                "Returns are not yet available. Call fetch_data() first."
-            )
+            raise ValueError("Returns are not yet available. Call fetch_data() first.")
         return self._returns
 
     # ------------------------------------------------------------------
@@ -242,29 +232,21 @@ class Universe:
         if isinstance(data.columns, pd.MultiIndex):
             level_zero = data.columns.get_level_values(0)
             if "Close" not in level_zero:
-                raise ValueError(
-                    "Downloaded data has no 'Close' price level."
-                )
+                raise ValueError("Downloaded data has no 'Close' price level.")
             prices = data["Close"]
         else:
             if "Close" in data.columns:
                 prices = pd.DataFrame({self._tickers[0]: data["Close"]})
-            elif (
-                len(self._tickers) == 1
-                and self._tickers[0] in data.columns
-            ):
+            elif len(self._tickers) == 1 and self._tickers[0] in data.columns:
                 prices = data[[self._tickers[0]]]
             else:
                 raise ValueError(
-                    "Downloaded data has no 'Close' column and no "
-                    "ticker-named column."
+                    "Downloaded data has no 'Close' column and no ticker-named column."
                 )
 
         missing_tickers = set(self._tickers) - set(prices.columns)
         if missing_tickers:
-            raise ValueError(
-                f"Download did not return data for: {missing_tickers}"
-            )
+            raise ValueError(f"Download did not return data for: {missing_tickers}")
 
         # Reorder columns to match the original tickers ordering.
         prices = prices[self._tickers]
@@ -303,17 +285,13 @@ class Universe:
             disjoint trading histories.
         """
         if self._returns is None:
-            raise ValueError(
-                "Returns are not available. Call fetch_data() first."
-            )
+            raise ValueError("Returns are not available. Call fetch_data() first.")
 
         first_valid_indices = []
         for col in self._returns.columns:
             fvi = self._returns[col].first_valid_index()
             if fvi is None:
-                raise ValueError(
-                    f"Asset '{col}' has no valid return observations."
-                )
+                raise ValueError(f"Asset '{col}' has no valid return observations.")
             first_valid_indices.append(fvi)
 
         latest_start = max(first_valid_indices)

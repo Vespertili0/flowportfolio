@@ -76,9 +76,7 @@ class PortfolioDeltaEngine:
                 "current_weights values must all be numeric (int or float)."
             )
         if not all(isinstance(v, (int, float)) for v in target_weights.values()):
-            raise TypeError(
-                "target_weights values must all be numeric (int or float)."
-            )
+            raise TypeError("target_weights values must all be numeric (int or float).")
 
         # --- sum-to-one validation ---
         current_sum = sum(current_weights.values())
@@ -219,9 +217,7 @@ class PortfolioDeltaEngine:
             been populated (i.e. ``fetch_data()`` has not been called).
         """
         if not isinstance(population, Population):
-            raise TypeError(
-                "population must be a skfolio.Population instance."
-            )
+            raise TypeError("population must be a skfolio.Population instance.")
         if len(population) == 0:
             raise ValueError("population must not be empty.")
 
@@ -294,9 +290,7 @@ class PortfolioDeltaEngine:
                 f"brokerage_bps must be non-negative; got {brokerage_bps}."
             )
         if slippage_bps < 0:
-            raise ValueError(
-                f"slippage_bps must be non-negative; got {slippage_bps}."
-            )
+            raise ValueError(f"slippage_bps must be non-negative; got {slippage_bps}.")
 
         fees = self._universe.fees
         total_bps = brokerage_bps + slippage_bps
@@ -328,7 +322,13 @@ class PortfolioDeltaEngine:
 
         df = pd.DataFrame(
             rows,
-            columns=["ticker", "turnover", "transaction_cost", "annual_ter", "total_friction"],
+            columns=[
+                "ticker",
+                "turnover",
+                "transaction_cost",
+                "annual_ter",
+                "total_friction",
+            ],
         )
 
         # Append summary row

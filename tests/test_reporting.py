@@ -13,6 +13,7 @@ from skfolio.portfolio import MultiPeriodPortfolio
 
 from flowportfolio.core.reporting import Reporter
 
+
 def _make_mock_portfolio(tag: str, cvar_ratio: float = 1.0) -> MagicMock:
     p = MagicMock(spec=MultiPeriodPortfolio)
     p.__class__ = MultiPeriodPortfolio
@@ -20,9 +21,11 @@ def _make_mock_portfolio(tag: str, cvar_ratio: float = 1.0) -> MagicMock:
     p.cvar_ratio = cvar_ratio
     return p
 
+
 # ---------------------------------------------------------------------------
 # Initialisation
 # ---------------------------------------------------------------------------
+
 
 def test_init_valid() -> None:
     """Test Reporter accepts a valid Population instance."""
@@ -36,9 +39,11 @@ def test_init_wrong_type() -> None:
     with pytest.raises(TypeError, match="population must be a skfolio.Population"):
         Reporter(population="not_a_population")  # type: ignore
 
+
 # ---------------------------------------------------------------------------
 # Tearsheet Generation
 # ---------------------------------------------------------------------------
+
 
 @patch.object(Population, "plot_composition")
 @patch.object(Population, "plot_distribution")
@@ -57,7 +62,7 @@ def test_generate_tearsheet_calls_all_plots(
 
     # Setup population with dummy portfolios
     p1 = _make_mock_portfolio("Baseline", 1.0)
-    
+
     pop = MagicMock(spec=Population)
     pop.__iter__.return_value = [p1]
     reporter = Reporter(pop)
@@ -81,18 +86,18 @@ def test_generate_tearsheet_calls_show(
     fig1 = MagicMock()
     fig2 = MagicMock()
     fig3 = MagicMock()
-    
+
     mock_boxplot.return_value = fig1
     mock_distribution.return_value = fig2
     mock_composition.return_value = fig3
 
     p1 = _make_mock_portfolio("Baseline", 1.0)
-    
+
     pop = MagicMock(spec=Population)
     pop.__iter__.return_value = [p1]
     pop.boxplot_measure.return_value = fig1
     pop.plot_distribution.return_value = fig2
-    
+
     reporter = Reporter(pop)
     reporter.generate_tearsheet()
 
@@ -117,7 +122,7 @@ def test_tag_list_includes_baseline(
 
     # Population without Baseline
     p1 = _make_mock_portfolio("StratA", 1.0)
-    
+
     pop = MagicMock(spec=Population)
     pop.__iter__.return_value = [p1]
     reporter = Reporter(pop)
@@ -146,11 +151,11 @@ def test_best_strategy_selection(
     # StratA has lower CVAR_RATIO (0.5)
     pa1 = _make_mock_portfolio("StratA", 0.4)
     pa2 = _make_mock_portfolio("StratA", 0.6)
-    
+
     # StratB has higher CVAR_RATIO (1.5)
     pb1 = _make_mock_portfolio("StratB", 1.4)
     pb2 = _make_mock_portfolio("StratB", 1.6)
-    
+
     # Baseline (must exist to prevent np.median from returning NaN on empty lists)
     p_base = _make_mock_portfolio("Baseline", 0.0)
 
@@ -158,7 +163,7 @@ def test_best_strategy_selection(
     pop.__iter__.return_value = [p_base, pa1, pa2, pb1, pb2]
     pop.boxplot_measure.return_value = fig_mock
     pop.plot_distribution.return_value = fig_mock
-    
+
     reporter = Reporter(pop)
     reporter.generate_tearsheet()
 
@@ -186,7 +191,7 @@ def test_custom_baseline_tag(
     mock_composition.return_value = fig_mock
 
     p1 = _make_mock_portfolio("MyBaseline", 1.0)
-    
+
     pop = MagicMock(spec=Population)
     pop.__iter__.return_value = [p1]
     reporter = Reporter(pop)
