@@ -5,9 +5,7 @@ description = "A fluent portfolio experimentation API built on top of skfolio."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-authors = [
-    { name = "Vespertili0", email = "[EMAIL_ADDRESS]" },
-]
+authors = [{ name = "Vespertili0"}]
 
 dependencies = [
     "numpy>=2.4.6",
