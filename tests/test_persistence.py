@@ -77,7 +77,7 @@ def test_save_snapshot_os_error(manager, dummy_population, tmp_path):
     os.chmod(read_only_dir, 0o444)
 
     try:
-        with pytest.raises(OSError, match="Cannot create directory"):
+        with pytest.raises(OSError, match="Cannot write file to"):
             manager.save_snapshot(dummy_population, str(filepath))
     finally:
         # restore permissions to allow cleanup

@@ -62,7 +62,7 @@ class PersistenceManager:
             with path.open("w", encoding="utf-8") as f:
                 json.dump(data, f, indent=4)
         except OSError as e:
-            raise OSError(f"Cannot create directory {path.parent}") from e
+            raise OSError(f"Cannot write file to {path}") from e
 
     def load_snapshot(self, filepath: str) -> dict:
         """Load a JSON snapshot dict from the specified filepath.
@@ -99,7 +99,9 @@ class PersistenceManager:
             raise TypeError("population must be a skfolio.Population instance.")
 
         if label:
-            filename = f"{label}.json"
+            # Sanitize label to prevent path traversal vulnerabilities
+            safe_label = Path(label).name
+            filename = f"{safe_label}.json"
         else:
             now = datetime.now(timezone.utc)
             year, week, _ = now.isocalendar()
@@ -145,7 +147,9 @@ class PersistenceManager:
                 if timestamp_str.endswith("Z"):
                     timestamp_str = timestamp_str[:-1] + "+00:00"
                 ts = pd.to_datetime(timestamp_str)
-            except Exception:
+            except Exception as e:
+                import warnings
+                warnings.warn(f"Failed to parse timestamp {timestamp_str} in file {file}: {e}")
                 continue
 
             for p_data in data.get("portfolios", []):

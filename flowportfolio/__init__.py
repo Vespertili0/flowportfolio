@@ -8,7 +8,7 @@ from flowportfolio.delta import PortfolioDeltaEngine
 from flowportfolio.priors import PriorSynthesiser
 from flowportfolio.strategies import StrategyBuilder
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "__version__",
