@@ -149,7 +149,10 @@ class PersistenceManager:
                 ts = pd.to_datetime(timestamp_str)
             except Exception as e:
                 import warnings
-                warnings.warn(f"Failed to parse timestamp {timestamp_str} in file {file}: {e}")
+
+                warnings.warn(
+                    f"Failed to parse timestamp {timestamp_str} in file {file}: {e}"
+                )
                 continue
 
             for p_data in data.get("portfolios", []):
