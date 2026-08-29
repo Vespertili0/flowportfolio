@@ -19,7 +19,6 @@ from skfolio.model_selection import (
     OnlineGridSearch,
     online_predict,
 )
-from skfolio.moments import EWMu, EWCovariance
 from flowportfolio.core.universe import Universe
 
 
@@ -204,7 +203,7 @@ class PortfolioExperimentEngine:
                 n_jobs=self._n_jobs,
                 portfolio_params={"tag": name},
             )
-            
+
             collected.append(portfolio)
 
         return Population(collected)
@@ -272,7 +271,7 @@ class PortfolioExperimentEngine:
                 n_jobs=self._n_jobs,
                 portfolio_params={"tag": name},
             )
-            
+
             collected.append(portfolio)
 
         return Population(collected)

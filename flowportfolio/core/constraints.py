@@ -110,7 +110,7 @@ class ConstraintBuilder:
         for group in group_names:
             if group not in valid_groups:
                 raise ValueError(f"Group '{group}' not found in universe metadata.")
-        
+
         combined_str = " + ".join(group_names)
         self._constraints.append(f"{combined_str} <= {weight:.6g}")
         return self
@@ -145,18 +145,18 @@ class ConstraintBuilder:
         """
         if not (0.0 < limit <= 1.0):
             raise ValueError("Turnover limit must be between 0.0 (exclusive) and 1.0.")
-            
+
         missing_tickers = set(self._universe.tickers) - set(current_weights.keys())
         if missing_tickers:
             raise ValueError(f"Missing current weights for tickers: {missing_tickers}")
 
         for ticker in self._universe.tickers:
             current_weight = current_weights[ticker]
-            
+
             # Calculate bounds and clamp to [0.0, 1.0]
             lower_bound = max(0.0, current_weight - limit)
             upper_bound = min(1.0, current_weight + limit)
-            
+
             self._constraints.append(f"{ticker} >= {lower_bound:.6g}")
             self._constraints.append(f"{ticker} <= {upper_bound:.6g}")
 

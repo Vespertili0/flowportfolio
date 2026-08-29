@@ -57,7 +57,12 @@ from skfolio.measures import RiskMeasure
 # 1. Define and anchor the universe
 universe = Universe(
     tickers=["SPY", "QQQ", "AGG", "GLD"],
-    metadata={"SPY": "core", "QQQ": "satellite", "AGG": "defensive", "GLD": "defensive"},
+    metadata={
+        "SPY": "core",
+        "QQQ": "satellite",
+        "AGG": "defensive",
+        "GLD": "defensive",
+    },
     fees={"SPY": 0.0009, "QQQ": 0.0020, "AGG": 0.0003, "GLD": 0.0040},
 )
 universe.fetch_data(start="2022-01-01")
@@ -78,7 +83,9 @@ engine.add_strategy(
     estimator=MeanRisk(risk_free_rate=0.03, linear_constraints=constraints),
     grid={"risk_measure": [RiskMeasure.VARIANCE, RiskMeasure.SEMI_VARIANCE]},
 )
-population = engine.run_robustness_test(cv_type="walk_forward", train_size=252, test_size=63)
+population = engine.run_robustness_test(
+    cv_type="walk_forward", train_size=252, test_size=63
+)
 
 # 4. Generate visual tearsheet
 Reporter(population).generate_tearsheet(baseline_tag="CoreSatellite")
@@ -98,11 +105,9 @@ from flowportfolio import PriorSynthesiser
 synthesiser = PriorSynthesiser(universe)
 
 # Entropy Pooling prior from market views
-entropy_prior = (
-    synthesiser
-    .add_market_view("SPY > 0.05", confidence=0.8)
-    .build_entropy_prior()
-)
+entropy_prior = synthesiser.add_market_view(
+    "SPY > 0.05", confidence=0.8
+).build_entropy_prior()
 
 # Synthetic prior for stress-testing tail risk
 synthetic_prior = synthesiser.build_synthetic_prior(n_samples=5000)
@@ -120,8 +125,7 @@ from skfolio.optimization import MeanRisk, HierarchicalRiskParity
 builder = StrategyBuilder(constraints=constraints)
 
 pipeline = (
-    builder
-    .add_pre_selection(DropCorrelated(threshold=0.85))
+    builder.add_pre_selection(DropCorrelated(threshold=0.85))
     .add_cross_sectional(CSStandardScaler())
     .set_optimizer(
         optimizer=MeanRisk(linear_constraints=constraints),

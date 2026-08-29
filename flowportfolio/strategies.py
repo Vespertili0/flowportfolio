@@ -4,7 +4,6 @@ from sklearn.pipeline import Pipeline
 from skfolio.prior import BasePrior
 from skfolio.optimization import NestedClustersOptimization
 
-from flowportfolio.core.universe import Universe
 
 class StrategyBuilder:
     """Assembles skfolio-compatible pipeline estimators for portfolio optimisation.
@@ -39,7 +38,7 @@ class StrategyBuilder:
     ) -> None:
         if not isinstance(constraints, list):
             raise TypeError("constraints must be a list.")
-        
+
         self.constraints = constraints
         self.prior = prior
         self._pre_selection = []
@@ -70,9 +69,11 @@ class StrategyBuilder:
         TypeError
             If transformer does not implement fit_transform.
         """
-        if not hasattr(transformer, "fit_transform") or not callable(getattr(transformer, "fit_transform")):
+        if not hasattr(transformer, "fit_transform") or not callable(
+            getattr(transformer, "fit_transform")
+        ):
             raise TypeError("transformer must implement a fit_transform method.")
-        
+
         self._pre_selection.append(transformer)
         return self
 
@@ -99,9 +100,11 @@ class StrategyBuilder:
         TypeError
             If transformer does not implement fit_transform.
         """
-        if not hasattr(transformer, "fit_transform") or not callable(getattr(transformer, "fit_transform")):
+        if not hasattr(transformer, "fit_transform") or not callable(
+            getattr(transformer, "fit_transform")
+        ):
             raise TypeError("transformer must implement a fit_transform method.")
-        
+
         self._cross_sectional.append(transformer)
         return self
 
@@ -134,17 +137,17 @@ class StrategyBuilder:
         """
         if self._optimizer is not None:
             raise RuntimeError("set_optimizer called more than once without resetting.")
-            
+
         self._optimizer = optimizer
         self._fallbacks = fallbacks if fallbacks is not None else []
-        
+
         if self._fallbacks:
             setattr(self._optimizer, "raise_on_failure", False)
             setattr(self._optimizer, "fallback", self._fallbacks[0])
-            
+
         if hasattr(self._optimizer, "linear_constraints"):
             self._optimizer.linear_constraints = self.constraints
-            
+
         return self
 
     def build_pipeline(self) -> Pipeline:
@@ -165,20 +168,22 @@ class StrategyBuilder:
             If no optimizer has been set via set_optimizer().
         """
         if self._optimizer is None:
-            raise RuntimeError("No optimizer set. Call set_optimizer() before build_pipeline().")
-            
+            raise RuntimeError(
+                "No optimizer set. Call set_optimizer() before build_pipeline()."
+            )
+
         steps = []
         for i, transformer in enumerate(self._pre_selection):
             steps.append((f"pre_{i}", transformer))
-            
+
         for i, transformer in enumerate(self._cross_sectional):
             steps.append((f"cs_{i}", transformer))
-            
+
         if self.prior is not None and hasattr(self._optimizer, "prior_estimator"):
             self._optimizer.prior_estimator = self.prior
-            
+
         steps.append(("optimizer", self._optimizer))
-        
+
         return Pipeline(steps)
 
     def build_nco(
@@ -216,22 +221,26 @@ class StrategyBuilder:
         permitted_clusterers = ["ward", "complete", "single", "average", "kmeans"]
         if clusterer not in permitted_clusterers:
             raise ValueError(f"clusterer must be one of {permitted_clusterers}")
-            
+
         if hasattr(inner_estimator, "linear_constraints"):
             inner_estimator.linear_constraints = self.constraints
-            
+
         if self.prior is not None and hasattr(outer_estimator, "prior_estimator"):
             outer_estimator.prior_estimator = self.prior
-            
+
         if clusterer == "kmeans":
             from sklearn.cluster import KMeans
+
             clustering_estimator = KMeans()
         else:
             from skfolio.cluster import HierarchicalClustering, LinkageMethod
-            clustering_estimator = HierarchicalClustering(linkage_method=LinkageMethod(clusterer))
-            
+
+            clustering_estimator = HierarchicalClustering(
+                linkage_method=LinkageMethod(clusterer)
+            )
+
         return NestedClustersOptimization(
             inner_estimator=inner_estimator,
             outer_estimator=outer_estimator,
-            clustering_estimator=clustering_estimator
+            clustering_estimator=clustering_estimator,
         )
