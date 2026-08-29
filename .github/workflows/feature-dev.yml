@@ -44,7 +44,7 @@ jobs:
           git diff-index --quiet HEAD || (git commit -m "style: pre-commit auto-fixes" && git push)
 
       - name: Verify pre-commit check passes
-        uses: pre-commit/action@v3.0.1
+        run: uvx pre-commit run --all-files
 
   # Pytest runs, and conditionally uploads coverage
   pytest:
