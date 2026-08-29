@@ -72,7 +72,7 @@ Respond in Markdown using the following structure:
         console.log("✅ Workflow complete!");
 
     } catch (error) {
-        console.error("❌ Error running Jules release notes generation:", error);
+        console.error("❌ Error running Jules release notes generation:", error.stack || error.message || String(error));
         try {
             await postGitHubComment(
                 repo,
@@ -81,7 +81,7 @@ Respond in Markdown using the following structure:
                 `⚠️ **Jules release notes generation failed to complete.**\n\nPlease check the GitHub Actions workflow logs for more details.`
             );
         } catch (commentError) {
-            console.error("❌ Failed to post fallback error comment:", commentError);
+            console.error("❌ Failed to post fallback error comment:", commentError.stack || commentError.message || String(commentError));
         }
         process.exit(1);
     }
