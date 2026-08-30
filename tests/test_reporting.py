@@ -201,3 +201,140 @@ def test_custom_baseline_tag(
     # It shouldn't add "Baseline" if "MyBaseline" is the designated baseline
     assert "Baseline" not in boxplot_kwargs["tag_list"]
     assert "MyBaseline" in boxplot_kwargs["tag_list"]
+
+
+# ---------------------------------------------------------------------------
+# Headless API Methods
+# ---------------------------------------------------------------------------
+
+
+@patch.object(Population, "plot_composition")
+@patch.object(Population, "plot_distribution")
+@patch.object(Population, "boxplot_measure")
+def test_get_plotly_figures(
+    mock_boxplot: MagicMock,
+    mock_distribution: MagicMock,
+    mock_composition: MagicMock,
+) -> None:
+    """Test get_plotly_figures returns dict of figures and does not call show()."""
+    fig1 = MagicMock()
+    fig2 = MagicMock()
+    fig3 = MagicMock()
+    mock_boxplot.return_value = fig1
+    mock_distribution.return_value = fig2
+    mock_composition.return_value = fig3
+
+    p1 = _make_mock_portfolio("Baseline", 1.0)
+    pop = MagicMock(spec=Population)
+    pop.__iter__.return_value = [p1]
+    pop.boxplot_measure.return_value = fig1
+    pop.plot_distribution.return_value = fig2
+
+    reporter = Reporter(pop)
+    figs = reporter.get_plotly_figures()
+
+    assert isinstance(figs, dict)
+    assert set(figs.keys()) == {
+        "cvar_boxplot",
+        "drawdown_distribution",
+        "best_composition",
+    }
+    assert figs["cvar_boxplot"] is fig1
+    assert figs["drawdown_distribution"] is fig2
+    assert figs["best_composition"] is fig3
+
+    fig1.show.assert_not_called()
+    fig2.show.assert_not_called()
+    fig3.show.assert_not_called()
+
+
+def test_get_plotly_figures_empty() -> None:
+    """Test get_plotly_figures raises ValueError on empty population."""
+    pop = MagicMock(spec=Population)
+    pop.__iter__.return_value = []
+    reporter = Reporter(pop)
+    with pytest.raises(ValueError, match="Population contains no tagged portfolios."):
+        reporter.get_plotly_figures()
+
+
+def test_to_markdown_artifact() -> None:
+    """Test to_markdown_artifact generates expected markdown format."""
+    p1 = _make_mock_portfolio("Baseline", 1.0)
+    p1.name = "TestStrat"
+    p1.sharpe_ratio = 1.2345
+    p1.cvar = 0.05
+    p1.max_drawdown = 0.10
+    p1.sortino_ratio = 1.5
+    p1.weights = [0.4, 0.3, 0.2, 0.05, 0.05, 0.0]
+    p1.assets = ["A", "B", "C", "D", "E", "F"]
+
+    pop = MagicMock(spec=Population)
+    pop.__iter__.return_value = [p1]
+    pop.__len__.return_value = 1
+
+    reporter = Reporter(pop)
+    report = reporter.to_markdown_artifact()
+
+    assert "Portfolio Population Report" in report
+    assert "Generated:" in report
+    assert "TestStrat" in report
+    assert "1.2345" in report
+    assert "**Best Tag (by median CVaR Ratio):** Baseline" in report
+    assert "Top 5 Holdings:" in report
+    assert "A (40.00%)" in report
+
+
+def test_to_markdown_artifact_empty() -> None:
+    """Test to_markdown_artifact raises ValueError on empty population."""
+    pop = MagicMock(spec=Population)
+    pop.__iter__.return_value = []
+    pop.__len__.return_value = 0
+    reporter = Reporter(pop)
+    with pytest.raises(ValueError, match="Population is empty."):
+        reporter.to_markdown_artifact()
+
+
+def test_extract_metrics_dataframe() -> None:
+    """Test extract_metrics_dataframe returns a pandas DataFrame with exact columns."""
+    p1 = _make_mock_portfolio("Baseline", 1.0)
+    p1.name = "StratA"
+    p1.sharpe_ratio = 1.1
+    p1.sortino_ratio = 1.2
+    p1.cvar = 0.1
+    p1.max_drawdown = 0.2
+    p1.mean = 0.05
+
+    pop = MagicMock(spec=Population)
+    pop.__iter__.return_value = [p1]
+    pop.__len__.return_value = 1
+
+    reporter = Reporter(pop)
+    df = reporter.extract_metrics_dataframe()
+
+    import pandas as pd
+
+    assert isinstance(df, pd.DataFrame)
+    expected_cols = [
+        "name",
+        "tag",
+        "sharpe",
+        "sortino",
+        "cvar",
+        "max_drawdown",
+        "cvar_ratio",
+        "mean_return",
+    ]
+    assert list(df.columns) == expected_cols
+    assert len(df) == 1
+    assert df.iloc[0]["name"] == "StratA"
+    assert df.iloc[0]["sharpe"] == 1.1
+
+
+def test_extract_metrics_dataframe_empty() -> None:
+    """Test extract_metrics_dataframe raises ValueError on empty population."""
+    pop = MagicMock(spec=Population)
+    pop.__iter__.return_value = []
+    pop.__len__.return_value = 0
+    reporter = Reporter(pop)
+    with pytest.raises(ValueError, match="Population is empty. No metrics to extract."):
+        reporter.extract_metrics_dataframe()

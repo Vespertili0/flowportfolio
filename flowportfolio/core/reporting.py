@@ -8,6 +8,10 @@ plotting capabilities.
 from __future__ import annotations
 
 import numpy as np
+from datetime import datetime, timezone
+
+import pandas as pd
+import plotly.graph_objects as go
 from skfolio import Population, RatioMeasure, RiskMeasure
 
 
@@ -74,9 +78,12 @@ class Reporter:
 
         # 4. Plot 3: Composition plot for the best strategy
         # Find the strategy (tag) with the highest median CVAR_RATIO
+        valid_tags = [
+            t for t in set(tag_list) if any(p.tag == t for p in self._population)
+        ]
         best_tag = max(
-            set(tag_list),
-            key=lambda t: np.median(
+            valid_tags,
+            key=lambda t: np.nanmedian(
                 [p.cvar_ratio for p in self._population if p.tag == t]
             ),
         )
@@ -150,3 +157,167 @@ class Reporter:
             title=f"Max Drawdown Distribution: {stress_tag} vs {baseline_tag}"
         )
         fig2.show()
+
+    def get_plotly_figures(
+        self, baseline_tag: str = "Baseline"
+    ) -> dict[str, go.Figure]:
+        """Generate Plotly figures for strategy comparison without displaying them.
+
+        Returns:
+            dict[str, plotly.graph_objects.Figure]: Exact keys "cvar_boxplot",
+            "drawdown_distribution", and "best_composition".
+        Raises:
+            ValueError: "Population contains no tagged portfolios."
+        """
+        tag_list = list(
+            dict.fromkeys(p.tag for p in self._population if p.tag is not None)
+        )
+        if not tag_list:
+            raise ValueError("Population contains no tagged portfolios.")
+
+        if baseline_tag not in tag_list:
+            tag_list.insert(0, baseline_tag)
+
+        fig1 = self._population.boxplot_measure(
+            measure=RatioMeasure.CVAR_RATIO,
+            tag_list=tag_list,
+        )
+
+        fig2 = self._population.plot_distribution(
+            measure_list=[RatioMeasure.AVERAGE_DRAWDOWN_RATIO],
+            tag_list=tag_list,
+        )
+
+        valid_tags = [
+            t for t in set(tag_list) if any(p.tag == t for p in self._population)
+        ]
+        best_tag = max(
+            valid_tags,
+            key=lambda t: np.nanmedian(
+                [p.cvar_ratio for p in self._population if p.tag == t]
+            ),
+        )
+
+        best_portfolios = Population([p for p in self._population if p.tag == best_tag])
+        fig3 = best_portfolios.plot_composition()
+
+        return {
+            "cvar_boxplot": fig1,
+            "drawdown_distribution": fig2,
+            "best_composition": fig3,
+        }
+
+    def to_markdown_artifact(self, baseline_tag: str = "Baseline") -> str:
+        """Extract key population statistics into a formatted Markdown report.
+
+        Header must include ISO8601 timestamp. Table must include Sharpe, CVaR,
+        Max Drawdown, Sortino. Identify best strategy by median CVaR Ratio and
+        top 5 holdings.
+
+        Raises:
+            ValueError: If population is empty.
+        """
+        if not self._population:
+            raise ValueError("Population is empty.")
+
+        timestamp = datetime.now(timezone.utc).isoformat()
+
+        metrics = []
+        for p in self._population:
+            metrics.append(
+                {
+                    "Strategy": p.name,
+                    "Tag": p.tag if p.tag else "N/A",
+                    "Sharpe": f"{p.sharpe_ratio:.4f}",
+                    "CVaR": f"{p.cvar:.4f}",
+                    "Max Drawdown": f"{p.max_drawdown:.4f}",
+                    "Sortino": f"{p.sortino_ratio:.4f}",
+                }
+            )
+
+        df_metrics = pd.DataFrame(metrics)
+        table_md = df_metrics.to_markdown(index=False)
+
+        tag_list = list(
+            dict.fromkeys(p.tag for p in self._population if p.tag is not None)
+        )
+        if not tag_list:
+            best_strategy = "N/A (No tagged portfolios)"
+            top_holdings = "N/A"
+        else:
+            valid_tags = [
+                t for t in set(tag_list) if any(p.tag == t for p in self._population)
+            ]
+            best_tag = max(
+                valid_tags,
+                key=lambda t: np.nanmedian(
+                    [p.cvar_ratio for p in self._population if p.tag == t]
+                ),
+            )
+            # Find the best portfolio within that tag (e.g. highest Sharpe or CVaR Ratio)
+            # We will use the first one if there are multiple
+            best_portfolios = [p for p in self._population if p.tag == best_tag]
+            best_portfolio = best_portfolios[0]
+
+            # Top 5 holdings
+            weights = best_portfolio.weights
+            assets = best_portfolio.assets
+            # Sort by absolute weight descending
+            asset_weights = list(zip(assets, weights))
+            asset_weights.sort(key=lambda x: abs(x[1]), reverse=True)
+            top_5 = asset_weights[:5]
+
+            best_strategy = best_tag
+            top_holdings = ", ".join(f"{asset} ({w:.2%})" for asset, w in top_5)
+
+        report = (
+            f"# Portfolio Population Report\n\n"
+            f"**Generated:** {timestamp}\n\n"
+            f"## Performance Metrics\n\n"
+            f"{table_md}\n\n"
+            f"## Best Strategy Analysis\n\n"
+            f"**Best Tag (by median CVaR Ratio):** {best_strategy}\n"
+            f"**Top 5 Holdings:** {top_holdings}\n"
+        )
+        return report
+
+    def extract_metrics_dataframe(self) -> pd.DataFrame:
+        """Extract per-portfolio performance metrics into a flat pandas DataFrame.
+
+        Returns:
+            pandas.DataFrame: Columns exactly "name", "tag", "sharpe", "sortino",
+            "cvar", "max_drawdown", "cvar_ratio", "mean_return".
+        Raises:
+            ValueError: "Population is empty. No metrics to extract."
+        """
+        if not self._population:
+            raise ValueError("Population is empty. No metrics to extract.")
+
+        data = []
+        for p in self._population:
+            data.append(
+                {
+                    "name": p.name,
+                    "tag": p.tag,
+                    "sharpe": p.sharpe_ratio,
+                    "sortino": p.sortino_ratio,
+                    "cvar": p.cvar,
+                    "max_drawdown": p.max_drawdown,
+                    "cvar_ratio": p.cvar_ratio,
+                    "mean_return": p.mean,
+                }
+            )
+
+        return pd.DataFrame(
+            data,
+            columns=[
+                "name",
+                "tag",
+                "sharpe",
+                "sortino",
+                "cvar",
+                "max_drawdown",
+                "cvar_ratio",
+                "mean_return",
+            ],
+        )
