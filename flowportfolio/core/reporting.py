@@ -7,9 +7,9 @@ plotting capabilities.
 
 from __future__ import annotations
 
-import numpy as np
 from datetime import datetime, timezone
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from skfolio import Population, RatioMeasure, RiskMeasure
@@ -54,43 +54,13 @@ class Reporter:
             included in the visual comparisons even if its metric distribution
             is narrow.
         """
-        # 1. Derive tag_list ensuring baseline is included
-        tag_list = list(
-            dict.fromkeys(p.tag for p in self._population if p.tag is not None)
-        )
+        try:
+            figures = self.get_plotly_figures(baseline_tag=baseline_tag)
+        except ValueError:
+            return
 
-        if baseline_tag not in tag_list:
-            tag_list.insert(0, baseline_tag)
-
-        # 2. Plot 1: CVaR Ratio boxplot
-        fig1 = self._population.boxplot_measure(
-            measure=RatioMeasure.CVAR_RATIO,
-            tag_list=tag_list,
-        )
-        fig1.show()
-
-        # 3. Plot 2: Average Drawdown Ratio distribution
-        fig2 = self._population.plot_distribution(
-            measure_list=[RatioMeasure.AVERAGE_DRAWDOWN_RATIO],
-            tag_list=tag_list,
-        )
-        fig2.show()
-
-        # 4. Plot 3: Composition plot for the best strategy
-        # Find the strategy (tag) with the highest median CVAR_RATIO
-        valid_tags = [
-            t for t in set(tag_list) if any(p.tag == t for p in self._population)
-        ]
-        best_tag = max(
-            valid_tags,
-            key=lambda t: np.nanmedian(
-                [p.cvar_ratio for p in self._population if p.tag == t]
-            ),
-        )
-
-        best_portfolios = Population([p for p in self._population if p.tag == best_tag])
-        fig3 = best_portfolios.plot_composition()
-        fig3.show()
+        for fig in figures.values():
+            fig.show()
 
     def plot_stress_impact(
         self,
@@ -163,11 +133,23 @@ class Reporter:
     ) -> dict[str, go.Figure]:
         """Generate Plotly figures for strategy comparison without displaying them.
 
-        Returns:
-            dict[str, plotly.graph_objects.Figure]: Exact keys "cvar_boxplot",
-            "drawdown_distribution", and "best_composition".
-        Raises:
-            ValueError: "Population contains no tagged portfolios."
+        Parameters
+        ----------
+        baseline_tag : str, default "Baseline"
+            The tag representing the baseline strategy, ensuring it is always
+            included in the visual comparisons even if its metric distribution
+            is narrow.
+
+        Returns
+        -------
+        dict[str, plotly.graph_objects.Figure]
+            Exact keys "cvar_boxplot", "drawdown_distribution", and
+            "best_composition".
+
+        Raises
+        ------
+        ValueError
+            If the population contains no tagged portfolios.
         """
         tag_list = list(
             dict.fromkeys(p.tag for p in self._population if p.tag is not None)
@@ -191,12 +173,12 @@ class Reporter:
         valid_tags = [
             t for t in set(tag_list) if any(p.tag == t for p in self._population)
         ]
-        best_tag = max(
-            valid_tags,
-            key=lambda t: np.nanmedian(
-                [p.cvar_ratio for p in self._population if p.tag == t]
-            ),
-        )
+        
+        def safe_median(tag: str) -> float:
+            cvar_ratios = [p.cvar_ratio for p in self._population if p.tag == tag and not np.isnan(p.cvar_ratio)]
+            return float(np.median(cvar_ratios)) if cvar_ratios else float("-inf")
+            
+        best_tag = max(valid_tags, key=safe_median)
 
         best_portfolios = Population([p for p in self._population if p.tag == best_tag])
         fig3 = best_portfolios.plot_composition()
@@ -210,12 +192,24 @@ class Reporter:
     def to_markdown_artifact(self, baseline_tag: str = "Baseline") -> str:
         """Extract key population statistics into a formatted Markdown report.
 
-        Header must include ISO8601 timestamp. Table must include Sharpe, CVaR,
-        Max Drawdown, Sortino. Identify best strategy by median CVaR Ratio and
-        top 5 holdings.
+        Parameters
+        ----------
+        baseline_tag : str, default "Baseline"
+            The tag representing the baseline strategy, provided for interface
+            consistency with other reporting methods.
 
-        Raises:
-            ValueError: If population is empty.
+        Returns
+        -------
+        str
+            A formatted Markdown string containing an ISO8601 UTC timestamp,
+            a metrics table (Sharpe, CVaR, Max Drawdown, Sortino), and analysis
+            identifying the best strategy by median CVaR Ratio and its top 5
+            holdings.
+
+        Raises
+        ------
+        ValueError
+            If the population is empty.
         """
         if not self._population:
             raise ValueError("Population is empty.")
@@ -236,7 +230,14 @@ class Reporter:
             )
 
         df_metrics = pd.DataFrame(metrics)
-        table_md = df_metrics.to_markdown(index=False)
+        try:
+            table_md = df_metrics.to_markdown(index=False)
+        except (ImportError, ModuleNotFoundError):
+            cols = list(df_metrics.columns)
+            header = "| " + " | ".join(cols) + " |"
+            separator = "| " + " | ".join(["---"] * len(cols)) + " |"
+            rows = ["| " + " | ".join(str(row[c]) for c in cols) + " |" for _, row in df_metrics.iterrows()]
+            table_md = "\n".join([header, separator] + rows)
 
         tag_list = list(
             dict.fromkeys(p.tag for p in self._population if p.tag is not None)
@@ -248,27 +249,39 @@ class Reporter:
             valid_tags = [
                 t for t in set(tag_list) if any(p.tag == t for p in self._population)
             ]
-            best_tag = max(
-                valid_tags,
-                key=lambda t: np.nanmedian(
-                    [p.cvar_ratio for p in self._population if p.tag == t]
-                ),
-            )
-            # Find the best portfolio within that tag (e.g. highest Sharpe or CVaR Ratio)
-            # We will use the first one if there are multiple
+            
+            def safe_median(tag: str) -> float:
+                cvar_ratios = [p.cvar_ratio for p in self._population if p.tag == tag and not np.isnan(p.cvar_ratio)]
+                return float(np.median(cvar_ratios)) if cvar_ratios else float("-inf")
+                
+            best_tag = max(valid_tags, key=safe_median)
+            
             best_portfolios = [p for p in self._population if p.tag == best_tag]
-            best_portfolio = best_portfolios[0]
+            best_portfolio = max(
+                best_portfolios, 
+                key=lambda p: p.cvar_ratio if getattr(p, "cvar_ratio", None) is not None and not np.isnan(p.cvar_ratio) else float("-inf")
+            )
 
-            # Top 5 holdings
-            weights = best_portfolio.weights
-            assets = best_portfolio.assets
-            # Sort by absolute weight descending
-            asset_weights = list(zip(assets, weights))
-            asset_weights.sort(key=lambda x: abs(x[1]), reverse=True)
-            top_5 = asset_weights[:5]
+            weights = getattr(best_portfolio, "weights", None)
+            assets = getattr(best_portfolio, "assets", None)
+            
+            if weights is None or not len(weights):
+                top_holdings = "N/A (No weights available)"
+            else:
+                if assets is None or len(assets) != len(weights):
+                    assets = [f"Asset_{i}" for i in range(len(weights))]
+                    
+                asset_weights = list(zip(assets, weights))
+                asset_weights = [aw for aw in asset_weights if aw[1] is not None and not np.isnan(aw[1])]
+                asset_weights.sort(key=lambda x: abs(x[1]), reverse=True)
+                top_5 = asset_weights[:5]
+                
+                if not top_5:
+                    top_holdings = "N/A (All weights zero or NaN)"
+                else:
+                    top_holdings = ", ".join(f"{str(asset)} ({w:.2%})" for asset, w in top_5)
 
             best_strategy = best_tag
-            top_holdings = ", ".join(f"{asset} ({w:.2%})" for asset, w in top_5)
 
         report = (
             f"# Portfolio Population Report\n\n"
@@ -284,11 +297,16 @@ class Reporter:
     def extract_metrics_dataframe(self) -> pd.DataFrame:
         """Extract per-portfolio performance metrics into a flat pandas DataFrame.
 
-        Returns:
-            pandas.DataFrame: Columns exactly "name", "tag", "sharpe", "sortino",
-            "cvar", "max_drawdown", "cvar_ratio", "mean_return".
-        Raises:
-            ValueError: "Population is empty. No metrics to extract."
+        Returns
+        -------
+        pandas.DataFrame
+            Columns exactly "name", "tag", "sharpe", "sortino", "cvar",
+            "max_drawdown", "cvar_ratio", "mean_return".
+
+        Raises
+        ------
+        ValueError
+            If the population is empty.
         """
         if not self._population:
             raise ValueError("Population is empty. No metrics to extract.")
