@@ -1,6 +1,6 @@
 [project]
 name = "flowportfolio"
-version = "0.2.0"
+version = "0.2.1"
 description = "A fluent portfolio experimentation API built on top of skfolio."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -10,8 +10,10 @@ authors = [{ name = "Vespertili0"}]
 dependencies = [
     "numpy>=2.4.6",
     "pandas>=3.0.3",
+    "plotly>=5.0.0",
     "scikit-learn>=1.9.0",
     "skfolio>=0.20.1",
+    "tabulate>=0.9.0",
     "yfinance>=1.5.1",
 ]
 
