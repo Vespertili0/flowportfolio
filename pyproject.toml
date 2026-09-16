@@ -21,3 +21,9 @@ dependencies = [
 Homepage = "https://github.com/Vespertili0/flowportfolio"
 Repository = "https://github.com/Vespertili0/flowportfolio"
 Issues = "https://github.com/Vespertili0/flowportfolio/issues"
+
+[project.optional-dependencies]
+dev = [
+    "pre-commit",
+    "mypy"
+]
