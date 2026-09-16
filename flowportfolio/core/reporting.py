@@ -173,11 +173,15 @@ class Reporter:
         valid_tags = [
             t for t in set(tag_list) if any(p.tag == t for p in self._population)
         ]
-        
+
         def safe_median(tag: str) -> float:
-            cvar_ratios = [p.cvar_ratio for p in self._population if p.tag == tag and not np.isnan(p.cvar_ratio)]
+            cvar_ratios = [
+                p.cvar_ratio
+                for p in self._population
+                if p.tag == tag and not np.isnan(p.cvar_ratio)
+            ]
             return float(np.median(cvar_ratios)) if cvar_ratios else float("-inf")
-            
+
         best_tag = max(valid_tags, key=safe_median)
 
         best_portfolios = Population([p for p in self._population if p.tag == best_tag])
@@ -236,7 +240,10 @@ class Reporter:
             cols = list(df_metrics.columns)
             header = "| " + " | ".join(cols) + " |"
             separator = "| " + " | ".join(["---"] * len(cols)) + " |"
-            rows = ["| " + " | ".join(str(row[c]) for c in cols) + " |" for _, row in df_metrics.iterrows()]
+            rows = [
+                "| " + " | ".join(str(row[c]) for c in cols) + " |"
+                for _, row in df_metrics.iterrows()
+            ]
             table_md = "\n".join([header, separator] + rows)
 
         tag_list = list(
@@ -249,37 +256,50 @@ class Reporter:
             valid_tags = [
                 t for t in set(tag_list) if any(p.tag == t for p in self._population)
             ]
-            
+
             def safe_median(tag: str) -> float:
-                cvar_ratios = [p.cvar_ratio for p in self._population if p.tag == tag and not np.isnan(p.cvar_ratio)]
+                cvar_ratios = [
+                    p.cvar_ratio
+                    for p in self._population
+                    if p.tag == tag and not np.isnan(p.cvar_ratio)
+                ]
                 return float(np.median(cvar_ratios)) if cvar_ratios else float("-inf")
-                
+
             best_tag = max(valid_tags, key=safe_median)
-            
+
             best_portfolios = [p for p in self._population if p.tag == best_tag]
             best_portfolio = max(
-                best_portfolios, 
-                key=lambda p: p.cvar_ratio if getattr(p, "cvar_ratio", None) is not None and not np.isnan(p.cvar_ratio) else float("-inf")
+                best_portfolios,
+                key=lambda p: p.cvar_ratio
+                if getattr(p, "cvar_ratio", None) is not None
+                and not np.isnan(p.cvar_ratio)
+                else float("-inf"),
             )
 
             weights = getattr(best_portfolio, "weights", None)
             assets = getattr(best_portfolio, "assets", None)
-            
+
             if weights is None or not len(weights):
                 top_holdings = "N/A (No weights available)"
             else:
                 if assets is None or len(assets) != len(weights):
                     assets = [f"Asset_{i}" for i in range(len(weights))]
-                    
+
                 asset_weights = list(zip(assets, weights))
-                asset_weights = [aw for aw in asset_weights if aw[1] is not None and not np.isnan(aw[1])]
+                asset_weights = [
+                    aw
+                    for aw in asset_weights
+                    if aw[1] is not None and not np.isnan(aw[1])
+                ]
                 asset_weights.sort(key=lambda x: abs(x[1]), reverse=True)
                 top_5 = asset_weights[:5]
-                
+
                 if not top_5:
                     top_holdings = "N/A (All weights zero or NaN)"
                 else:
-                    top_holdings = ", ".join(f"{str(asset)} ({w:.2%})" for asset, w in top_5)
+                    top_holdings = ", ".join(
+                        f"{str(asset)} ({w:.2%})" for asset, w in top_5
+                    )
 
             best_strategy = best_tag
 

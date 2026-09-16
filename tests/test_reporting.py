@@ -347,13 +347,16 @@ def test_extract_metrics_dataframe_empty() -> None:
 # Real Fixture Tests & Edge Cases
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
 def dummy_population() -> Population:
     """Fixture providing a real Population with real Portfolio instances."""
     df1 = pd.DataFrame(np.random.randn(10, 3) / 100, columns=["A", "B", "C"])
     df1.index = pd.date_range("2023-01-01", periods=10)
-    p1 = Portfolio(X=df1, weights=np.array([0.3, 0.3, 0.4]), name="port1", tag="Baseline")
-    
+    p1 = Portfolio(
+        X=df1, weights=np.array([0.3, 0.3, 0.4]), name="port1", tag="Baseline"
+    )
+
     df2 = pd.DataFrame(np.random.randn(10, 3) / 100, columns=["A", "B", "C"])
     df2.index = pd.date_range("2023-01-01", periods=10)
     p2 = Portfolio(X=df2, weights=np.array([0.5, 0.5, 0.0]), name="port2", tag="StratA")
@@ -361,16 +364,18 @@ def dummy_population() -> Population:
     return Population([p1, p2])
 
 
-def test_generate_tearsheet_delegates_to_get_plotly_figures(dummy_population: Population) -> None:
+def test_generate_tearsheet_delegates_to_get_plotly_figures(
+    dummy_population: Population,
+) -> None:
     """Test that generate_tearsheet delegates correctly when using a real population."""
     reporter = Reporter(dummy_population)
-    
+
     with patch.object(reporter, "get_plotly_figures") as mock_get_figures:
         fig_mock = MagicMock()
         mock_get_figures.return_value = {"mock_fig": fig_mock}
-        
+
         reporter.generate_tearsheet(baseline_tag="Baseline")
-        
+
         mock_get_figures.assert_called_once_with(baseline_tag="Baseline")
         fig_mock.show.assert_called_once()
 
@@ -379,7 +384,7 @@ def test_to_markdown_artifact_real_population(dummy_population: Population) -> N
     """Test to_markdown_artifact formatting with real objects."""
     reporter = Reporter(dummy_population)
     report = reporter.to_markdown_artifact(baseline_tag="Baseline")
-    
+
     assert "Portfolio Population Report" in report
     assert "port1" in report
     assert "port2" in report
@@ -390,11 +395,11 @@ def test_to_markdown_artifact_real_population(dummy_population: Population) -> N
 def test_to_markdown_artifact_without_tabulate(dummy_population: Population) -> None:
     """Test the native Markdown table fallback when tabulate is missing."""
     reporter = Reporter(dummy_population)
-    
+
     # Hide tabulate from sys.modules to simulate it being uninstalled
     with patch.dict(sys.modules, {"tabulate": None}):
         report = reporter.to_markdown_artifact()
-        
+
     assert "| Strategy" in report
     assert "| Tag" in report
     assert "| Sharpe" in report
@@ -406,13 +411,15 @@ def test_to_markdown_artifact_unlabelled_assets() -> None:
     # Dataframe without column names (default integer indexing)
     df = pd.DataFrame(np.random.randn(10, 3) / 100)
     df.index = pd.date_range("2023-01-01", periods=10)
-    
+
     # Portfolio created without explicit names
-    p = Portfolio(X=df, weights=np.array([0.3, 0.3, 0.4]), name="port_unlabelled", tag="StratB")
-    
+    p = Portfolio(
+        X=df, weights=np.array([0.3, 0.3, 0.4]), name="port_unlabelled", tag="StratB"
+    )
+
     pop = Population([p])
     reporter = Reporter(pop)
     report = reporter.to_markdown_artifact()
-    
+
     assert "Asset_0" in report or "0" in report
     assert "port_unlabelled" in report

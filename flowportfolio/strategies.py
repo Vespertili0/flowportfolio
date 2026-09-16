@@ -3,6 +3,7 @@ from __future__ import annotations
 from sklearn.pipeline import Pipeline
 from skfolio.prior import BasePrior
 from skfolio.optimization import NestedClustersOptimization
+from sklearn.base import clone
 
 
 class StrategyBuilder:
@@ -41,10 +42,10 @@ class StrategyBuilder:
 
         self.constraints = constraints
         self.prior = prior
-        self._pre_selection = []
-        self._cross_sectional = []
+        self._pre_selection: list = []
+        self._cross_sectional: list = []
         self._optimizer = None
-        self._fallbacks = []
+        self._fallback = None
 
     def add_pre_selection(self, transformer) -> StrategyBuilder:
         """Add a pre-selection transformer to the pipeline queue.
@@ -111,7 +112,7 @@ class StrategyBuilder:
     def set_optimizer(
         self,
         optimizer,
-        fallbacks: list | None = None,
+        fallback=None,
     ) -> StrategyBuilder:
         """Configure the terminal optimizer for the pipeline.
 
@@ -120,8 +121,8 @@ class StrategyBuilder:
         optimizer : skfolio optimizer
             The primary portfolio optimizer (e.g., MeanRisk, RiskBudgeting,
             HierarchicalRiskParity).
-        fallbacks : list or None, optional
-            Ordered list of fallback optimizers to attempt if the primary
+        fallback : skfolio optimizer or None, optional
+            A single fallback estimator to attempt if the primary
             optimizer fails. If provided, sets raise_on_failure=False on
             the primary optimizer.
 
@@ -138,15 +139,16 @@ class StrategyBuilder:
         if self._optimizer is not None:
             raise RuntimeError("set_optimizer called more than once without resetting.")
 
-        self._optimizer = optimizer
-        self._fallbacks = fallbacks if fallbacks is not None else []
+        self._optimizer = clone(optimizer)
+        self._fallback = clone(fallback) if fallback is not None else None
 
-        if self._fallbacks:
+        if self._fallback is not None:
             setattr(self._optimizer, "raise_on_failure", False)
-            setattr(self._optimizer, "fallback", self._fallbacks[0])
+            setattr(self._optimizer, "fallback", self._fallback)
 
         if hasattr(self._optimizer, "linear_constraints"):
-            self._optimizer.linear_constraints = self.constraints
+            if self._optimizer is not None:
+                self._optimizer.linear_constraints = self.constraints
 
         return self
 

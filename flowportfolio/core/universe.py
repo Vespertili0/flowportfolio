@@ -136,7 +136,7 @@ class Universe:
         dict[str, str]
             Dictionary mapping tickers to their group tags.
         """
-        return self._metadata
+        return dict(self._metadata)
 
     @property
     def fees(self) -> dict[str, float]:
@@ -147,7 +147,7 @@ class Universe:
         dict[str, float]
             Dictionary mapping tickers to their annual management fees.
         """
-        return self._fees
+        return dict(self._fees)
 
     @property
     def returns(self) -> pd.DataFrame:
