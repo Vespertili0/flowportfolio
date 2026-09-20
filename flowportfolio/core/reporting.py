@@ -7,7 +7,7 @@ plotting capabilities.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import numpy as np
 import pandas as pd
@@ -152,7 +152,9 @@ class Reporter:
             If the population contains no tagged portfolios.
         """
         tag_list = list(
-            dict.fromkeys(p.tag for p in self._population if p.tag is not None)
+            dict.fromkeys(
+                p.tag for p in self._population if getattr(p, "tag", None) is not None
+            )
         )
         if not tag_list:
             raise ValueError("Population contains no tagged portfolios.")
@@ -171,20 +173,26 @@ class Reporter:
         )
 
         valid_tags = [
-            t for t in set(tag_list) if any(p.tag == t for p in self._population)
+            t
+            for t in set(tag_list)
+            if any(getattr(p, "tag", None) == t for p in self._population)
         ]
 
         def safe_median(tag: str) -> float:
             cvar_ratios = [
                 p.cvar_ratio
                 for p in self._population
-                if p.tag == tag and not np.isnan(p.cvar_ratio)
+                if getattr(p, "tag", None) == tag
+                and getattr(p, "cvar_ratio", None) is not None
+                and not np.isnan(p.cvar_ratio)
             ]
             return float(np.median(cvar_ratios)) if cvar_ratios else float("-inf")
 
         best_tag = max(valid_tags, key=safe_median)
 
-        best_portfolios = Population([p for p in self._population if p.tag == best_tag])
+        best_portfolios = Population(
+            [p for p in self._population if getattr(p, "tag", None) == best_tag]
+        )
         fig3 = best_portfolios.plot_composition()
 
         return {
@@ -215,21 +223,38 @@ class Reporter:
         ValueError
             If the population is empty.
         """
-        if not self._population:
+        if not self._population or len(self._population) == 0:
             raise ValueError("Population is empty.")
 
-        timestamp = datetime.now(timezone.utc).isoformat()
+        timestamp = datetime.now(UTC).isoformat()
+
+        def _fmt(val: object) -> str:
+            if val is None:
+                return "N/A"
+            if isinstance(val, (int, float, np.number)):
+                if np.isnan(val):
+                    return "nan"
+                return f"{float(val):.4f}"
+            try:
+                f_val = float(val)  # type: ignore[arg-type]
+                if np.isnan(f_val):
+                    return "nan"
+                return f"{f_val:.4f}"
+            except (ValueError, TypeError):
+                return str(val)
 
         metrics = []
         for p in self._population:
             metrics.append(
                 {
-                    "Strategy": p.name,
-                    "Tag": p.tag if p.tag else "N/A",
-                    "Sharpe": f"{p.sharpe_ratio:.4f}",
-                    "CVaR": f"{p.cvar:.4f}",
-                    "Max Drawdown": f"{p.max_drawdown:.4f}",
-                    "Sortino": f"{p.sortino_ratio:.4f}",
+                    "Strategy": getattr(p, "name", "N/A") or "N/A",
+                    "Tag": getattr(p, "tag", None)
+                    if getattr(p, "tag", None)
+                    else "N/A",
+                    "Sharpe": _fmt(getattr(p, "sharpe_ratio", None)),
+                    "CVaR": _fmt(getattr(p, "cvar", None)),
+                    "Max Drawdown": _fmt(getattr(p, "max_drawdown", None)),
+                    "Sortino": _fmt(getattr(p, "sortino_ratio", None)),
                 }
             )
 
@@ -247,39 +272,49 @@ class Reporter:
             table_md = "\n".join([header, separator] + rows)
 
         tag_list = list(
-            dict.fromkeys(p.tag for p in self._population if p.tag is not None)
+            dict.fromkeys(
+                p.tag for p in self._population if getattr(p, "tag", None) is not None
+            )
         )
         if not tag_list:
             best_strategy = "N/A (No tagged portfolios)"
             top_holdings = "N/A"
         else:
             valid_tags = [
-                t for t in set(tag_list) if any(p.tag == t for p in self._population)
+                t
+                for t in set(tag_list)
+                if any(getattr(p, "tag", None) == t for p in self._population)
             ]
 
             def safe_median(tag: str) -> float:
                 cvar_ratios = [
                     p.cvar_ratio
                     for p in self._population
-                    if p.tag == tag and not np.isnan(p.cvar_ratio)
+                    if getattr(p, "tag", None) == tag
+                    and getattr(p, "cvar_ratio", None) is not None
+                    and not np.isnan(p.cvar_ratio)
                 ]
                 return float(np.median(cvar_ratios)) if cvar_ratios else float("-inf")
 
             best_tag = max(valid_tags, key=safe_median)
 
-            best_portfolios = [p for p in self._population if p.tag == best_tag]
+            best_portfolios = [
+                p for p in self._population if getattr(p, "tag", None) == best_tag
+            ]
             best_portfolio = max(
                 best_portfolios,
-                key=lambda p: p.cvar_ratio
-                if getattr(p, "cvar_ratio", None) is not None
-                and not np.isnan(p.cvar_ratio)
-                else float("-inf"),
+                key=lambda p: (
+                    p.cvar_ratio
+                    if getattr(p, "cvar_ratio", None) is not None
+                    and not np.isnan(p.cvar_ratio)
+                    else float("-inf")
+                ),
             )
 
             weights = getattr(best_portfolio, "weights", None)
             assets = getattr(best_portfolio, "assets", None)
 
-            if weights is None or not len(weights):
+            if weights is None or len(weights) == 0:
                 top_holdings = "N/A (No weights available)"
             else:
                 if assets is None or len(assets) != len(weights):
@@ -298,7 +333,7 @@ class Reporter:
                     top_holdings = "N/A (All weights zero or NaN)"
                 else:
                     top_holdings = ", ".join(
-                        f"{str(asset)} ({w:.2%})" for asset, w in top_5
+                        f"{asset!s} ({w:.2%})" for asset, w in top_5
                     )
 
             best_strategy = best_tag
@@ -328,21 +363,21 @@ class Reporter:
         ValueError
             If the population is empty.
         """
-        if not self._population:
+        if not self._population or len(self._population) == 0:
             raise ValueError("Population is empty. No metrics to extract.")
 
         data = []
         for p in self._population:
             data.append(
                 {
-                    "name": p.name,
-                    "tag": p.tag,
-                    "sharpe": p.sharpe_ratio,
-                    "sortino": p.sortino_ratio,
-                    "cvar": p.cvar,
-                    "max_drawdown": p.max_drawdown,
-                    "cvar_ratio": p.cvar_ratio,
-                    "mean_return": p.mean,
+                    "name": getattr(p, "name", None),
+                    "tag": getattr(p, "tag", None),
+                    "sharpe": getattr(p, "sharpe_ratio", None),
+                    "sortino": getattr(p, "sortino_ratio", None),
+                    "cvar": getattr(p, "cvar", None),
+                    "max_drawdown": getattr(p, "max_drawdown", None),
+                    "cvar_ratio": getattr(p, "cvar_ratio", None),
+                    "mean_return": getattr(p, "mean", None),
                 }
             )
 

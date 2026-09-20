@@ -1,7 +1,9 @@
 from __future__ import annotations
+
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
+
 import pandas as pd
 from skfolio import Population
 
@@ -54,7 +56,7 @@ class PersistenceManager:
             )
 
         data = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "portfolios": portfolios_data,
         }
 
@@ -103,7 +105,7 @@ class PersistenceManager:
             safe_label = Path(label).name
             filename = f"{safe_label}.json"
         else:
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             year, week, _ = now.isocalendar()
             filename = f"rebalance_{year}_W{week:02d}.json"
 
@@ -147,7 +149,7 @@ class PersistenceManager:
                 if timestamp_str.endswith("Z"):
                     timestamp_str = timestamp_str[:-1] + "+00:00"
                 ts = pd.to_datetime(timestamp_str)
-            except Exception as e:
+            except (ValueError, TypeError) as e:
                 import warnings
 
                 warnings.warn(

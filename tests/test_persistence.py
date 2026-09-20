@@ -1,11 +1,12 @@
-import pytest
 import json
 import os
 import re
-import pandas as pd
-import numpy as np
+from datetime import UTC, datetime
 from pathlib import Path
-from datetime import datetime, timezone
+
+import numpy as np
+import pandas as pd
+import pytest
 from skfolio import Population, Portfolio
 
 from flowportfolio.persistence import PersistenceManager
@@ -96,7 +97,7 @@ def test_load_snapshot_success(manager, dummy_population, tmp_path):
 def test_load_snapshot_file_not_found(manager, tmp_path):
     filepath = tmp_path / "non_existent.json"
     with pytest.raises(
-        FileNotFoundError, match=re.escape(f"Snapshot file not found: {str(filepath)}")
+        FileNotFoundError, match=re.escape(f"Snapshot file not found: {filepath!s}")
     ):
         manager.load_snapshot(str(filepath))
 
@@ -107,7 +108,7 @@ def test_load_snapshot_invalid_json(manager, tmp_path):
         f.write("{invalid_json:")
 
     with pytest.raises(
-        ValueError, match=re.escape(f"Invalid JSON in snapshot file: {str(filepath)}")
+        ValueError, match=re.escape(f"Invalid JSON in snapshot file: {filepath!s}")
     ):
         manager.load_snapshot(str(filepath))
 
@@ -116,7 +117,7 @@ def test_export_gitops_artifact_default_label(manager, dummy_population, tmp_pat
     path_str = manager.export_gitops_artifact(dummy_population, str(tmp_path))
     path = Path(path_str)
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     year, week, _ = now.isocalendar()
     expected_filename = f"rebalance_{year}_W{week:02d}.json"
 
@@ -161,7 +162,7 @@ def test_calculate_trajectory_history_dir_not_found(manager, tmp_path):
     bad_dir = tmp_path / "no_dir"
     with pytest.raises(
         FileNotFoundError,
-        match=re.escape(f"Snapshot directory not found: {str(bad_dir)}"),
+        match=re.escape(f"Snapshot directory not found: {bad_dir!s}"),
     ):
         manager.calculate_trajectory_history(str(bad_dir))
 
@@ -170,6 +171,6 @@ def test_calculate_trajectory_history_no_files(manager, tmp_path):
     # directory exists, but no files
     with pytest.raises(
         ValueError,
-        match=re.escape(f"No rebalance_*.json snapshots found in: {str(tmp_path)}"),
+        match=re.escape(f"No rebalance_*.json snapshots found in: {tmp_path!s}"),
     ):
         manager.calculate_trajectory_history(str(tmp_path))

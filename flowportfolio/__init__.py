@@ -8,16 +8,16 @@ from flowportfolio.delta import PortfolioDeltaEngine
 from flowportfolio.priors import PriorSynthesiser
 from flowportfolio.strategies import StrategyBuilder
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 __all__ = [
-    "__version__",
-    "Universe",
-    "DataFetchError",
     "ConstraintBuilder",
-    "PriorSynthesiser",
-    "StrategyBuilder",
-    "PortfolioExperimentEngine",
-    "Reporter",
+    "DataFetchError",
     "PortfolioDeltaEngine",
+    "PortfolioExperimentEngine",
+    "PriorSynthesiser",
+    "Reporter",
+    "StrategyBuilder",
+    "Universe",
+    "__version__",
 ]

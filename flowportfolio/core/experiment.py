@@ -7,18 +7,19 @@ multiple investment strategies using ``skfolio``.
 
 from __future__ import annotations
 
-from sklearn.base import BaseEstimator
-from sklearn.model_selection import GridSearchCV
 from skfolio import Population, RatioMeasure
 from skfolio.metrics import make_scorer
 from skfolio.model_selection import (
-    cross_val_predict,
-    WalkForward,
     CombinatorialPurgedCV,
     MultipleRandomizedCV,
     OnlineGridSearch,
+    WalkForward,
+    cross_val_predict,
     online_predict,
 )
+from sklearn.base import BaseEstimator
+from sklearn.model_selection import GridSearchCV
+
 from flowportfolio.core.universe import Universe
 
 

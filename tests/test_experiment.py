@@ -9,12 +9,12 @@ from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
-from sklearn.base import BaseEstimator
 from skfolio.model_selection import (
     CombinatorialPurgedCV,
     MultipleRandomizedCV,
     WalkForward,
 )
+from sklearn.base import BaseEstimator
 
 from flowportfolio.core.experiment import PortfolioExperimentEngine
 from flowportfolio.core.universe import Universe

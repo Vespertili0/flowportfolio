@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import re
-from skfolio.prior import EmpiricalPrior, EntropyPooling, SyntheticData
-from skfolio.moments import DenoiseCovariance, ShrunkMu
+
 from skfolio.distribution import VineCopula
+from skfolio.moments import DenoiseCovariance, ShrunkMu
+from skfolio.prior import EmpiricalPrior, EntropyPooling, SyntheticData
 
 from flowportfolio.core.universe import Universe
 

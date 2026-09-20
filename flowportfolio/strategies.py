@@ -1,9 +1,21 @@
 from __future__ import annotations
 
-from sklearn.pipeline import Pipeline
-from skfolio.prior import BasePrior
+import copy
+
 from skfolio.optimization import NestedClustersOptimization
+from skfolio.prior import BasePrior
 from sklearn.base import clone
+from sklearn.pipeline import Pipeline
+
+
+def _safe_clone(estimator):
+    """Clone an estimator safely, falling back to deepcopy for non-sklearn objects."""
+    if estimator is None:
+        return None
+    try:
+        return clone(estimator)
+    except TypeError:
+        return copy.deepcopy(estimator)
 
 
 class StrategyBuilder:
@@ -40,12 +52,13 @@ class StrategyBuilder:
         if not isinstance(constraints, list):
             raise TypeError("constraints must be a list.")
 
-        self.constraints = constraints
+        self.constraints = list(constraints)
         self.prior = prior
         self._pre_selection: list = []
         self._cross_sectional: list = []
         self._optimizer = None
         self._fallback = None
+        self._fallbacks: list = []
 
     def add_pre_selection(self, transformer) -> StrategyBuilder:
         """Add a pre-selection transformer to the pipeline queue.
@@ -70,9 +83,7 @@ class StrategyBuilder:
         TypeError
             If transformer does not implement fit_transform.
         """
-        if not hasattr(transformer, "fit_transform") or not callable(
-            getattr(transformer, "fit_transform")
-        ):
+        if not callable(getattr(transformer, "fit_transform", None)):
             raise TypeError("transformer must implement a fit_transform method.")
 
         self._pre_selection.append(transformer)
@@ -101,9 +112,7 @@ class StrategyBuilder:
         TypeError
             If transformer does not implement fit_transform.
         """
-        if not hasattr(transformer, "fit_transform") or not callable(
-            getattr(transformer, "fit_transform")
-        ):
+        if not callable(getattr(transformer, "fit_transform", None)):
             raise TypeError("transformer must implement a fit_transform method.")
 
         self._cross_sectional.append(transformer)
@@ -113,6 +122,7 @@ class StrategyBuilder:
         self,
         optimizer,
         fallback=None,
+        fallbacks: list | None = None,
     ) -> StrategyBuilder:
         """Configure the terminal optimizer for the pipeline.
 
@@ -125,6 +135,10 @@ class StrategyBuilder:
             A single fallback estimator to attempt if the primary
             optimizer fails. If provided, sets raise_on_failure=False on
             the primary optimizer.
+        fallbacks : list or None, optional
+            Ordered list of fallback optimizers for backward compatibility.
+            If fallback is not explicitly provided and fallbacks is given,
+            the first element of fallbacks is used.
 
         Returns
         -------
@@ -139,15 +153,20 @@ class StrategyBuilder:
         if self._optimizer is not None:
             raise RuntimeError("set_optimizer called more than once without resetting.")
 
-        self._optimizer = clone(optimizer)
-        self._fallback = clone(fallback) if fallback is not None else None
+        resolved_fallback = fallback
+        if resolved_fallback is None and fallbacks:
+            resolved_fallback = fallbacks[0]
 
-        if self._fallback is not None:
-            setattr(self._optimizer, "raise_on_failure", False)
-            setattr(self._optimizer, "fallback", self._fallback)
+        self._optimizer = _safe_clone(optimizer)
+        self._fallback = _safe_clone(resolved_fallback)
+        self._fallbacks = [self._fallback] if self._fallback is not None else []
 
-        if hasattr(self._optimizer, "linear_constraints"):
-            if self._optimizer is not None:
+        if self._optimizer is not None:
+            if self._fallback is not None:
+                self._optimizer.raise_on_failure = False
+                self._optimizer.fallback = self._fallback
+
+            if hasattr(self._optimizer, "linear_constraints"):
                 self._optimizer.linear_constraints = self.constraints
 
         return self

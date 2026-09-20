@@ -5,8 +5,8 @@ This module verifies the visual tearsheet generation logic in
 methods are mocked to prevent rendering during tests.
 """
 
-from unittest.mock import MagicMock, patch
 import sys
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pandas as pd
