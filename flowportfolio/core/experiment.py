@@ -7,18 +7,19 @@ multiple investment strategies using ``skfolio``.
 
 from __future__ import annotations
 
-from sklearn.base import BaseEstimator
-from sklearn.model_selection import GridSearchCV
 from skfolio import Population, RatioMeasure
 from skfolio.metrics import make_scorer
 from skfolio.model_selection import (
-    cross_val_predict,
-    WalkForward,
     CombinatorialPurgedCV,
     MultipleRandomizedCV,
     OnlineGridSearch,
+    WalkForward,
+    cross_val_predict,
     online_predict,
 )
+from sklearn.base import BaseEstimator
+from sklearn.model_selection import GridSearchCV
+
 from flowportfolio.core.universe import Universe
 
 
@@ -172,7 +173,8 @@ class PortfolioExperimentEngine:
             ``universe.returns`` is unavailable.
         """
         # 1. Resolve CV protocol
-        cv = self._resolve_cv_splitter(cv_type, **cv_kwargs)
+        inner_cv = self._resolve_cv_splitter(cv_type, **cv_kwargs)
+        outer_cv = self._resolve_cv_splitter(cv_type, **cv_kwargs)
 
         # 2. Extract returns (will raise ValueError if not fetched)
         returns = self._universe.returns
@@ -187,19 +189,17 @@ class PortfolioExperimentEngine:
             search = GridSearchCV(
                 estimator=config["estimator"],
                 param_grid=config["grid"],
-                cv=cv,
+                cv=inner_cv,
                 scoring=make_scorer(RatioMeasure.CVAR_RATIO),
                 refit=True,
                 n_jobs=self._n_jobs,
             )
-            search.fit(returns)
-            best_model = search.best_estimator_
 
             # b. Out-of-sample journey simulation
             portfolio = cross_val_predict(
-                best_model,
+                search,
                 returns,
-                cv=cv,
+                cv=outer_cv,
                 n_jobs=self._n_jobs,
                 portfolio_params={"tag": name},
             )

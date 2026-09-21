@@ -9,12 +9,12 @@ from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
-from sklearn.base import BaseEstimator
 from skfolio.model_selection import (
     CombinatorialPurgedCV,
     MultipleRandomizedCV,
     WalkForward,
 )
+from sklearn.base import BaseEstimator
 
 from flowportfolio.core.experiment import PortfolioExperimentEngine
 from flowportfolio.core.universe import Universe
@@ -140,7 +140,6 @@ def test_run_robustness_test_walk_forward(
     """Test execution with WalkForward cross-validator."""
     # Setup mocks
     mock_gscv_instance = MagicMock()
-    mock_gscv_instance.best_estimator_ = DummyEstimator()
     mock_gscv.return_value = mock_gscv_instance
 
     mock_portfolio = MagicMock()
@@ -165,8 +164,7 @@ def test_run_robustness_test_walk_forward(
     assert call_args["cv"].train_size == 252
     assert call_args["cv"].test_size == 63
 
-    # Verify fit and predict were called
-    mock_gscv_instance.fit.assert_called_once_with(stub_universe.returns)
+    # Verify predict were called
     mock_cv_predict.assert_called_once()
 
     # Verify tag injection and output
