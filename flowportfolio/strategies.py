@@ -51,6 +51,10 @@ class StrategyBuilder:
     ) -> None:
         if not isinstance(constraints, list):
             raise TypeError("constraints must be a list.")
+        if not all(isinstance(c, str) for c in constraints):
+            raise TypeError("All constraints must be strings.")
+        if prior is not None and not isinstance(prior, BasePrior):
+            raise TypeError("prior must be an instance of BasePrior or None.")
 
         self.constraints = list(constraints)
         self.prior = prior
@@ -152,6 +156,8 @@ class StrategyBuilder:
         """
         if self._optimizer is not None:
             raise RuntimeError("set_optimizer called more than once without resetting.")
+        if optimizer is None:
+            raise TypeError("optimizer must not be None.")
 
         resolved_fallback = fallback
         if resolved_fallback is None and fallbacks:
@@ -163,11 +169,16 @@ class StrategyBuilder:
 
         if self._optimizer is not None:
             if self._fallback is not None:
+                if not hasattr(self._optimizer, "raise_on_failure"):
+                    raise TypeError(
+                        "The provided optimizer does not support fallback semantics."
+                    )
+
                 self._optimizer.raise_on_failure = False
                 self._optimizer.fallback = self._fallback
 
             if hasattr(self._optimizer, "linear_constraints"):
-                self._optimizer.linear_constraints = self.constraints
+                self._optimizer.linear_constraints = list(self.constraints)
 
         return self
 
@@ -200,10 +211,11 @@ class StrategyBuilder:
         for i, transformer in enumerate(self._cross_sectional):
             steps.append((f"cs_{i}", transformer))
 
-        if self.prior is not None and hasattr(self._optimizer, "prior_estimator"):
-            self._optimizer.prior_estimator = self.prior
+        cloned_optimizer = _safe_clone(self._optimizer)
+        if self.prior is not None and hasattr(cloned_optimizer, "prior_estimator"):
+            cloned_optimizer.prior_estimator = self.prior
 
-        steps.append(("optimizer", self._optimizer))
+        steps.append(("optimizer", cloned_optimizer))
 
         return Pipeline(steps)
 
@@ -236,18 +248,28 @@ class StrategyBuilder:
 
         Raises
         ------
+        TypeError
+            If inner_estimator or outer_estimator is None.
         ValueError
             If clusterer is not one of the permitted values.
         """
+        if inner_estimator is None:
+            raise TypeError("inner_estimator must not be None.")
+        if outer_estimator is None:
+            raise TypeError("outer_estimator must not be None.")
+
         permitted_clusterers = ["ward", "complete", "single", "average", "kmeans"]
-        if clusterer not in permitted_clusterers:
+        if not isinstance(clusterer, str) or clusterer not in permitted_clusterers:
             raise ValueError(f"clusterer must be one of {permitted_clusterers}")
 
-        if hasattr(inner_estimator, "linear_constraints"):
-            inner_estimator.linear_constraints = self.constraints
+        cloned_inner = _safe_clone(inner_estimator)
+        cloned_outer = _safe_clone(outer_estimator)
 
-        if self.prior is not None and hasattr(outer_estimator, "prior_estimator"):
-            outer_estimator.prior_estimator = self.prior
+        if hasattr(cloned_inner, "linear_constraints"):
+            cloned_inner.linear_constraints = list(self.constraints)
+
+        if self.prior is not None and hasattr(cloned_outer, "prior_estimator"):
+            cloned_outer.prior_estimator = self.prior
 
         if clusterer == "kmeans":
             from sklearn.cluster import KMeans
@@ -261,7 +283,7 @@ class StrategyBuilder:
             )
 
         return NestedClustersOptimization(
-            inner_estimator=inner_estimator,
-            outer_estimator=outer_estimator,
+            inner_estimator=cloned_inner,
+            outer_estimator=cloned_outer,
             clustering_estimator=clustering_estimator,
         )
