@@ -100,9 +100,11 @@ class PersistenceManager:
         if not isinstance(population, Population):
             raise TypeError("population must be a skfolio.Population instance.")
 
-        if label:
+        if label is not None:
             # Sanitize label to prevent path traversal vulnerabilities
             safe_label = Path(label).name
+            if not safe_label or safe_label.startswith("."):
+                raise ValueError("Invalid label provided for Git-Ops artifact.")
             filename = f"{safe_label}.json"
         else:
             now = datetime.now(UTC)

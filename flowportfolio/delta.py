@@ -94,17 +94,30 @@ class PortfolioDeltaEngine:
 
         # --- ticker coverage validation ---
         universe_tickers = set(universe.tickers)
-        missing_current = set(current_weights.keys()) - universe_tickers
-        if missing_current:
+
+        unknown_current = set(current_weights.keys()) - universe_tickers
+        if unknown_current:
             raise ValueError(
                 f"current_weights contains tickers not found in universe: "
+                f"{sorted(unknown_current)}."
+            )
+        missing_current = universe_tickers - set(current_weights.keys())
+        if missing_current:
+            raise ValueError(
+                f"current_weights is missing universe tickers: "
                 f"{sorted(missing_current)}."
             )
-        missing_target = set(target_weights.keys()) - universe_tickers
-        if missing_target:
+
+        unknown_target = set(target_weights.keys()) - universe_tickers
+        if unknown_target:
             raise ValueError(
                 f"target_weights contains tickers not found in universe: "
-                f"{sorted(missing_target)}."
+                f"{sorted(unknown_target)}."
+            )
+        missing_target = universe_tickers - set(target_weights.keys())
+        if missing_target:
+            raise ValueError(
+                f"target_weights is missing universe tickers: {sorted(missing_target)}."
             )
 
         self._universe: Universe = universe

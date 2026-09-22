@@ -163,6 +163,11 @@ class StrategyBuilder:
 
         if self._optimizer is not None:
             if self._fallback is not None:
+                if not hasattr(self._optimizer, "raise_on_failure"):
+                    raise TypeError(
+                        "The provided optimizer does not support fallback semantics."
+                    )
+
                 self._optimizer.raise_on_failure = False
                 self._optimizer.fallback = self._fallback
 
@@ -243,11 +248,14 @@ class StrategyBuilder:
         if clusterer not in permitted_clusterers:
             raise ValueError(f"clusterer must be one of {permitted_clusterers}")
 
-        if hasattr(inner_estimator, "linear_constraints"):
-            inner_estimator.linear_constraints = self.constraints
+        cloned_inner = _safe_clone(inner_estimator)
+        cloned_outer = _safe_clone(outer_estimator)
 
-        if self.prior is not None and hasattr(outer_estimator, "prior_estimator"):
-            outer_estimator.prior_estimator = self.prior
+        if hasattr(cloned_inner, "linear_constraints"):
+            cloned_inner.linear_constraints = self.constraints
+
+        if self.prior is not None and hasattr(cloned_outer, "prior_estimator"):
+            cloned_outer.prior_estimator = self.prior
 
         if clusterer == "kmeans":
             from sklearn.cluster import KMeans
@@ -261,7 +269,7 @@ class StrategyBuilder:
             )
 
         return NestedClustersOptimization(
-            inner_estimator=inner_estimator,
-            outer_estimator=outer_estimator,
+            inner_estimator=cloned_inner,
+            outer_estimator=cloned_outer,
             clustering_estimator=clustering_estimator,
         )
