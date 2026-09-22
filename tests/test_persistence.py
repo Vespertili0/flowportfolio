@@ -135,7 +135,7 @@ def test_export_gitops_artifact_with_label(manager, dummy_population, tmp_path):
     assert path.exists()
 
 
-@pytest.mark.parametrize("invalid_label", [".", "..", ".hidden", "///", ""])
+@pytest.mark.parametrize("invalid_label", [".", "..", ".hidden", "///", "", "..\\.."])
 def test_export_gitops_artifact_invalid_label(
     manager, dummy_population, tmp_path, invalid_label
 ):
@@ -145,6 +145,11 @@ def test_export_gitops_artifact_invalid_label(
         manager.export_gitops_artifact(
             dummy_population, str(tmp_path), label=invalid_label
         )
+
+
+def test_export_gitops_artifact_label_type_error(manager, dummy_population, tmp_path):
+    with pytest.raises(TypeError, match="label must be a string or None"):
+        manager.export_gitops_artifact(dummy_population, str(tmp_path), label=123)
 
 
 def test_calculate_trajectory_history_success(manager, dummy_population, tmp_path):

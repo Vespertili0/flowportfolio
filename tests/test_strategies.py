@@ -20,6 +20,16 @@ def test_init_raises_type_error():
         StrategyBuilder(constraints="not a list")
 
 
+def test_init_raises_type_error_elements():
+    with pytest.raises(TypeError, match="All constraints must be strings"):
+        StrategyBuilder(constraints=[123])
+
+
+def test_init_raises_type_error_prior():
+    with pytest.raises(TypeError, match="prior must be an instance of BasePrior"):
+        StrategyBuilder(constraints=[], prior="not a prior")
+
+
 def test_add_pre_selection_raises_type_error():
     builder = StrategyBuilder(constraints=[])
     with pytest.raises(
@@ -34,6 +44,12 @@ def test_add_cross_sectional_raises_type_error():
         TypeError, match="transformer must implement a fit_transform method"
     ):
         builder.add_cross_sectional("not a transformer")
+
+
+def test_set_optimizer_raises_type_error_if_none():
+    builder = StrategyBuilder(constraints=[])
+    with pytest.raises(TypeError, match="optimizer must not be None"):
+        builder.set_optimizer(None)
 
 
 def test_set_optimizer_raises_runtime_error_if_called_twice():
@@ -119,3 +135,11 @@ def test_build_nco_does_not_mutate_estimators():
 
     # But NCO's inner should
     assert nco.inner_estimator.linear_constraints == ["constraint1"]
+
+
+def test_build_nco_raises_type_error_if_none():
+    builder = StrategyBuilder(constraints=[])
+    with pytest.raises(TypeError, match="inner_estimator must not be None"):
+        builder.build_nco(None, MeanRisk())
+    with pytest.raises(TypeError, match="outer_estimator must not be None"):
+        builder.build_nco(MeanRisk(), None)

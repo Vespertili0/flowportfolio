@@ -31,6 +31,35 @@ def test_init_raises_type_error(stub_universe):
         )
 
 
+def test_init_raises_type_error_non_string_keys(stub_universe):
+    with pytest.raises(TypeError, match="current_weights keys must all be strings"):
+        PortfolioDeltaEngine(
+            universe=stub_universe,
+            current_weights={1: 1.0, "MSFT": 0.0, "GOOG": 0.0},
+            target_weights={"AAPL": 1.0, "MSFT": 0.0, "GOOG": 0.0},
+        )
+
+
+def test_init_raises_type_error_bool_values(stub_universe):
+    with pytest.raises(TypeError, match="current_weights values must all be numeric"):
+        PortfolioDeltaEngine(
+            universe=stub_universe,
+            current_weights={"AAPL": True, "MSFT": False, "GOOG": False},
+            target_weights={"AAPL": 1.0, "MSFT": 0.0, "GOOG": 0.0},
+        )
+
+
+def test_init_raises_value_error_nan_values(stub_universe):
+    with pytest.raises(
+        ValueError, match="current_weights values must be finite numbers"
+    ):
+        PortfolioDeltaEngine(
+            universe=stub_universe,
+            current_weights={"AAPL": float("nan"), "MSFT": 0.0, "GOOG": 0.0},
+            target_weights={"AAPL": 1.0, "MSFT": 0.0, "GOOG": 0.0},
+        )
+
+
 def test_init_raises_value_error_sum_current(stub_universe):
     with pytest.raises(ValueError, match="current_weights must sum to 1.0"):
         PortfolioDeltaEngine(
