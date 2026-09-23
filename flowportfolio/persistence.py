@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pandas as pd
 from skfolio import Population
+
+logger = logging.getLogger(__name__)
 
 
 class PersistenceManager:
@@ -154,9 +157,7 @@ class PersistenceManager:
                     timestamp_str = timestamp_str[:-1] + "+00:00"
                 ts = pd.to_datetime(timestamp_str)
             except (ValueError, TypeError) as e:
-                import warnings
-
-                warnings.warn(
+                logger.warning(
                     f"Failed to parse timestamp {timestamp_str} in file {file}: {e}"
                 )
                 continue

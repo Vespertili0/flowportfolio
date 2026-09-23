@@ -32,6 +32,7 @@ class ConstraintBuilder:
         if not isinstance(universe, Universe):
             raise TypeError("universe must be a Universe instance.")
         self._universe = universe
+        self._valid_groups: set[str] = set(universe.metadata.values())
         self._constraints: list[str] = []
 
     def min_group(self, group_name: str, weight: float) -> ConstraintBuilder:
@@ -54,7 +55,7 @@ class ConstraintBuilder:
         ValueError
             If the group is not found in the universe metadata.
         """
-        if group_name not in self._universe.metadata.values():
+        if group_name not in self._valid_groups:
             raise ValueError(f"Group '{group_name}' not found in universe metadata.")
         self._constraints.append(f"{group_name} >= {weight:.6g}")
         return self
@@ -79,7 +80,7 @@ class ConstraintBuilder:
         ValueError
             If the group is not found in the universe metadata.
         """
-        if group_name not in self._universe.metadata.values():
+        if group_name not in self._valid_groups:
             raise ValueError(f"Group '{group_name}' not found in universe metadata.")
         self._constraints.append(f"{group_name} <= {weight:.6g}")
         return self
@@ -106,9 +107,8 @@ class ConstraintBuilder:
         ValueError
             If any of the groups are not found in the universe metadata.
         """
-        valid_groups = set(self._universe.metadata.values())
         for group in group_names:
-            if group not in valid_groups:
+            if group not in self._valid_groups:
                 raise ValueError(f"Group '{group}' not found in universe metadata.")
 
         combined_str = " + ".join(group_names)

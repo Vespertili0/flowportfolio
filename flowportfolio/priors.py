@@ -94,8 +94,8 @@ class PriorSynthesiser:
         self._views.append({"view": view_str, "confidence": confidence})
         return self
 
+    @staticmethod
     def build_empirical_prior(
-        self,
         covariance_estimator=None,
         mu_estimator=None,
     ) -> EmpiricalPrior:
