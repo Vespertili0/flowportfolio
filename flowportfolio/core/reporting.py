@@ -319,9 +319,11 @@ class Reporter:
     def _best_tag_by_median_cvar(self, tag_list: list[str]) -> str:
         valid_tags = [
             t
-            for t in set(tag_list)
+            for t in dict.fromkeys(tag_list)
             if any(getattr(p, "tag", None) == t for p in self._population)
         ]
+        if not valid_tags:
+            raise ValueError("No portfolios with matching tags found in population.")
 
         def safe_median(tag: str) -> float:
             cvar_ratios = [
