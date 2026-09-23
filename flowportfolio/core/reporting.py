@@ -151,11 +151,7 @@ class Reporter:
         ValueError
             If the population contains no tagged portfolios.
         """
-        tag_list = list(
-            dict.fromkeys(
-                p.tag for p in self._population if getattr(p, "tag", None) is not None
-            )
-        )
+        tag_list = self._unique_tags()
         if not tag_list:
             raise ValueError("Population contains no tagged portfolios.")
 
@@ -172,23 +168,7 @@ class Reporter:
             tag_list=tag_list,
         )
 
-        valid_tags = [
-            t
-            for t in set(tag_list)
-            if any(getattr(p, "tag", None) == t for p in self._population)
-        ]
-
-        def safe_median(tag: str) -> float:
-            cvar_ratios = [
-                p.cvar_ratio
-                for p in self._population
-                if getattr(p, "tag", None) == tag
-                and getattr(p, "cvar_ratio", None) is not None
-                and not np.isnan(p.cvar_ratio)
-            ]
-            return float(np.median(cvar_ratios)) if cvar_ratios else float("-inf")
-
-        best_tag = max(valid_tags, key=safe_median)
+        best_tag = self._best_tag_by_median_cvar(tag_list)
 
         best_portfolios = Population(
             [p for p in self._population if getattr(p, "tag", None) == best_tag]
@@ -271,32 +251,12 @@ class Reporter:
             ]
             table_md = "\n".join([header, separator] + rows)
 
-        tag_list = list(
-            dict.fromkeys(
-                p.tag for p in self._population if getattr(p, "tag", None) is not None
-            )
-        )
+        tag_list = self._unique_tags()
         if not tag_list:
             best_strategy = "N/A (No tagged portfolios)"
             top_holdings = "N/A"
         else:
-            valid_tags = [
-                t
-                for t in set(tag_list)
-                if any(getattr(p, "tag", None) == t for p in self._population)
-            ]
-
-            def safe_median(tag: str) -> float:
-                cvar_ratios = [
-                    p.cvar_ratio
-                    for p in self._population
-                    if getattr(p, "tag", None) == tag
-                    and getattr(p, "cvar_ratio", None) is not None
-                    and not np.isnan(p.cvar_ratio)
-                ]
-                return float(np.median(cvar_ratios)) if cvar_ratios else float("-inf")
-
-            best_tag = max(valid_tags, key=safe_median)
+            best_tag = self._best_tag_by_median_cvar(tag_list)
 
             best_portfolios = [
                 p for p in self._population if getattr(p, "tag", None) == best_tag
@@ -348,6 +308,32 @@ class Reporter:
             f"**Top 5 Holdings:** {top_holdings}\n"
         )
         return report
+
+    def _unique_tags(self) -> list[str]:
+        return list(
+            dict.fromkeys(
+                p.tag for p in self._population if getattr(p, "tag", None) is not None
+            )
+        )
+
+    def _best_tag_by_median_cvar(self, tag_list: list[str]) -> str:
+        valid_tags = [
+            t
+            for t in set(tag_list)
+            if any(getattr(p, "tag", None) == t for p in self._population)
+        ]
+
+        def safe_median(tag: str) -> float:
+            cvar_ratios = [
+                p.cvar_ratio
+                for p in self._population
+                if getattr(p, "tag", None) == tag
+                and getattr(p, "cvar_ratio", None) is not None
+                and not np.isnan(p.cvar_ratio)
+            ]
+            return float(np.median(cvar_ratios)) if cvar_ratios else float("-inf")
+
+        return max(valid_tags, key=safe_median)
 
     def extract_metrics_dataframe(self) -> pd.DataFrame:
         """Extract per-portfolio performance metrics into a flat pandas DataFrame.

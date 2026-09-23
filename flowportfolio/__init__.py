@@ -6,6 +6,7 @@ from flowportfolio.core.reporting import Reporter
 from flowportfolio.core.universe import DataFetchError, Universe
 from flowportfolio.delta import PortfolioDeltaEngine
 from flowportfolio.priors import PriorSynthesiser
+from flowportfolio.persistence import PersistenceManager
 from flowportfolio.strategies import StrategyBuilder
 
 __version__ = "0.3.0"
@@ -15,6 +16,7 @@ __all__ = [
     "DataFetchError",
     "PortfolioDeltaEngine",
     "PortfolioExperimentEngine",
+    "PersistenceManager",
     "PriorSynthesiser",
     "Reporter",
     "StrategyBuilder",
