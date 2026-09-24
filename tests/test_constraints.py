@@ -7,6 +7,7 @@ using the fluent builder pattern in :class:`flowportfolio.core.constraints.Const
 import pytest
 
 from flowportfolio.core.constraints import ConstraintBuilder
+from flowportfolio.core.protocols import UniverseProtocol
 from flowportfolio.core.universe import Universe
 
 # ---------------------------------------------------------------------------
@@ -27,6 +28,27 @@ def stub_universe() -> Universe:
     return Universe(tickers=tickers, metadata=metadata, fees=fees)
 
 
+@pytest.fixture
+def stub_protocol_universe() -> UniverseProtocol:
+    """Provide a minimal duck-typed stub that satisfies UniverseProtocol.
+
+    This stub does NOT subclass Universe, verifying that ConstraintBuilder
+    accepts any conforming object rather than requiring the concrete class.
+    """
+
+    class _MinimalStub:
+        @property
+        def tickers(self) -> list[str]:
+            return ["X", "Y"]
+
+        @property
+        def metadata(self) -> dict[str, str]:
+            return {"X": "growth", "Y": "value"}
+
+    return _MinimalStub()  # type: ignore[return-value]
+
+
+
 # ---------------------------------------------------------------------------
 # Initialisation
 # ---------------------------------------------------------------------------
@@ -41,7 +63,7 @@ def test_init_valid(stub_universe: Universe) -> None:
 
 def test_init_wrong_type() -> None:
     """Test ConstraintBuilder raises TypeError for non-Universe argument."""
-    with pytest.raises(TypeError, match="universe must be a Universe instance"):
+    with pytest.raises(TypeError, match="universe must implement UniverseProtocol"):
         ConstraintBuilder(universe="not_a_universe")  # type: ignore
 
 
@@ -161,3 +183,57 @@ def test_build_does_not_mutate(stub_universe: Universe) -> None:
     assert result1 == ["core >= 0.5"]
     assert result1 is not result2
     assert result1 == result2
+
+
+# ---------------------------------------------------------------------------
+# Protocol decoupling
+# ---------------------------------------------------------------------------
+
+
+def test_init_accepts_protocol_stub(stub_protocol_universe: UniverseProtocol) -> None:
+    """Test ConstraintBuilder accepts any object satisfying UniverseProtocol."""
+    builder = ConstraintBuilder(stub_protocol_universe)
+    assert builder._universe is stub_protocol_universe
+    assert builder._constraints == []
+
+
+def test_protocol_stub_builds_valid_constraints(
+    stub_protocol_universe: UniverseProtocol,
+) -> None:
+    """Test that constraints can be compiled from a protocol stub."""
+    builder = ConstraintBuilder(stub_protocol_universe)
+    result = builder.min_group("growth", 0.5).build()
+    assert result == ["growth >= 0.5"]
+
+
+# ---------------------------------------------------------------------------
+# Reset lifecycle
+# ---------------------------------------------------------------------------
+
+
+def test_reset_clears_constraints(stub_universe: Universe) -> None:
+    """Test reset() clears accumulated constraints."""
+    builder = ConstraintBuilder(stub_universe)
+    builder.min_group("core", 0.5)
+    assert builder.build() == ["core >= 0.5"]
+
+    builder.reset()
+    assert builder.build() == []
+
+
+def test_reset_returns_self_for_chaining(stub_universe: Universe) -> None:
+    """Test reset() returns self, enabling fluent chaining."""
+    builder = ConstraintBuilder(stub_universe)
+    result = builder.min_group("core", 0.5).reset().max_group("satellite", 0.3).build()
+    assert result == ["satellite <= 0.3"]
+
+
+def test_build_is_idempotent_without_reset(stub_universe: Universe) -> None:
+    """Test build() does not clear state; calling it twice yields same result."""
+    builder = ConstraintBuilder(stub_universe)
+    builder.min_group("core", 0.5)
+    first = builder.build()
+    second = builder.build()
+    assert first == second == ["core >= 0.5"]
+    assert first is not second  # distinct list objects
+

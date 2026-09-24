@@ -56,7 +56,7 @@ def test_set_optimizer_raises_runtime_error_if_called_twice():
     builder = StrategyBuilder(constraints=[])
     builder.set_optimizer(MeanRisk())
     with pytest.raises(
-        RuntimeError, match="set_optimizer called more than once without resetting"
+        RuntimeError, match="set_optimizer\\(\\) has already been called"
     ):
         builder.set_optimizer(MeanRisk())
 
@@ -143,3 +143,54 @@ def test_build_nco_raises_type_error_if_none():
         builder.build_nco(None, MeanRisk())
     with pytest.raises(TypeError, match="outer_estimator must not be None"):
         builder.build_nco(MeanRisk(), None)
+
+
+# ---------------------------------------------------------------------------
+# Reset lifecycle
+# ---------------------------------------------------------------------------
+
+
+def test_reset_clears_optimizer_state() -> None:
+    """Test reset() allows set_optimizer() to be called again."""
+    builder = StrategyBuilder(constraints=[])
+    builder.set_optimizer(MeanRisk())
+    builder.reset()
+    # Should not raise after reset
+    builder.set_optimizer(MeanRisk())
+    assert builder._optimizer is not None
+
+
+def test_reset_clears_pipeline_queues() -> None:
+    """Test reset() clears pre_selection and cross_sectional queues."""
+    builder = StrategyBuilder(constraints=[])
+    builder.add_pre_selection(MockTransformer())
+    builder.add_cross_sectional(MockTransformer())
+    builder.reset()
+    assert builder._pre_selection == []
+    assert builder._cross_sectional == []
+
+
+def test_reset_preserves_base_config_by_default() -> None:
+    """Test reset() retains constraints and prior when clear_base_config=False."""
+    prior = EmpiricalPrior()
+    builder = StrategyBuilder(constraints=["A >= 0.1"], prior=prior)
+    builder.reset()
+    assert builder.constraints == ["A >= 0.1"]
+    assert builder.prior is prior
+
+
+def test_reset_clears_base_config_when_flag_true() -> None:
+    """Test reset(clear_base_config=True) also wipes constraints and prior."""
+    prior = EmpiricalPrior()
+    builder = StrategyBuilder(constraints=["A >= 0.1"], prior=prior)
+    builder.reset(clear_base_config=True)
+    assert builder.constraints == []
+    assert builder.prior is None
+
+
+def test_reset_returns_self_for_chaining() -> None:
+    """Test reset() returns self, enabling fluent chaining."""
+    builder = StrategyBuilder(constraints=[])
+    returned = builder.reset()
+    assert returned is builder
+

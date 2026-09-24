@@ -76,18 +76,27 @@ constraints = (
     .build()
 )
 
-# 3. Register strategies and run a walk-forward cross-validation
-engine = PortfolioExperimentEngine(universe, constraints, n_jobs=-1)
+# 3. Assemble the estimator with constraints via StrategyBuilder
+from flowportfolio import StrategyBuilder
+
+pipeline = (
+    StrategyBuilder(constraints=constraints)
+    .set_optimizer(MeanRisk(risk_free_rate=0.03))
+    .build_pipeline()
+)
+
+# 4. Register strategies and run a walk-forward cross-validation
+engine = PortfolioExperimentEngine(universe, n_jobs=-1)
 engine.add_strategy(
     name="CoreSatellite",
-    estimator=MeanRisk(risk_free_rate=0.03, linear_constraints=constraints),
-    grid={"risk_measure": [RiskMeasure.VARIANCE, RiskMeasure.SEMI_VARIANCE]},
+    estimator=pipeline,
+    grid={"optimizer__risk_measure": [RiskMeasure.VARIANCE, RiskMeasure.SEMI_VARIANCE]},
 )
 population = engine.run_robustness_test(
     cv_type="walk_forward", train_size=252, test_size=63
 )
 
-# 4. Generate visual tearsheet
+# 5. Generate visual tearsheet
 Reporter(population).generate_tearsheet(baseline_tag="CoreSatellite")
 ```
 

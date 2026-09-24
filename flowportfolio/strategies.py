@@ -155,7 +155,10 @@ class StrategyBuilder:
             If set_optimizer() is called more than once without reset.
         """
         if self._optimizer is not None:
-            raise RuntimeError("set_optimizer called more than once without resetting.")
+            raise RuntimeError(
+                "set_optimizer() has already been called. "
+                "Call .reset() to clear the pipeline configuration before reconfiguring."
+            )
         if optimizer is None:
             raise TypeError("optimizer must not be None.")
 
@@ -180,6 +183,36 @@ class StrategyBuilder:
             if hasattr(self._optimizer, "linear_constraints"):
                 self._optimizer.linear_constraints = list(self.constraints)
 
+        return self
+
+    def reset(self, clear_base_config: bool = False) -> StrategyBuilder:
+        """Reset the builder pipeline configuration.
+
+        Clears the transformer queues and optimizer, allowing the builder
+        to be reconfigured with new pipeline components. By default, the
+        foundational ``constraints`` and ``prior`` supplied at construction
+        are retained.
+
+        Parameters
+        ----------
+        clear_base_config : bool, default False
+            If ``True``, also resets ``self.constraints`` to ``[]`` and
+            ``self.prior`` to ``None`` in addition to clearing the pipeline
+            staging queues.
+
+        Returns
+        -------
+        StrategyBuilder
+            The builder instance for method chaining.
+        """
+        self._pre_selection = []
+        self._cross_sectional = []
+        self._optimizer = None
+        self._fallback = None
+        self._fallbacks = []
+        if clear_base_config:
+            self.constraints = []
+            self.prior = None
         return self
 
     def build_pipeline(self) -> Pipeline:
