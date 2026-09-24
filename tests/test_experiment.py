@@ -62,25 +62,48 @@ def stub_universe_no_returns() -> Universe:
 # ---------------------------------------------------------------------------
 
 
-def test_init_valid(stub_universe: Universe) -> None:
-    """Test engine accepts valid Universe and list of constraints."""
-    engine = PortfolioExperimentEngine(stub_universe, ["core >= 0.5"])
+def test_init_valid_no_constraints(stub_universe: Universe) -> None:
+    """Test engine accepts Universe with no constraints (new default)."""
+    engine = PortfolioExperimentEngine(stub_universe)
     assert engine._universe is stub_universe
-    assert engine._constraints == ["core >= 0.5"]
+    assert engine._constraints == []
     assert engine._strategies == {}
     assert engine._n_jobs == -1
+
+
+def test_init_valid_with_deprecated_constraints(stub_universe: Universe) -> None:
+    """Test engine accepts constraints with DeprecationWarning when passed."""
+    with pytest.warns(DeprecationWarning, match="'constraints' parameter"):
+        engine = PortfolioExperimentEngine(stub_universe, ["core >= 0.5"])
+    assert engine._constraints == ["core >= 0.5"]
 
 
 def test_init_bad_universe() -> None:
     """Test TypeError is raised for non-Universe first arg."""
     with pytest.raises(TypeError, match="universe must be a Universe instance"):
-        PortfolioExperimentEngine(universe="invalid", constraints=[])  # type: ignore
+        PortfolioExperimentEngine(universe="invalid")  # type: ignore
 
 
 def test_init_bad_constraints(stub_universe: Universe) -> None:
-    """Test TypeError is raised for non-list constraints."""
+    """Test TypeError is raised when constraints is a non-list, non-None value."""
     with pytest.raises(TypeError, match="constraints must be a list"):
         PortfolioExperimentEngine(stub_universe, constraints="core >= 0.5")  # type: ignore
+
+
+def test_init_bad_constraints_elements(stub_universe: Universe) -> None:
+    """Test TypeError is raised when constraints list contains non-string items."""
+    with pytest.raises(TypeError, match="constraints must be a list of strings"):
+        PortfolioExperimentEngine(stub_universe, constraints=[123])  # type: ignore
+
+
+def test_constraints_property_returns_copy(stub_universe: Universe) -> None:
+    """Test the deprecated constraints property returns an independent copy."""
+    with pytest.warns(DeprecationWarning):
+        engine = PortfolioExperimentEngine(stub_universe, ["core >= 0.5"])
+    prop_result = engine.constraints
+    assert prop_result == ["core >= 0.5"]
+    prop_result.append("mutated")
+    assert engine.constraints == ["core >= 0.5"]  # internal state unaffected
 
 
 # ---------------------------------------------------------------------------
@@ -90,19 +113,32 @@ def test_init_bad_constraints(stub_universe: Universe) -> None:
 
 def test_add_strategy_valid(stub_universe: Universe) -> None:
     """Test valid strategy is stored correctly."""
-    engine = PortfolioExperimentEngine(stub_universe, [])
+    engine = PortfolioExperimentEngine(stub_universe)
     est = DummyEstimator()
     grid = {"param": [1, 2]}
 
     engine.add_strategy("MyStrat", est, grid)
+
     assert "MyStrat" in engine._strategies
     assert engine._strategies["MyStrat"]["estimator"] is est
     assert engine._strategies["MyStrat"]["grid"] == grid
 
 
+def test_add_strategy_grid_defensive_copy(stub_universe: Universe) -> None:
+    """Test grid dict is defensively copied upon registration."""
+    engine = PortfolioExperimentEngine(stub_universe)
+    est = DummyEstimator()
+    grid = {"param": [1, 2]}
+
+    engine.add_strategy("MyStrat", est, grid)
+    grid["param"] = [999]
+
+    assert engine._strategies["MyStrat"]["grid"] == {"param": [1, 2]}
+
+
 def test_add_strategy_duplicate_name(stub_universe: Universe) -> None:
     """Test ValueError is raised on duplicate registration."""
-    engine = PortfolioExperimentEngine(stub_universe, [])
+    engine = PortfolioExperimentEngine(stub_universe)
     engine.add_strategy("MyStrat", DummyEstimator(), {})
 
     with pytest.raises(ValueError, match="already registered"):
@@ -111,14 +147,14 @@ def test_add_strategy_duplicate_name(stub_universe: Universe) -> None:
 
 def test_add_strategy_bad_estimator(stub_universe: Universe) -> None:
     """Test TypeError is raised for non-BaseEstimator."""
-    engine = PortfolioExperimentEngine(stub_universe, [])
+    engine = PortfolioExperimentEngine(stub_universe)
     with pytest.raises(TypeError, match="scikit-learn BaseEstimator"):
         engine.add_strategy("MyStrat", estimator="not_an_estimator", grid={})  # type: ignore
 
 
 def test_add_strategy_bad_grid(stub_universe: Universe) -> None:
     """Test TypeError is raised for non-dict grid."""
-    engine = PortfolioExperimentEngine(stub_universe, [])
+    engine = PortfolioExperimentEngine(stub_universe)
     with pytest.raises(TypeError, match="grid must be a dictionary"):
         engine.add_strategy("MyStrat", DummyEstimator(), grid=["not", "dict"])  # type: ignore
 
@@ -150,7 +186,7 @@ def test_run_robustness_test_walk_forward(
     mock_population.return_value = mock_pop_instance
 
     # Setup engine
-    engine = PortfolioExperimentEngine(stub_universe, [])
+    engine = PortfolioExperimentEngine(stub_universe)
     engine.add_strategy("MyStrat", DummyEstimator(), {"p": [1]})
 
     # Run
@@ -186,7 +222,7 @@ def test_run_robustness_test_combinatorial(
     stub_universe: Universe,
 ) -> None:
     """Test execution with CombinatorialPurgedCV."""
-    engine = PortfolioExperimentEngine(stub_universe, [])
+    engine = PortfolioExperimentEngine(stub_universe)
     engine.add_strategy("Strat", DummyEstimator(), {})
     engine.run_robustness_test(cv_type="combinatorial", n_folds=5, n_test_folds=2)
 
@@ -204,7 +240,7 @@ def test_run_robustness_test_randomised(
     stub_universe: Universe,
 ) -> None:
     """Test execution with MultipleRandomizedCV."""
-    engine = PortfolioExperimentEngine(stub_universe, [])
+    engine = PortfolioExperimentEngine(stub_universe)
     engine.add_strategy("Strat", DummyEstimator(), {})
     # Need a base CV for randomized
     base_cv = WalkForward(train_size=252, test_size=63)
@@ -218,14 +254,14 @@ def test_run_robustness_test_randomised(
 
 def test_run_robustness_test_unknown_cv_type(stub_universe: Universe) -> None:
     """Test ValueError is raised for unsupported CV types."""
-    engine = PortfolioExperimentEngine(stub_universe, [])
+    engine = PortfolioExperimentEngine(stub_universe)
     with pytest.raises(ValueError, match="Unknown cv_type"):
         engine.run_robustness_test(cv_type="unknown_cv")
 
 
 def test_run_robustness_test_no_fetch(stub_universe_no_returns: Universe) -> None:
     """Test engine propagates ValueError if returns are not available."""
-    engine = PortfolioExperimentEngine(stub_universe_no_returns, [])
+    engine = PortfolioExperimentEngine(stub_universe_no_returns)
     engine.add_strategy("Strat", DummyEstimator(), {})
     with pytest.raises(ValueError, match="Returns are not yet available"):
         engine.run_robustness_test(train_size=252, test_size=63)

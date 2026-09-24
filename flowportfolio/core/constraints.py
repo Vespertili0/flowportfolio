@@ -7,7 +7,7 @@ asset universe structure.
 
 from __future__ import annotations
 
-from flowportfolio.core.universe import Universe
+from flowportfolio.core.protocols import UniverseProtocol
 
 
 class ConstraintBuilder:
@@ -18,19 +18,27 @@ class ConstraintBuilder:
 
     Parameters
     ----------
-    universe : Universe
-        The asset universe from which group metadata and ticker lists are
-        drawn.
+    universe : UniverseProtocol
+        The asset universe satisfying :class:`~flowportfolio.core.protocols.UniverseProtocol`
+        from which group metadata and ticker lists are drawn.
 
     Raises
     ------
     TypeError
-        If the ``universe`` argument is not a :class:`Universe` instance.
+        If the ``universe`` argument does not implement :class:`UniverseProtocol`,
+        or if its ``metadata`` is not a dict or ``tickers`` is not a list.
     """
 
-    def __init__(self, universe: Universe) -> None:
-        if not isinstance(universe, Universe):
-            raise TypeError("universe must be a Universe instance.")
+    def __init__(self, universe: UniverseProtocol) -> None:
+        if not isinstance(universe, UniverseProtocol):
+            raise TypeError(
+                "universe must implement UniverseProtocol "
+                "(requires 'tickers: list[str]' and 'metadata: dict[str, str]' properties)."
+            )
+        if not isinstance(universe.metadata, dict):
+            raise TypeError("universe.metadata must be a dictionary.")
+        if not isinstance(universe.tickers, list):
+            raise TypeError("universe.tickers must be a list.")
         self._universe = universe
         self._valid_groups: set[str] = set(universe.metadata.values())
         self._constraints: list[str] = []
@@ -172,3 +180,19 @@ class ConstraintBuilder:
             to ``skfolio`` optimisers.
         """
         return list(self._constraints)
+
+    def reset(self) -> ConstraintBuilder:
+        """Clear all accumulated constraints and return self.
+
+        Resets the builder to its initial empty state, ready for a new
+        constraint-building chain. This is the only way to discard
+        previously accumulated constraints; :meth:`build` is idempotent
+        and does not clear internal state.
+
+        Returns
+        -------
+        ConstraintBuilder
+            The builder instance for method chaining.
+        """
+        self._constraints = []
+        return self
