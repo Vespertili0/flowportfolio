@@ -83,7 +83,7 @@ Respond in Markdown using sections: ## Summary, ## Strengths, ## Findings (group
             reviewMarkdown = await awaitSessionResult(session);
         } catch (streamError) {
             // Log full error details to Actions console only — never expose to public PR comments
-            console.error("⚠️ Stream failed or timed out:", streamError);
+            console.error("⚠️ Stream failed or timed out:", streamError.stack || streamError.message || String(streamError));
             const softTimeoutComment = `⚠️ **Jules review stream interrupted.**\nThe session (\`${session.id}\`) was dispatched and may still complete the version bump PR in the background, but the review feedback stream timed out or did not report back.\n\nPlease check the GitHub Actions workflow logs for details.`;
 
             await postGitHubComment(repo, prNumber, githubToken, softTimeoutComment);
@@ -113,7 +113,7 @@ Respond in Markdown using sections: ## Summary, ## Strengths, ## Findings (group
 
     } catch (error) {
         // Log full error details to Actions console only — never expose to public PR comments
-        console.error("❌ Error running Jules PR Review:", error);
+        console.error("❌ Error running Jules PR Review:", error.stack || error.message || String(error));
         try {
             await postGitHubComment(
                 repo,
@@ -122,7 +122,7 @@ Respond in Markdown using sections: ## Summary, ## Strengths, ## Findings (group
                 `⚠️ **Jules PR review failed to complete.**\n\nPlease check the GitHub Actions workflow logs for more details.`
             );
         } catch (commentError) {
-            console.error("❌ Failed to post fallback error comment:", commentError);
+            console.error("❌ Failed to post fallback error comment:", commentError.stack || commentError.message || String(commentError));
         }
         process.exit(1);
     }

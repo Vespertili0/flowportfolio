@@ -220,7 +220,10 @@ def test_universe_fetch_data_no_close_column(mock_download) -> None:
     """Missing 'Close' level in a MultiIndex response must raise ValueError."""
     dates = pd.date_range("2026-01-01", periods=3)
     mock_df = pd.DataFrame(
-        {("Open", "SPY"): [100.0, 101.0, 102.0], ("Open", "IVV"): [200.0, 202.0, 204.0]},
+        {
+            ("Open", "SPY"): [100.0, 101.0, 102.0],
+            ("Open", "IVV"): [200.0, 202.0, 204.0],
+        },
         index=dates,
     )
     mock_df.columns = pd.MultiIndex.from_tuples(mock_df.columns)

@@ -7,7 +7,7 @@ asset universe structure.
 
 from __future__ import annotations
 
-from flowportfolio.core.universe import Universe
+from flowportfolio.core.protocols import UniverseProtocol
 
 
 class ConstraintBuilder:
@@ -18,20 +18,29 @@ class ConstraintBuilder:
 
     Parameters
     ----------
-    universe : Universe
-        The asset universe from which group metadata and ticker lists are
-        drawn.
+    universe : UniverseProtocol
+        The asset universe satisfying :class:`~flowportfolio.core.protocols.UniverseProtocol`
+        from which group metadata and ticker lists are drawn.
 
     Raises
     ------
     TypeError
-        If the ``universe`` argument is not a :class:`Universe` instance.
+        If the ``universe`` argument does not implement :class:`UniverseProtocol`,
+        or if its ``metadata`` is not a dict or ``tickers`` is not a list.
     """
 
-    def __init__(self, universe: Universe) -> None:
-        if not isinstance(universe, Universe):
-            raise TypeError("universe must be a Universe instance.")
+    def __init__(self, universe: UniverseProtocol) -> None:
+        if not isinstance(universe, UniverseProtocol):
+            raise TypeError(
+                "universe must implement UniverseProtocol "
+                "(requires 'tickers: list[str]' and 'metadata: dict[str, str]' properties)."
+            )
+        if not isinstance(universe.metadata, dict):
+            raise TypeError("universe.metadata must be a dictionary.")
+        if not isinstance(universe.tickers, list):
+            raise TypeError("universe.tickers must be a list.")
         self._universe = universe
+        self._valid_groups: set[str] = set(universe.metadata.values())
         self._constraints: list[str] = []
 
     def min_group(self, group_name: str, weight: float) -> ConstraintBuilder:
@@ -54,7 +63,7 @@ class ConstraintBuilder:
         ValueError
             If the group is not found in the universe metadata.
         """
-        if group_name not in self._universe.metadata.values():
+        if group_name not in self._valid_groups:
             raise ValueError(f"Group '{group_name}' not found in universe metadata.")
         self._constraints.append(f"{group_name} >= {weight:.6g}")
         return self
@@ -79,7 +88,7 @@ class ConstraintBuilder:
         ValueError
             If the group is not found in the universe metadata.
         """
-        if group_name not in self._universe.metadata.values():
+        if group_name not in self._valid_groups:
             raise ValueError(f"Group '{group_name}' not found in universe metadata.")
         self._constraints.append(f"{group_name} <= {weight:.6g}")
         return self
@@ -106,11 +115,10 @@ class ConstraintBuilder:
         ValueError
             If any of the groups are not found in the universe metadata.
         """
-        valid_groups = set(self._universe.metadata.values())
         for group in group_names:
-            if group not in valid_groups:
+            if group not in self._valid_groups:
                 raise ValueError(f"Group '{group}' not found in universe metadata.")
-        
+
         combined_str = " + ".join(group_names)
         self._constraints.append(f"{combined_str} <= {weight:.6g}")
         return self
@@ -145,18 +153,18 @@ class ConstraintBuilder:
         """
         if not (0.0 < limit <= 1.0):
             raise ValueError("Turnover limit must be between 0.0 (exclusive) and 1.0.")
-            
+
         missing_tickers = set(self._universe.tickers) - set(current_weights.keys())
         if missing_tickers:
             raise ValueError(f"Missing current weights for tickers: {missing_tickers}")
 
         for ticker in self._universe.tickers:
             current_weight = current_weights[ticker]
-            
+
             # Calculate bounds and clamp to [0.0, 1.0]
             lower_bound = max(0.0, current_weight - limit)
             upper_bound = min(1.0, current_weight + limit)
-            
+
             self._constraints.append(f"{ticker} >= {lower_bound:.6g}")
             self._constraints.append(f"{ticker} <= {upper_bound:.6g}")
 
@@ -172,3 +180,19 @@ class ConstraintBuilder:
             to ``skfolio`` optimisers.
         """
         return list(self._constraints)
+
+    def reset(self) -> ConstraintBuilder:
+        """Clear all accumulated constraints and return self.
+
+        Resets the builder to its initial empty state, ready for a new
+        constraint-building chain. This is the only way to discard
+        previously accumulated constraints; :meth:`build` is idempotent
+        and does not clear internal state.
+
+        Returns
+        -------
+        ConstraintBuilder
+            The builder instance for method chaining.
+        """
+        self._constraints = []
+        return self

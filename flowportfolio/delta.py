@@ -71,13 +71,31 @@ class PortfolioDeltaEngine:
             raise TypeError("current_weights must be a dict.")
         if not isinstance(target_weights, dict):
             raise TypeError("target_weights must be a dict.")
-        if not all(isinstance(v, (int, float)) for v in current_weights.values()):
+        if not all(isinstance(k, str) for k in current_weights):
+            raise TypeError("current_weights keys must all be strings.")
+        if not all(isinstance(k, str) for k in target_weights):
+            raise TypeError("target_weights keys must all be strings.")
+        if not all(
+            isinstance(v, (int, float)) and not isinstance(v, bool)
+            for v in current_weights.values()
+        ):
             raise TypeError(
                 "current_weights values must all be numeric (int or float)."
             )
-        if not all(isinstance(v, (int, float)) for v in target_weights.values()):
-            raise TypeError(
-                "target_weights values must all be numeric (int or float)."
+        if not all(
+            isinstance(v, (int, float)) and not isinstance(v, bool)
+            for v in target_weights.values()
+        ):
+            raise TypeError("target_weights values must all be numeric (int or float).")
+
+        # --- finite value validation (guards against NaN / Inf) ---
+        if not all(np.isfinite(v) for v in current_weights.values()):
+            raise ValueError(
+                "current_weights values must be finite numbers (no NaN or Inf)."
+            )
+        if not all(np.isfinite(v) for v in target_weights.values()):
+            raise ValueError(
+                "target_weights values must be finite numbers (no NaN or Inf)."
             )
 
         # --- sum-to-one validation ---
@@ -96,17 +114,30 @@ class PortfolioDeltaEngine:
 
         # --- ticker coverage validation ---
         universe_tickers = set(universe.tickers)
-        missing_current = set(current_weights.keys()) - universe_tickers
-        if missing_current:
+
+        unknown_current = set(current_weights.keys()) - universe_tickers
+        if unknown_current:
             raise ValueError(
                 f"current_weights contains tickers not found in universe: "
+                f"{sorted(unknown_current)}."
+            )
+        missing_current = universe_tickers - set(current_weights.keys())
+        if missing_current:
+            raise ValueError(
+                f"current_weights is missing universe tickers: "
                 f"{sorted(missing_current)}."
             )
-        missing_target = set(target_weights.keys()) - universe_tickers
-        if missing_target:
+
+        unknown_target = set(target_weights.keys()) - universe_tickers
+        if unknown_target:
             raise ValueError(
                 f"target_weights contains tickers not found in universe: "
-                f"{sorted(missing_target)}."
+                f"{sorted(unknown_target)}."
+            )
+        missing_target = universe_tickers - set(target_weights.keys())
+        if missing_target:
+            raise ValueError(
+                f"target_weights is missing universe tickers: {sorted(missing_target)}."
             )
 
         self._universe: Universe = universe
@@ -219,9 +250,7 @@ class PortfolioDeltaEngine:
             been populated (i.e. ``fetch_data()`` has not been called).
         """
         if not isinstance(population, Population):
-            raise TypeError(
-                "population must be a skfolio.Population instance."
-            )
+            raise TypeError("population must be a skfolio.Population instance.")
         if len(population) == 0:
             raise ValueError("population must not be empty.")
 
@@ -289,14 +318,22 @@ class PortfolioDeltaEngine:
         ValueError
             If ``brokerage_bps`` or ``slippage_bps`` are negative.
         """
-        if brokerage_bps < 0:
+        if (
+            not isinstance(brokerage_bps, (int, float))
+            or isinstance(brokerage_bps, bool)
+            or not np.isfinite(brokerage_bps)
+            or brokerage_bps < 0
+        ):
             raise ValueError(
                 f"brokerage_bps must be non-negative; got {brokerage_bps}."
             )
-        if slippage_bps < 0:
-            raise ValueError(
-                f"slippage_bps must be non-negative; got {slippage_bps}."
-            )
+        if (
+            not isinstance(slippage_bps, (int, float))
+            or isinstance(slippage_bps, bool)
+            or not np.isfinite(slippage_bps)
+            or slippage_bps < 0
+        ):
+            raise ValueError(f"slippage_bps must be non-negative; got {slippage_bps}.")
 
         fees = self._universe.fees
         total_bps = brokerage_bps + slippage_bps
@@ -328,7 +365,13 @@ class PortfolioDeltaEngine:
 
         df = pd.DataFrame(
             rows,
-            columns=["ticker", "turnover", "transaction_cost", "annual_ter", "total_friction"],
+            columns=[
+                "ticker",
+                "turnover",
+                "transaction_cost",
+                "annual_ter",
+                "total_friction",
+            ],
         )
 
         # Append summary row

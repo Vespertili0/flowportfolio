@@ -7,19 +7,21 @@ multiple investment strategies using ``skfolio``.
 
 from __future__ import annotations
 
-from sklearn.base import BaseEstimator
-from sklearn.model_selection import GridSearchCV
+import warnings
+
 from skfolio import Population, RatioMeasure
 from skfolio.metrics import make_scorer
 from skfolio.model_selection import (
-    cross_val_predict,
-    WalkForward,
     CombinatorialPurgedCV,
     MultipleRandomizedCV,
     OnlineGridSearch,
+    WalkForward,
+    cross_val_predict,
     online_predict,
 )
-from skfolio.moments import EWMu, EWCovariance
+from sklearn.base import BaseEstimator
+from sklearn.model_selection import GridSearchCV
+
 from flowportfolio.core.universe import Universe
 
 
@@ -33,12 +35,13 @@ class PortfolioExperimentEngine:
     ----------
     universe : Universe
         The asset universe providing historical returns and fees.
-    constraints : list[str]
-        A list of ``skfolio``-compatible linear constraint strings. Stored
-        on the engine (as ``self._constraints``) so that callers can
-        inject them into estimators before registering them via
-        ``add_strategy``. The engine does not automatically inject these
-        constraints into the estimators.
+    constraints : list[str] or None, optional
+        Deprecated. A list of ``skfolio``-compatible linear constraint
+        strings. Passing a non-``None`` value emits a
+        :class:`DeprecationWarning`. Strategy constraints should be
+        injected into estimators via
+        :class:`~flowportfolio.strategies.StrategyBuilder` instead.
+        Default is ``None``.
     n_jobs : int, default -1
         The number of parallel jobs to run during cross-validation.
         ``-1`` means using all available processors.
@@ -53,18 +56,43 @@ class PortfolioExperimentEngine:
     def __init__(
         self,
         universe: Universe,
-        constraints: list[str],
+        constraints: list[str] | None = None,
         n_jobs: int = -1,
     ) -> None:
         if not isinstance(universe, Universe):
             raise TypeError("universe must be a Universe instance.")
-        if not isinstance(constraints, list):
-            raise TypeError("constraints must be a list of strings.")
-
+        if constraints is not None:
+            if not isinstance(constraints, list):
+                raise TypeError("constraints must be a list of strings.")
+            if not all(isinstance(c, str) for c in constraints):
+                raise TypeError("constraints must be a list of strings.")
+            warnings.warn(
+                "The 'constraints' parameter of PortfolioExperimentEngine is deprecated "
+                "and will be removed in a future release. Constraints should be applied "
+                "per-strategy via StrategyBuilder(constraints=...) before registering "
+                "the estimator with add_strategy().",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            self._constraints = list(constraints)
+        else:
+            self._constraints = []
         self._universe = universe
-        self._constraints = list(constraints)
         self._n_jobs = n_jobs
         self._strategies: dict[str, dict] = {}
+
+    @property
+    def constraints(self) -> list[str]:
+        """Deprecated engine-level constraint list.
+
+        Returns
+        -------
+        list[str]
+            A copy of the constraints stored at construction time.
+            Prefer managing constraints via
+            :class:`~flowportfolio.strategies.StrategyBuilder`.
+        """
+        return list(self._constraints)
 
     def add_strategy(
         self,
@@ -104,7 +132,7 @@ class PortfolioExperimentEngine:
 
         self._strategies[name] = {
             "estimator": estimator,
-            "grid": grid,
+            "grid": dict(grid),
         }
 
     def _resolve_cv_splitter(self, cv_type: str, **cv_kwargs):
@@ -173,7 +201,8 @@ class PortfolioExperimentEngine:
             ``universe.returns`` is unavailable.
         """
         # 1. Resolve CV protocol
-        cv = self._resolve_cv_splitter(cv_type, **cv_kwargs)
+        inner_cv = self._resolve_cv_splitter(cv_type, **cv_kwargs)
+        outer_cv = self._resolve_cv_splitter(cv_type, **cv_kwargs)
 
         # 2. Extract returns (will raise ValueError if not fetched)
         returns = self._universe.returns
@@ -188,23 +217,21 @@ class PortfolioExperimentEngine:
             search = GridSearchCV(
                 estimator=config["estimator"],
                 param_grid=config["grid"],
-                cv=cv,
+                cv=inner_cv,
                 scoring=make_scorer(RatioMeasure.CVAR_RATIO),
                 refit=True,
                 n_jobs=self._n_jobs,
             )
-            search.fit(returns)
-            best_model = search.best_estimator_
 
             # b. Out-of-sample journey simulation
             portfolio = cross_val_predict(
-                best_model,
+                search,
                 returns,
-                cv=cv,
+                cv=outer_cv,
                 n_jobs=self._n_jobs,
                 portfolio_params={"tag": name},
             )
-            
+
             collected.append(portfolio)
 
         return Population(collected)
@@ -272,7 +299,7 @@ class PortfolioExperimentEngine:
                 n_jobs=self._n_jobs,
                 portfolio_params={"tag": name},
             )
-            
+
             collected.append(portfolio)
 
         return Population(collected)

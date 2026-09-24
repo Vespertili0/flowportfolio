@@ -1,0 +1,224 @@
+import pytest
+from skfolio.optimization import (
+    HierarchicalRiskParity,
+    MeanRisk,
+    NestedClustersOptimization,
+)
+from skfolio.prior import EmpiricalPrior
+from sklearn.pipeline import Pipeline
+
+from flowportfolio.strategies import StrategyBuilder
+
+
+class MockTransformer:
+    def fit_transform(self, X):
+        return X
+
+
+def test_init_raises_type_error():
+    with pytest.raises(TypeError, match="constraints must be a list"):
+        StrategyBuilder(constraints="not a list")
+
+
+def test_init_raises_type_error_elements():
+    with pytest.raises(TypeError, match="All constraints must be strings"):
+        StrategyBuilder(constraints=[123])
+
+
+def test_init_raises_type_error_prior():
+    with pytest.raises(TypeError, match="prior must be an instance of BasePrior"):
+        StrategyBuilder(constraints=[], prior="not a prior")
+
+
+def test_add_pre_selection_raises_type_error():
+    builder = StrategyBuilder(constraints=[])
+    with pytest.raises(
+        TypeError, match="transformer must implement a fit_transform method"
+    ):
+        builder.add_pre_selection("not a transformer")
+
+
+def test_add_cross_sectional_raises_type_error():
+    builder = StrategyBuilder(constraints=[])
+    with pytest.raises(
+        TypeError, match="transformer must implement a fit_transform method"
+    ):
+        builder.add_cross_sectional("not a transformer")
+
+
+def test_set_optimizer_raises_type_error_if_none():
+    builder = StrategyBuilder(constraints=[])
+    with pytest.raises(TypeError, match="optimizer must not be None"):
+        builder.set_optimizer(None)
+
+
+def test_set_optimizer_raises_runtime_error_if_called_twice():
+    builder = StrategyBuilder(constraints=[])
+    builder.set_optimizer(MeanRisk())
+    with pytest.raises(
+        RuntimeError, match="set_optimizer\\(\\) has already been called"
+    ):
+        builder.set_optimizer(MeanRisk())
+
+
+def test_set_optimizer_fallback_unsupported_raises_type_error():
+    class UnsupportedOptimizer:
+        pass
+
+    builder = StrategyBuilder(constraints=[])
+    with pytest.raises(
+        TypeError, match="The provided optimizer does not support fallback semantics."
+    ):
+        builder.set_optimizer(UnsupportedOptimizer(), fallback=MeanRisk())
+
+
+def test_build_pipeline_raises_runtime_error_no_optimizer():
+    builder = StrategyBuilder(constraints=[])
+    with pytest.raises(RuntimeError, match="No optimizer set"):
+        builder.build_pipeline()
+
+
+def test_build_pipeline_ordering_and_prior_injection():
+    prior = EmpiricalPrior()
+    builder = StrategyBuilder(constraints=[], prior=prior)
+
+    pre = MockTransformer()
+    cs = MockTransformer()
+    opt = MeanRisk()
+
+    builder.add_pre_selection(pre)
+    builder.add_cross_sectional(cs)
+    builder.set_optimizer(opt)
+
+    pipeline = builder.build_pipeline()
+    assert isinstance(pipeline, Pipeline)
+    assert len(pipeline.steps) == 3
+    assert pipeline.steps[0][0] == "pre_0"
+    assert pipeline.steps[1][0] == "cs_0"
+    assert pipeline.steps[2][0] == "optimizer"
+
+    # Check prior injection
+    assert pipeline.steps[2][1].prior_estimator is prior
+
+
+def test_build_nco_clustering_dispatch_and_no_mutation():
+    builder = StrategyBuilder(constraints=["A >= 0.1"])
+
+    inner = MeanRisk()
+    outer = MeanRisk()
+
+    nco = builder.build_nco(inner, outer, clusterer="kmeans")
+    assert isinstance(nco, NestedClustersOptimization)
+
+    # Check injection
+    assert nco.inner_estimator.linear_constraints == ["A >= 0.1"]
+
+    # Check invalid clusterer
+    with pytest.raises(ValueError, match="clusterer must be one of"):
+        builder.build_nco(inner, outer, clusterer="invalid")
+
+
+def test_build_nco_does_not_mutate_estimators():
+    builder = StrategyBuilder(constraints=["constraint1"])
+
+    inner = MeanRisk()
+    outer = HierarchicalRiskParity()
+
+    nco = builder.build_nco(inner, outer)
+
+    # Original inner should not have constraints
+    assert (
+        not hasattr(inner, "linear_constraints")
+        or inner.linear_constraints is None
+        or inner.linear_constraints != ["constraint1"]
+    )
+
+    # But NCO's inner should
+    assert nco.inner_estimator.linear_constraints == ["constraint1"]
+
+
+def test_build_nco_raises_type_error_if_none():
+    builder = StrategyBuilder(constraints=[])
+    with pytest.raises(TypeError, match="inner_estimator must not be None"):
+        builder.build_nco(None, MeanRisk())
+    with pytest.raises(TypeError, match="outer_estimator must not be None"):
+        builder.build_nco(MeanRisk(), None)
+
+
+# ---------------------------------------------------------------------------
+# Reset lifecycle
+# ---------------------------------------------------------------------------
+
+
+def test_reset_clears_optimizer_state() -> None:
+    """Test reset() allows set_optimizer() to be called again."""
+    builder = StrategyBuilder(constraints=[])
+    builder.set_optimizer(MeanRisk())
+    builder.reset()
+    # Should not raise after reset
+    builder.set_optimizer(MeanRisk())
+    assert builder._optimizer is not None
+
+
+def test_reset_clears_pipeline_queues() -> None:
+    """Test reset() clears pre_selection and cross_sectional queues."""
+    builder = StrategyBuilder(constraints=[])
+    builder.add_pre_selection(MockTransformer())
+    builder.add_cross_sectional(MockTransformer())
+    builder.reset()
+    assert builder._pre_selection == []
+    assert builder._cross_sectional == []
+
+
+def test_reset_preserves_base_config_by_default() -> None:
+    """Test reset() retains constraints and prior when clear_base_config=False."""
+    prior = EmpiricalPrior()
+    builder = StrategyBuilder(constraints=["A >= 0.1"], prior=prior)
+    builder.reset()
+    assert builder.constraints == ["A >= 0.1"]
+    assert builder.prior is prior
+
+
+def test_reset_clears_base_config_when_flag_true() -> None:
+    """Test reset(clear_base_config=True) also wipes constraints and prior."""
+    prior = EmpiricalPrior()
+    builder = StrategyBuilder(constraints=["A >= 0.1"], prior=prior)
+    builder.reset(clear_base_config=True)
+    assert builder.constraints == []
+    assert builder.prior is None
+
+
+def test_reset_returns_self_for_chaining() -> None:
+    """Test reset() returns self, enabling fluent chaining."""
+    builder = StrategyBuilder(constraints=[])
+    returned = builder.reset()
+    assert returned is builder
+
+
+def test_init_defaults_to_empty_constraints() -> None:
+    """Test StrategyBuilder can be instantiated with no arguments."""
+    builder = StrategyBuilder()
+    assert builder.constraints == []
+    assert builder.prior is None
+
+
+def test_init_accepts_none_constraints() -> None:
+    """Test StrategyBuilder explicitly accepts constraints=None."""
+    builder = StrategyBuilder(constraints=None)
+    assert builder.constraints == []
+
+
+def test_build_pipeline_clones_transformers() -> None:
+    """Test build_pipeline creates independent clones of queued transformers."""
+    pre = MockTransformer()
+    cs = MockTransformer()
+    builder = StrategyBuilder()
+    builder.add_pre_selection(pre)
+    builder.add_cross_sectional(cs)
+    builder.set_optimizer(MeanRisk())
+
+    pipeline1 = builder.build_pipeline()
+    pipeline2 = builder.build_pipeline()
+
+    assert pipeline1.steps[0][1] is not pipeline2.steps[0][1]
+    assert pipeline1.steps[1][1] is not pipeline2.steps[1][1]
