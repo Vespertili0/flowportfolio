@@ -1,6 +1,7 @@
 """flowportfolio: A fluent, ETF-focused portfolio experimentation API built on top of skfolio."""
 
-from importlib.metadata import PackageNotFoundError, version as _metadata_version
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _metadata_version
 
 from flowportfolio.core.constraints import ConstraintBuilder
 from flowportfolio.core.experiment import PortfolioExperimentEngine

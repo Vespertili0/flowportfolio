@@ -194,3 +194,31 @@ def test_reset_returns_self_for_chaining() -> None:
     returned = builder.reset()
     assert returned is builder
 
+
+def test_init_defaults_to_empty_constraints() -> None:
+    """Test StrategyBuilder can be instantiated with no arguments."""
+    builder = StrategyBuilder()
+    assert builder.constraints == []
+    assert builder.prior is None
+
+
+def test_init_accepts_none_constraints() -> None:
+    """Test StrategyBuilder explicitly accepts constraints=None."""
+    builder = StrategyBuilder(constraints=None)
+    assert builder.constraints == []
+
+
+def test_build_pipeline_clones_transformers() -> None:
+    """Test build_pipeline creates independent clones of queued transformers."""
+    pre = MockTransformer()
+    cs = MockTransformer()
+    builder = StrategyBuilder()
+    builder.add_pre_selection(pre)
+    builder.add_cross_sectional(cs)
+    builder.set_optimizer(MeanRisk())
+
+    pipeline1 = builder.build_pipeline()
+    pipeline2 = builder.build_pipeline()
+
+    assert pipeline1.steps[0][1] is not pipeline2.steps[0][1]
+    assert pipeline1.steps[1][1] is not pipeline2.steps[1][1]

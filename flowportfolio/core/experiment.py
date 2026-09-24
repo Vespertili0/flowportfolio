@@ -64,6 +64,8 @@ class PortfolioExperimentEngine:
         if constraints is not None:
             if not isinstance(constraints, list):
                 raise TypeError("constraints must be a list of strings.")
+            if not all(isinstance(c, str) for c in constraints):
+                raise TypeError("constraints must be a list of strings.")
             warnings.warn(
                 "The 'constraints' parameter of PortfolioExperimentEngine is deprecated "
                 "and will be removed in a future release. Constraints should be applied "
@@ -130,7 +132,7 @@ class PortfolioExperimentEngine:
 
         self._strategies[name] = {
             "estimator": estimator,
-            "grid": grid,
+            "grid": dict(grid),
         }
 
     def _resolve_cv_splitter(self, cv_type: str, **cv_kwargs):

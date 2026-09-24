@@ -18,14 +18,15 @@ class ConstraintBuilder:
 
     Parameters
     ----------
-    universe : Universe
-        The asset universe from which group metadata and ticker lists are
-        drawn.
+    universe : UniverseProtocol
+        The asset universe satisfying :class:`~flowportfolio.core.protocols.UniverseProtocol`
+        from which group metadata and ticker lists are drawn.
 
     Raises
     ------
     TypeError
-        If the ``universe`` argument is not a :class:`Universe` instance.
+        If the ``universe`` argument does not implement :class:`UniverseProtocol`,
+        or if its ``metadata`` is not a dict or ``tickers`` is not a list.
     """
 
     def __init__(self, universe: UniverseProtocol) -> None:
@@ -34,6 +35,10 @@ class ConstraintBuilder:
                 "universe must implement UniverseProtocol "
                 "(requires 'tickers: list[str]' and 'metadata: dict[str, str]' properties)."
             )
+        if not isinstance(universe.metadata, dict):
+            raise TypeError("universe.metadata must be a dictionary.")
+        if not isinstance(universe.tickers, list):
+            raise TypeError("universe.tickers must be a list.")
         self._universe = universe
         self._valid_groups: set[str] = set(universe.metadata.values())
         self._constraints: list[str] = []

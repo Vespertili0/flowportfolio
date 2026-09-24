@@ -48,7 +48,6 @@ def stub_protocol_universe() -> UniverseProtocol:
     return _MinimalStub()  # type: ignore[return-value]
 
 
-
 # ---------------------------------------------------------------------------
 # Initialisation
 # ---------------------------------------------------------------------------
@@ -237,3 +236,26 @@ def test_build_is_idempotent_without_reset(stub_universe: Universe) -> None:
     assert first == second == ["core >= 0.5"]
     assert first is not second  # distinct list objects
 
+
+def test_init_raises_if_metadata_not_dict() -> None:
+    """Test ConstraintBuilder raises TypeError if universe.metadata is not a dict."""
+
+    class _BadMetadata:
+        def __init__(self) -> None:
+            self.tickers = ["A"]
+            self.metadata = "not-a-dict"
+
+    with pytest.raises(TypeError, match="universe.metadata must be a dictionary"):
+        ConstraintBuilder(_BadMetadata())  # type: ignore[arg-type]
+
+
+def test_init_raises_if_tickers_not_list() -> None:
+    """Test ConstraintBuilder raises TypeError if universe.tickers is not a list."""
+
+    class _BadTickers:
+        def __init__(self) -> None:
+            self.tickers = "not-a-list"
+            self.metadata = {"A": "growth"}
+
+    with pytest.raises(TypeError, match="universe.tickers must be a list"):
+        ConstraintBuilder(_BadTickers())  # type: ignore[arg-type]

@@ -27,6 +27,7 @@ jobs:
 
     - name: Verify build
       run: |
+        uv venv
         uv pip install dist/*.whl
         mkdir tmp_test
         cd tmp_test

@@ -90,6 +90,12 @@ def test_init_bad_constraints(stub_universe: Universe) -> None:
         PortfolioExperimentEngine(stub_universe, constraints="core >= 0.5")  # type: ignore
 
 
+def test_init_bad_constraints_elements(stub_universe: Universe) -> None:
+    """Test TypeError is raised when constraints list contains non-string items."""
+    with pytest.raises(TypeError, match="constraints must be a list of strings"):
+        PortfolioExperimentEngine(stub_universe, constraints=[123])  # type: ignore
+
+
 def test_constraints_property_returns_copy(stub_universe: Universe) -> None:
     """Test the deprecated constraints property returns an independent copy."""
     with pytest.warns(DeprecationWarning):
@@ -112,9 +118,22 @@ def test_add_strategy_valid(stub_universe: Universe) -> None:
     grid = {"param": [1, 2]}
 
     engine.add_strategy("MyStrat", est, grid)
+
     assert "MyStrat" in engine._strategies
     assert engine._strategies["MyStrat"]["estimator"] is est
     assert engine._strategies["MyStrat"]["grid"] == grid
+
+
+def test_add_strategy_grid_defensive_copy(stub_universe: Universe) -> None:
+    """Test grid dict is defensively copied upon registration."""
+    engine = PortfolioExperimentEngine(stub_universe)
+    est = DummyEstimator()
+    grid = {"param": [1, 2]}
+
+    engine.add_strategy("MyStrat", est, grid)
+    grid["param"] = [999]
+
+    assert engine._strategies["MyStrat"]["grid"] == {"param": [1, 2]}
 
 
 def test_add_strategy_duplicate_name(stub_universe: Universe) -> None:

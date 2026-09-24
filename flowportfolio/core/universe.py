@@ -8,11 +8,11 @@ computation via ``skfolio``'s canonical preprocessing pipeline.
 
 from __future__ import annotations
 
-from flowportfolio.core.protocols import UniverseProtocol  # noqa: F401
-
 import pandas as pd
 import yfinance as yf
 from skfolio.preprocessing import prices_to_returns
+
+from flowportfolio.core.protocols import UniverseProtocol  # noqa: F401
 
 
 class DataFetchError(Exception):
