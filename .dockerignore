@@ -1,0 +1,46 @@
+# Version control
+.git/
+.gitattributes
+.gitignore
+
+# CI/CD and agent configs
+.github/
+.agents/
+.pre-commit-config.yaml
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python cache and build artefacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Dev tool caches
+.pytest_cache/
+.ruff_cache/
+.python-version
+.coverage
+htmlcov/
+
+# Tests (not needed at runtime)
+tests/
+
+# Local runtime data and credentials
+.env
+.env.*
+*.db
+*.sqlite3
+
+# IDE and OS artefacts
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/
