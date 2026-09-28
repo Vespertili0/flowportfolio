@@ -206,6 +206,71 @@ def test_custom_baseline_tag(
     assert "MyBaseline" in boxplot_kwargs["tag_list"]
 
 
+@patch.object(Population, "plot_distribution")
+@patch.object(Population, "boxplot_measure")
+def test_plot_stress_impact_success(
+    mock_boxplot: MagicMock,
+    mock_distribution: MagicMock,
+) -> None:
+    """Test plot_stress_impact calls the required plots and show()."""
+    fig1 = MagicMock()
+    fig2 = MagicMock()
+    mock_boxplot.return_value = fig1
+    mock_distribution.return_value = fig2
+
+    p_baseline = _make_mock_portfolio("Baseline", 1.0)
+    p_stress = _make_mock_portfolio("Stress", 0.8)
+
+    pop = MagicMock(spec=Population)
+    pop.__iter__.return_value = [p_baseline, p_stress]
+    reporter = Reporter(pop)
+
+    reporter.plot_stress_impact(stress_tag="Stress", baseline_tag="Baseline")
+
+    # boxplot_measure called on the combined Population of Stress + Baseline
+    # We can assert it was called, and that show() was called on figures
+    mock_boxplot.assert_called_once()
+    mock_distribution.assert_called_once()
+
+    fig1.show.assert_called_once()
+    fig1.update_layout.assert_called_once_with(
+        title="CVaR Distribution: Stress vs Baseline"
+    )
+
+    fig2.show.assert_called_once()
+    fig2.update_layout.assert_called_once_with(
+        title="Max Drawdown Distribution: Stress vs Baseline"
+    )
+
+
+def test_plot_stress_impact_missing_stress_tag() -> None:
+    """Test plot_stress_impact raises ValueError if stress_tag matches no portfolios."""
+    p_baseline = _make_mock_portfolio("Baseline", 1.0)
+
+    pop = MagicMock(spec=Population)
+    pop.__iter__.return_value = [p_baseline]
+    reporter = Reporter(pop)
+
+    with pytest.raises(
+        ValueError, match="Tag 'Stress' matched no portfolios in the population."
+    ):
+        reporter.plot_stress_impact(stress_tag="Stress", baseline_tag="Baseline")
+
+
+def test_plot_stress_impact_missing_baseline_tag() -> None:
+    """Test plot_stress_impact raises ValueError if baseline_tag matches no portfolios."""
+    p_stress = _make_mock_portfolio("Stress", 0.8)
+
+    pop = MagicMock(spec=Population)
+    pop.__iter__.return_value = [p_stress]
+    reporter = Reporter(pop)
+
+    with pytest.raises(
+        ValueError, match="Tag 'Baseline' matched no portfolios in the population."
+    ):
+        reporter.plot_stress_impact(stress_tag="Stress", baseline_tag="Baseline")
+
+
 # ---------------------------------------------------------------------------
 # Headless API Methods
 # ---------------------------------------------------------------------------

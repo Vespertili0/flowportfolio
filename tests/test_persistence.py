@@ -1,8 +1,8 @@
 import json
-import os
 import re
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -70,19 +70,28 @@ def test_save_snapshot_value_error(manager, tmp_path):
         manager.save_snapshot(empty_pop, str(filepath))
 
 
-def test_save_snapshot_os_error(manager, dummy_population, tmp_path):
-    filepath = tmp_path / "read_only_dir" / "test.json"
-    # Make parent unwriteable
-    read_only_dir = tmp_path / "read_only_dir"
-    read_only_dir.mkdir()
-    os.chmod(read_only_dir, 0o444)
+def test_save_snapshot_mkdir_os_error(manager, dummy_population, tmp_path):
+    # Simulate a file existing at the directory path, which causes mkdir to raise OSError
+    conflict_path = tmp_path / "conflict"
+    conflict_path.touch()
+    filepath = conflict_path / "test.json"
 
-    try:
-        with pytest.raises(OSError, match="Cannot write file to"):
-            manager.save_snapshot(dummy_population, str(filepath))
-    finally:
-        # restore permissions to allow cleanup
-        os.chmod(read_only_dir, 0o777)
+    with pytest.raises(
+        OSError, match=re.escape(f"Cannot create directory {conflict_path}")
+    ):
+        manager.save_snapshot(dummy_population, str(filepath))
+
+
+def test_save_snapshot_os_error(manager, dummy_population, tmp_path):
+    filepath = tmp_path / "test.json"
+
+    with (
+        patch("pathlib.Path.open", side_effect=OSError("Disk full")),
+        pytest.raises(
+            RuntimeError, match=re.escape(f"Failed to save snapshot to {filepath}")
+        ),
+    ):
+        manager.save_snapshot(dummy_population, str(filepath))
 
 
 def test_load_snapshot_success(manager, dummy_population, tmp_path):
@@ -98,6 +107,15 @@ def test_load_snapshot_file_not_found(manager, tmp_path):
     filepath = tmp_path / "non_existent.json"
     with pytest.raises(
         FileNotFoundError, match=re.escape(f"Snapshot file not found: {filepath!s}")
+    ):
+        manager.load_snapshot(str(filepath))
+
+
+def test_load_snapshot_path_traversal(manager, tmp_path):
+    filepath = tmp_path / ".." / "test.json"
+    with pytest.raises(
+        ValueError,
+        match=re.escape(f"Invalid filepath (path traversal detected): {filepath!s}"),
     ):
         manager.load_snapshot(str(filepath))
 
@@ -152,6 +170,14 @@ def test_export_gitops_artifact_label_type_error(manager, dummy_population, tmp_
         manager.export_gitops_artifact(dummy_population, str(tmp_path), label=123)
 
 
+@pytest.mark.parametrize("invalid_dir", ["../foo", "foo/../../bar", "a/b/../c"])
+def test_export_gitops_artifact_invalid_export_dir(
+    manager, dummy_population, invalid_dir
+):
+    with pytest.raises(ValueError, match="Path traversal detected in export_dir."):
+        manager.export_gitops_artifact(dummy_population, invalid_dir)
+
+
 def test_calculate_trajectory_history_success(manager, dummy_population, tmp_path):
     # Save a few snapshots
     manager.export_gitops_artifact(dummy_population, str(tmp_path))
@@ -191,3 +217,19 @@ def test_calculate_trajectory_history_no_files(manager, tmp_path):
         match=re.escape(f"No rebalance_*.json snapshots found in: {tmp_path!s}"),
     ):
         manager.calculate_trajectory_history(str(tmp_path))
+
+
+def test_load_snapshot_os_error(manager, tmp_path, monkeypatch):
+    filepath = tmp_path / "os_error.json"
+    with filepath.open("w") as f:
+        f.write("{}")
+
+    def mock_open(*args, **kwargs):
+        raise OSError("Mocked OSError")
+
+    monkeypatch.setattr(Path, "open", mock_open)
+
+    with pytest.raises(
+        RuntimeError, match=re.escape(f"Failed to read snapshot from {filepath!s}")
+    ):
+        manager.load_snapshot(str(filepath))

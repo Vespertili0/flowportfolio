@@ -62,53 +62,18 @@ def stub_universe_no_returns() -> Universe:
 # ---------------------------------------------------------------------------
 
 
-def test_init_valid_no_constraints(stub_universe: Universe) -> None:
-    """Test engine accepts Universe with no constraints (new default)."""
+def test_init_valid(stub_universe: Universe) -> None:
+    """Test engine accepts Universe."""
     engine = PortfolioExperimentEngine(stub_universe)
     assert engine._universe is stub_universe
-    assert engine._constraints == []
     assert engine._strategies == {}
     assert engine._n_jobs == -1
-
-
-def test_init_valid_with_deprecated_constraints(stub_universe: Universe) -> None:
-    """Test engine accepts constraints with DeprecationWarning when passed."""
-    with pytest.warns(DeprecationWarning, match="'constraints' parameter"):
-        engine = PortfolioExperimentEngine(stub_universe, ["core >= 0.5"])
-    assert engine._constraints == ["core >= 0.5"]
 
 
 def test_init_bad_universe() -> None:
     """Test TypeError is raised for non-Universe first arg."""
     with pytest.raises(TypeError, match="universe must be a Universe instance"):
         PortfolioExperimentEngine(universe="invalid")  # type: ignore
-
-
-def test_init_bad_constraints(stub_universe: Universe) -> None:
-    """Test TypeError is raised when constraints is a non-list, non-None value."""
-    with pytest.raises(TypeError, match="constraints must be a list"):
-        PortfolioExperimentEngine(stub_universe, constraints="core >= 0.5")  # type: ignore
-
-
-def test_init_bad_constraints_elements(stub_universe: Universe) -> None:
-    """Test TypeError is raised when constraints list contains non-string items."""
-    with pytest.raises(TypeError, match="constraints must be a list of strings"):
-        PortfolioExperimentEngine(stub_universe, constraints=[123])  # type: ignore
-
-
-def test_constraints_property_returns_copy(stub_universe: Universe) -> None:
-    """Test the deprecated constraints property returns an independent copy."""
-    with pytest.warns(DeprecationWarning):
-        engine = PortfolioExperimentEngine(stub_universe, ["core >= 0.5"])
-    prop_result = engine.constraints
-    assert prop_result == ["core >= 0.5"]
-    prop_result.append("mutated")
-    assert engine.constraints == ["core >= 0.5"]  # internal state unaffected
-
-
-# ---------------------------------------------------------------------------
-# Strategy Registration
-# ---------------------------------------------------------------------------
 
 
 def test_add_strategy_valid(stub_universe: Universe) -> None:
