@@ -31,8 +31,9 @@ class PersistenceManager:
 
         Raises:
             TypeError: If population is not a skfolio.Population instance.
-            ValueError: If population is empty.
+            ValueError: If population is empty, or if path traversal is detected.
             OSError: If the directory cannot be created.
+            RuntimeError: If the snapshot file cannot be written.
         """
         if not isinstance(population, Population):
             raise TypeError("population must be a skfolio.Population instance.")
@@ -40,6 +41,11 @@ class PersistenceManager:
             raise ValueError("population is empty.")
 
         path = Path(filepath)
+
+        # Prevent path traversal
+        if ".." in path.parts:
+            raise ValueError(f"Invalid filepath (path traversal detected): {filepath}")
+
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
         except OSError as e:
@@ -142,11 +148,16 @@ class PersistenceManager:
             and one column per ticker.
 
         Raises:
+            ValueError: If path traversal is detected in snapshot_dir, or if no
+                matching snapshot files are found.
             FileNotFoundError: If snapshot_dir does not exist.
-            ValueError: If no matching snapshot files are found, with message:
-                "No rebalance_*.json snapshots found in: {snapshot_dir}"
         """
         dir_path = Path(snapshot_dir)
+
+        # Prevent path traversal
+        if ".." in dir_path.parts:
+            raise ValueError("Path traversal detected in snapshot_dir.")
+
         if not dir_path.exists() or not dir_path.is_dir():
             raise FileNotFoundError(f"Snapshot directory not found: {snapshot_dir}")
 
@@ -186,14 +197,18 @@ class PersistenceManager:
                         )
                     continue
 
-                for p_data in data.get("portfolios", []):
+                portfolios = data.get("portfolios") or []
+                for p_data in portfolios:
+                    if not isinstance(p_data, dict):
+                        continue
                     record = {
                         "timestamp": ts,
                         "portfolio_name": p_data.get("name"),
                         "tag": p_data.get("tag"),
                     }
-                    weights = p_data.get("weights", {})
-                    record.update(weights)
+                    weights = p_data.get("weights")
+                    if isinstance(weights, dict):
+                        record.update(weights)
                     records.append(record)
 
         if not records:

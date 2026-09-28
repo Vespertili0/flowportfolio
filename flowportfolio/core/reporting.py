@@ -215,7 +215,10 @@ class Reporter:
                 }
             )
 
-        df_metrics = pd.DataFrame(metrics)
+        df_metrics = pd.DataFrame(
+            metrics,
+            columns=["Strategy", "Tag", "Sharpe", "CVaR", "Max Drawdown", "Sortino"],
+        )
         try:
             table_md = df_metrics.to_markdown(index=False)
         except (ImportError, ModuleNotFoundError):
@@ -242,15 +245,13 @@ class Reporter:
             p for p in self._population if getattr(p, "tag", None) == best_tag
         ]
 
-        best_portfolio = max(
-            best_portfolios,
-            key=lambda p: (
-                p.cvar_ratio
-                if getattr(p, "cvar_ratio", None) is not None
-                and not np.isnan(p.cvar_ratio)
-                else float("-inf")
-            ),
-        )
+        def _get_cvar_ratio(p: object) -> float:
+            val = getattr(p, "cvar_ratio", None)
+            if val is not None and not np.isnan(val):
+                return float(val)
+            return float("-inf")
+
+        best_portfolio = max(best_portfolios, key=_get_cvar_ratio)
 
         weights = getattr(best_portfolio, "weights", None)
         assets = getattr(best_portfolio, "assets", None)
@@ -261,9 +262,18 @@ class Reporter:
             if assets is None or len(assets) != len(weights):
                 assets = [f"Asset_{i}" for i in range(len(weights))]
 
-            asset_weights = list(zip(assets, weights))
+            def _is_valid_weight(w: object) -> bool:
+                if w is None:
+                    return False
+                try:
+                    return not np.isnan(float(w))  # type: ignore[arg-type]
+                except (ValueError, TypeError):
+                    return False
+
             asset_weights = [
-                aw for aw in asset_weights if aw[1] is not None and not np.isnan(aw[1])
+                (aw[0], float(aw[1]))
+                for aw in zip(assets, weights)
+                if _is_valid_weight(aw[1])
             ]
             asset_weights.sort(key=lambda x: abs(x[1]), reverse=True)
             top_5 = asset_weights[:5]

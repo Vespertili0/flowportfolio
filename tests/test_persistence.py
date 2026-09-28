@@ -94,6 +94,15 @@ def test_save_snapshot_os_error(manager, dummy_population, tmp_path):
         manager.save_snapshot(dummy_population, str(filepath))
 
 
+def test_save_snapshot_path_traversal(manager, dummy_population, tmp_path):
+    filepath = tmp_path / ".." / "test.json"
+    with pytest.raises(
+        ValueError,
+        match=re.escape(f"Invalid filepath (path traversal detected): {filepath!s}"),
+    ):
+        manager.save_snapshot(dummy_population, str(filepath))
+
+
 def test_load_snapshot_success(manager, dummy_population, tmp_path):
     filepath = tmp_path / "test_snapshot.json"
     manager.save_snapshot(dummy_population, str(filepath))
@@ -207,6 +216,12 @@ def test_calculate_trajectory_history_dir_not_found(manager, tmp_path):
         FileNotFoundError,
         match=re.escape(f"Snapshot directory not found: {bad_dir!s}"),
     ):
+        manager.calculate_trajectory_history(str(bad_dir))
+
+
+def test_calculate_trajectory_history_path_traversal(manager, tmp_path):
+    bad_dir = tmp_path / ".." / "snapshots"
+    with pytest.raises(ValueError, match="Path traversal detected in snapshot_dir."):
         manager.calculate_trajectory_history(str(bad_dir))
 
 
