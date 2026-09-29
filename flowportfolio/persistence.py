@@ -31,8 +31,9 @@ class PersistenceManager:
 
         Raises:
             TypeError: If population is not a skfolio.Population instance.
-            ValueError: If population is empty.
+            ValueError: If population is empty, or if path traversal is detected.
             OSError: If the directory cannot be created.
+            RuntimeError: If the snapshot file cannot be written.
         """
         if not isinstance(population, Population):
             raise TypeError("population must be a skfolio.Population instance.")
@@ -40,6 +41,11 @@ class PersistenceManager:
             raise ValueError("population is empty.")
 
         path = Path(filepath)
+
+        # Prevent path traversal
+        if ".." in path.parts:
+            raise ValueError(f"Invalid filepath (path traversal detected): {filepath}")
+
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
         except OSError as e:
@@ -67,7 +73,7 @@ class PersistenceManager:
             with path.open("w", encoding="utf-8") as f:
                 json.dump(data, f, indent=4)
         except OSError as e:
-            raise OSError(f"Cannot write file to {path}") from e
+            raise RuntimeError(f"Failed to save snapshot to {path}") from e
 
     def load_snapshot(self, filepath: str) -> dict:
         """Load a JSON snapshot dict from the specified filepath.
@@ -76,15 +82,22 @@ class PersistenceManager:
             FileNotFoundError: If filepath does not exist, with message:
                 "Snapshot file not found: {filepath}"
             ValueError: If the file exists but cannot be parsed as valid JSON, with message:
-                "Invalid JSON in snapshot file: {filepath}"
+                "Invalid JSON in snapshot file: {filepath}", or if path traversal is detected.
         """
         path = Path(filepath)
+
+        # Prevent path traversal
+        if ".." in path.parts:
+            raise ValueError(f"Invalid filepath (path traversal detected): {filepath}")
+
         if not path.exists():
             raise FileNotFoundError(f"Snapshot file not found: {filepath}")
 
         try:
             with path.open("r", encoding="utf-8") as f:
                 return json.load(f)
+        except OSError as e:
+            raise RuntimeError(f"Failed to read snapshot from {filepath}") from e
         except json.JSONDecodeError as e:
             raise ValueError(f"Invalid JSON in snapshot file: {filepath}") from e
 
@@ -102,6 +115,9 @@ class PersistenceManager:
         """
         if not isinstance(population, Population):
             raise TypeError("population must be a skfolio.Population instance.")
+
+        if ".." in Path(export_dir).parts:
+            raise ValueError("Path traversal detected in export_dir.")
 
         if label is not None:
             if not isinstance(label, str):
@@ -132,11 +148,16 @@ class PersistenceManager:
             and one column per ticker.
 
         Raises:
+            ValueError: If path traversal is detected in snapshot_dir, or if no
+                matching snapshot files are found.
             FileNotFoundError: If snapshot_dir does not exist.
-            ValueError: If no matching snapshot files are found, with message:
-                "No rebalance_*.json snapshots found in: {snapshot_dir}"
         """
         dir_path = Path(snapshot_dir)
+
+        # Prevent path traversal
+        if ".." in dir_path.parts:
+            raise ValueError("Path traversal detected in snapshot_dir.")
+
         if not dir_path.exists() or not dir_path.is_dir():
             raise FileNotFoundError(f"Snapshot directory not found: {snapshot_dir}")
 
@@ -145,32 +166,50 @@ class PersistenceManager:
             raise ValueError(f"No rebalance_*.json snapshots found in: {snapshot_dir}")
 
         records = []
+        valid_files_data = []
+        timestamps_to_parse = []
+
         for file in sorted(json_files):
             data = self.load_snapshot(str(file))
             timestamp_str = data.get("timestamp")
             if timestamp_str is None:
                 continue
 
-            try:
-                # Handle different isoformat styles gracefully
-                if timestamp_str.endswith("Z"):
-                    timestamp_str = timestamp_str[:-1] + "+00:00"
-                ts = pd.to_datetime(timestamp_str)
-            except (ValueError, TypeError) as e:
-                logger.warning(
-                    f"Failed to parse timestamp {timestamp_str} in file {file}: {e}"
-                )
-                continue
+            orig_str = timestamp_str
+            # Handle different isoformat styles gracefully
+            if timestamp_str.endswith("Z"):
+                timestamp_str = timestamp_str[:-1] + "+00:00"
 
-            for p_data in data.get("portfolios", []):
-                record = {
-                    "timestamp": ts,
-                    "portfolio_name": p_data.get("name"),
-                    "tag": p_data.get("tag"),
-                }
-                weights = p_data.get("weights", {})
-                record.update(weights)
-                records.append(record)
+            valid_files_data.append((file, timestamp_str, data, orig_str))
+            timestamps_to_parse.append(timestamp_str)
+
+        if timestamps_to_parse:
+            parsed_series = pd.to_datetime(timestamps_to_parse, errors="coerce")
+            for (file, timestamp_str, data, orig_str), ts in zip(
+                valid_files_data, parsed_series
+            ):
+                if pd.isna(ts):
+                    try:
+                        pd.to_datetime(timestamp_str)
+                    except (ValueError, TypeError) as e:
+                        logger.warning(
+                            f"Failed to parse timestamp {orig_str} in file {file}: {e}"
+                        )
+                    continue
+
+                portfolios = data.get("portfolios") or []
+                for p_data in portfolios:
+                    if not isinstance(p_data, dict):
+                        continue
+                    record = {
+                        "timestamp": ts,
+                        "portfolio_name": p_data.get("name"),
+                        "tag": p_data.get("tag"),
+                    }
+                    weights = p_data.get("weights")
+                    if isinstance(weights, dict):
+                        record.update(weights)
+                    records.append(record)
 
         if not records:
             # Handle edge case where files matched but didn't contain valid data
