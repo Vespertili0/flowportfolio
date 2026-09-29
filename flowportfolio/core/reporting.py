@@ -181,36 +181,13 @@ class Reporter:
             "best_composition": fig3,
         }
 
-    def to_markdown_artifact(self, baseline_tag: str = "Baseline") -> str:
-        """Extract key population statistics into a formatted Markdown report.
-
-        Parameters
-        ----------
-        baseline_tag : str, default "Baseline"
-            The tag representing the baseline strategy, provided for interface
-            consistency with other reporting methods.
-
-        Returns
-        -------
-        str
-            A formatted Markdown string containing an ISO8601 UTC timestamp,
-            a metrics table (Sharpe, CVaR, Max Drawdown, Sortino), and analysis
-            identifying the best strategy by median CVaR Ratio and its top 5
-            holdings.
-
-        Raises
-        ------
-        ValueError
-            If the population is empty.
-        """
-        if not self._population or len(self._population) == 0:
-            raise ValueError("Population is empty.")
-
-        timestamp = datetime.now(UTC).isoformat()
+    def _generate_metrics_table(self) -> str:
+        """Generate a Markdown table of performance metrics for the population."""
 
         def _fmt(val: object) -> str:
             if val is None:
                 return "N/A"
+
             if isinstance(val, (int, float, np.number)):
                 if np.isnan(val):
                     return "nan"
@@ -238,7 +215,10 @@ class Reporter:
                 }
             )
 
-        df_metrics = pd.DataFrame(metrics)
+        df_metrics = pd.DataFrame(
+            metrics,
+            columns=["Strategy", "Tag", "Sharpe", "CVaR", "Max Drawdown", "Sortino"],
+        )
         try:
             table_md = df_metrics.to_markdown(index=False)
         except (ImportError, ModuleNotFoundError):
@@ -246,57 +226,93 @@ class Reporter:
             header = "| " + " | ".join(cols) + " |"
             separator = "| " + " | ".join(["---"] * len(cols)) + " |"
             rows = [
-                "| " + " | ".join(str(row[c]) for c in cols) + " |"
-                for _, row in df_metrics.iterrows()
+                "| " + " | ".join(str(val) for val in row) + " |"
+                for row in df_metrics.itertuples(index=False)
             ]
             table_md = "\n".join([header, separator] + rows)
 
+        return table_md
+
+    def _get_best_strategy_and_holdings(self) -> tuple[str, str]:
+        """Identify the best strategy by median CVaR Ratio and format its top 5 holdings."""
         tag_list = self._unique_tags()
         if not tag_list:
-            best_strategy = "N/A (No tagged portfolios)"
-            top_holdings = "N/A"
+            return "N/A (No tagged portfolios)", "N/A"
+
+        best_tag = self._best_tag_by_median_cvar(tag_list)
+
+        best_portfolios = [
+            p for p in self._population if getattr(p, "tag", None) == best_tag
+        ]
+
+        def _get_cvar_ratio(p: object) -> float:
+            val = getattr(p, "cvar_ratio", None)
+            if val is not None and not np.isnan(val):
+                return float(val)
+            return float("-inf")
+
+        best_portfolio = max(best_portfolios, key=_get_cvar_ratio)
+
+        weights = getattr(best_portfolio, "weights", None)
+        assets = getattr(best_portfolio, "assets", None)
+
+        if weights is None or len(weights) == 0:
+            top_holdings = "N/A (No weights available)"
         else:
-            best_tag = self._best_tag_by_median_cvar(tag_list)
+            if assets is None or len(assets) != len(weights):
+                assets = [f"Asset_{i}" for i in range(len(weights))]
 
-            best_portfolios = [
-                p for p in self._population if getattr(p, "tag", None) == best_tag
+            def _is_valid_weight(w: object) -> bool:
+                if w is None:
+                    return False
+                try:
+                    return not np.isnan(float(w))  # type: ignore[arg-type]
+                except (ValueError, TypeError):
+                    return False
+
+            asset_weights = [
+                (aw[0], float(aw[1]))
+                for aw in zip(assets, weights)
+                if _is_valid_weight(aw[1])
             ]
-            best_portfolio = max(
-                best_portfolios,
-                key=lambda p: (
-                    p.cvar_ratio
-                    if getattr(p, "cvar_ratio", None) is not None
-                    and not np.isnan(p.cvar_ratio)
-                    else float("-inf")
-                ),
-            )
+            asset_weights.sort(key=lambda x: abs(x[1]), reverse=True)
+            top_5 = asset_weights[:5]
 
-            weights = getattr(best_portfolio, "weights", None)
-            assets = getattr(best_portfolio, "assets", None)
-
-            if weights is None or len(weights) == 0:
-                top_holdings = "N/A (No weights available)"
+            if not top_5:
+                top_holdings = "N/A (All weights zero or NaN)"
             else:
-                if assets is None or len(assets) != len(weights):
-                    assets = [f"Asset_{i}" for i in range(len(weights))]
+                top_holdings = ", ".join(f"{asset!s} ({w:.2%})" for asset, w in top_5)
 
-                asset_weights = list(zip(assets, weights))
-                asset_weights = [
-                    aw
-                    for aw in asset_weights
-                    if aw[1] is not None and not np.isnan(aw[1])
-                ]
-                asset_weights.sort(key=lambda x: abs(x[1]), reverse=True)
-                top_5 = asset_weights[:5]
+        return best_tag, top_holdings
 
-                if not top_5:
-                    top_holdings = "N/A (All weights zero or NaN)"
-                else:
-                    top_holdings = ", ".join(
-                        f"{asset!s} ({w:.2%})" for asset, w in top_5
-                    )
+    def to_markdown_artifact(self, baseline_tag: str = "Baseline") -> str:
+        """Extract key population statistics into a formatted Markdown report.
 
-            best_strategy = best_tag
+        Parameters
+        ----------
+        baseline_tag : str, default "Baseline"
+            The tag representing the baseline strategy, provided for interface
+            consistency with other reporting methods.
+
+        Returns
+        -------
+        str
+            A formatted Markdown string containing an ISO8601 UTC timestamp,
+            a metrics table (Sharpe, CVaR, Max Drawdown, Sortino), and analysis
+            identifying the best strategy by median CVaR Ratio and its top 5
+            holdings.
+
+        Raises
+        ------
+        ValueError
+            If the population is empty.
+        """
+        if not self._population or len(self._population) == 0:
+            raise ValueError("Population is empty.")
+
+        timestamp = datetime.now(UTC).isoformat()
+        table_md = self._generate_metrics_table()
+        best_strategy, top_holdings = self._get_best_strategy_and_holdings()
 
         report = (
             f"# Portfolio Population Report\n\n"

@@ -16,6 +16,8 @@ execution contexts.
 
 from __future__ import annotations
 
+from collections import defaultdict
+
 import numpy as np
 import pandas as pd
 from skfolio import Population, RatioMeasure
@@ -185,18 +187,16 @@ class PortfolioDeltaEngine:
             )
 
         # Accumulate per-group allocations
-        groups: dict[str, dict[str, float]] = {}
+        groups: defaultdict[str, dict[str, float]] = defaultdict(
+            lambda: {"current_allocation": 0.0, "target_allocation": 0.0}
+        )
 
         for ticker, weight in self._current_weights.items():
             group = metadata[ticker]
-            if group not in groups:
-                groups[group] = {"current_allocation": 0.0, "target_allocation": 0.0}
             groups[group]["current_allocation"] += float(weight)
 
         for ticker, weight in self._target_weights.items():
             group = metadata[ticker]
-            if group not in groups:
-                groups[group] = {"current_allocation": 0.0, "target_allocation": 0.0}
             groups[group]["target_allocation"] += float(weight)
 
         # Build result rows
@@ -286,6 +286,16 @@ class PortfolioDeltaEngine:
             },
         }
 
+    @staticmethod
+    def _validate_bps(value: float, name: str) -> None:
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not np.isfinite(value)
+            or value < 0
+        ):
+            raise ValueError(f"{name} must be non-negative; got {value}.")
+
     def calculate_net_friction(
         self,
         brokerage_bps: float = 10.0,
@@ -318,22 +328,8 @@ class PortfolioDeltaEngine:
         ValueError
             If ``brokerage_bps`` or ``slippage_bps`` are negative.
         """
-        if (
-            not isinstance(brokerage_bps, (int, float))
-            or isinstance(brokerage_bps, bool)
-            or not np.isfinite(brokerage_bps)
-            or brokerage_bps < 0
-        ):
-            raise ValueError(
-                f"brokerage_bps must be non-negative; got {brokerage_bps}."
-            )
-        if (
-            not isinstance(slippage_bps, (int, float))
-            or isinstance(slippage_bps, bool)
-            or not np.isfinite(slippage_bps)
-            or slippage_bps < 0
-        ):
-            raise ValueError(f"slippage_bps must be non-negative; got {slippage_bps}.")
+        self._validate_bps(brokerage_bps, "brokerage_bps")
+        self._validate_bps(slippage_bps, "slippage_bps")
 
         fees = self._universe.fees
         total_bps = brokerage_bps + slippage_bps

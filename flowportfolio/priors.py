@@ -10,6 +10,8 @@ from skfolio.prior import EmpiricalPrior, EntropyPooling, SyntheticData
 
 from flowportfolio.core.universe import Universe
 
+_TICKER_REGEX = re.compile(r"[A-Z][A-Z0-9_.]*")
+
 
 class PriorSynthesiser:
     """Builds skfolio prior objects for injection into portfolio optimizers.
@@ -71,7 +73,7 @@ class PriorSynthesiser:
             raise ValueError("confidence must be between 0.0 and 1.0")
 
         # Extract uppercase alphanumeric identifiers resembling tickers.
-        extracted_tickers = re.findall(r"[A-Z][A-Z0-9_.]*", view_str)
+        extracted_tickers = _TICKER_REGEX.findall(view_str)
         valid_tickers = set(self._universe.tickers)
 
         # Check that the view references at least one known ticker — catches
