@@ -7,6 +7,7 @@ from skfolio.optimization import (
 from skfolio.prior import EmpiricalPrior
 from sklearn.pipeline import Pipeline
 
+from flowportfolio.core.constraints import ConstraintSpec
 from flowportfolio.strategies import StrategyBuilder
 
 
@@ -222,3 +223,58 @@ def test_build_pipeline_clones_transformers() -> None:
 
     assert pipeline1.steps[0][1] is not pipeline2.steps[0][1]
     assert pipeline1.steps[1][1] is not pipeline2.steps[1][1]
+
+
+def test_set_optimizer_preserves_pre_configured_constraints_when_builder_empty():
+    opt = MeanRisk(linear_constraints=["pre_existing <= 0.2"])
+    builder = StrategyBuilder(constraints=[])
+    builder.set_optimizer(opt)
+
+    pipeline = builder.build_pipeline()
+    pipeline_opt = pipeline.steps[-1][1]
+    assert pipeline_opt.linear_constraints == ["pre_existing <= 0.2"]
+
+
+def test_set_optimizer_merges_linear_constraints():
+    opt = MeanRisk(linear_constraints=["pre_existing <= 0.2"])
+    builder = StrategyBuilder(constraints=["new_constraint >= 0.1"])
+    builder.set_optimizer(opt)
+
+    pipeline = builder.build_pipeline()
+    pipeline_opt = pipeline.steps[-1][1]
+    assert pipeline_opt.linear_constraints == [
+        "pre_existing <= 0.2",
+        "new_constraint >= 0.1",
+    ]
+
+
+def test_constraint_spec_binds_groups_and_linear_constraints():
+    spec = ConstraintSpec(
+        linear_constraints=["core >= 0.5"],
+        groups={"A": ["core"], "B": ["satellite"]},
+    )
+    builder = StrategyBuilder(constraints=spec)
+    opt = MeanRisk()
+    builder.set_optimizer(opt)
+
+    pipeline = builder.build_pipeline()
+    pipeline_opt = pipeline.steps[-1][1]
+    assert pipeline_opt.linear_constraints == ["core >= 0.5"]
+    assert pipeline_opt.groups == {"A": ["core"], "B": ["satellite"]}
+
+
+def test_build_nco_binds_groups_and_merges_constraints():
+    spec = ConstraintSpec(
+        linear_constraints=["core >= 0.4"],
+        groups={"A": ["core"], "B": ["satellite"]},
+    )
+    builder = StrategyBuilder(constraints=spec)
+    inner = MeanRisk(linear_constraints=["inner_exist <= 0.1"])
+    outer = MeanRisk()
+
+    nco = builder.build_nco(inner, outer)
+    assert nco.inner_estimator.linear_constraints == [
+        "inner_exist <= 0.1",
+        "core >= 0.4",
+    ]
+    assert nco.inner_estimator.groups == {"A": ["core"], "B": ["satellite"]}

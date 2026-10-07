@@ -6,7 +6,13 @@ import re
 
 from skfolio.distribution import VineCopula
 from skfolio.moments import DenoiseCovariance, ShrunkMu
-from skfolio.prior import EmpiricalPrior, EntropyPooling, SyntheticData
+from skfolio.prior import (
+    BasePrior,
+    BlackLitterman,
+    EmpiricalPrior,
+    EntropyPooling,
+    SyntheticData,
+)
 
 from flowportfolio.core.universe import Universe
 
@@ -14,11 +20,11 @@ _TICKER_REGEX = re.compile(r"[A-Z][A-Z0-9_.]*")
 
 
 class PriorSynthesiser:
-    """Builds skfolio prior objects for injection into portfolio optimizers.
+    """Builds skfolio prior objects for injection into portfolio optimisers.
 
     This class acts as the forward-looking prior layer in the flowportfolio
     pipeline. It translates raw Universe returns and user-defined market views
-    into fully configured skfolio prior objects. It does not run optimizations
+    into fully configured skfolio prior objects. It does not run optimisations
     itself.
 
     Prefect Compatibility: All build_*() methods are pure functions of
@@ -45,17 +51,25 @@ class PriorSynthesiser:
         self._universe = universe
         self._views: list[dict] = []
 
+    @staticmethod
+    def _normalise_view_operators(view_str: str) -> str:
+        """Normalise strict inequality operators (> or <) to (>= or <=)."""
+        normalised = re.sub(r"(?<![<>=!])>(?!=)", ">=", view_str)
+        normalised = re.sub(r"(?<![<>=!])<(?!=)", "<=", normalised)
+        return normalised
+
     def add_market_view(self, view_str: str, confidence: float) -> PriorSynthesiser:
-        """Register a forward-looking market view for use in Entropy Pooling.
+        """Register a forward-looking market view for use in prior estimation.
 
         Parameters
         ----------
         view_str : str
             A view expression referencing asset tickers present in the universe.
-            Example: "SPY > 0.05" (SPY expected to return >5% annualised).
+            Example: "SPY >= 0.05" (SPY expected to return >=5% annualised).
         confidence : float
             Confidence in this view, between 0.0 (no confidence) and 1.0
-            (certainty). Maps to the tau parameter in Entropy Pooling.
+            (certainty). Maps to view confidences in Black-Litterman and
+            Entropy Pooling.
 
         Returns
         -------
@@ -93,7 +107,8 @@ class PriorSynthesiser:
                     f"not present in the universe."
                 )
 
-        self._views.append({"view": view_str, "confidence": confidence})
+        normalised_view = self._normalise_view_operators(view_str)
+        self._views.append({"view": normalised_view, "confidence": confidence})
         return self
 
     @staticmethod
@@ -144,9 +159,78 @@ class PriorSynthesiser:
             )
 
         views = [v["view"] for v in self._views]
-        tau = [v["confidence"] for v in self._views]
 
-        return EntropyPooling(views=views, tau=tau)
+        raw_metadata = (
+            self._universe.metadata
+            if isinstance(getattr(self._universe, "metadata", None), dict)
+            else {}
+        )
+        groups: dict[str, list[str]] = {}
+        for ticker in getattr(self._universe, "tickers", []):
+            if ticker in raw_metadata:
+                val = raw_metadata[ticker]
+                groups[ticker] = [val] if isinstance(val, str) else list(val)
+        groups_arg = groups if groups else None
+
+        return EntropyPooling(mean_views=views, groups=groups_arg)
+
+    def build_black_litterman_prior(
+        self,
+        tau: float = 0.05,
+        prior_estimator: BasePrior | None = None,
+        risk_free_rate: float = 0.0,
+    ) -> BlackLitterman:
+        """Build a Black-Litterman prior from registered market views.
+
+        Parameters
+        ----------
+        tau : float, default 0.05
+            Degree of uncertainty given to the analyst views.
+        prior_estimator : BasePrior or None, optional
+            Prior distribution estimator. If None, skfolio default is used.
+        risk_free_rate : float, default 0.0
+            Risk-free rate.
+
+        Returns
+        -------
+        skfolio.prior.BlackLitterman
+
+        Raises
+        ------
+        RuntimeError
+            If no market views have been registered via add_market_view().
+        """
+        if not self._views:
+            raise RuntimeError(
+                "No market views registered. Call add_market_view() before building a Black-Litterman prior."
+            )
+
+        views = [v["view"] for v in self._views]
+        confidences = [v["confidence"] for v in self._views]
+
+        raw_metadata = (
+            self._universe.metadata
+            if isinstance(getattr(self._universe, "metadata", None), dict)
+            else {}
+        )
+        groups: dict[str, list[str]] = {}
+        for ticker in getattr(self._universe, "tickers", []):
+            if ticker in raw_metadata:
+                val = raw_metadata[ticker]
+                groups[ticker] = [val] if isinstance(val, str) else list(val)
+        groups_arg = groups if groups else None
+
+        kwargs: dict[str, object] = {
+            "views": views,
+            "tau": tau,
+            "view_confidences": confidences,
+            "groups": groups_arg,
+            "risk_free_rate": risk_free_rate,
+        }
+        if prior_estimator is not None:
+            kwargs["prior_estimator"] = prior_estimator
+
+        return BlackLitterman(**kwargs)
 
     def build_synthetic_prior(self, n_samples: int = 5000) -> SyntheticData:
         """Generate synthetic return paths using a VineCopula model.

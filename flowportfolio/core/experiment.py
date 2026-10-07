@@ -129,20 +129,25 @@ class PortfolioExperimentEngine:
     def run_robustness_test(
         self,
         cv_type: str = "walk_forward",
+        inner_cv_kwargs: dict | None = None,
         **cv_kwargs,
     ) -> Population:
         """Execute the full benchmarking pipeline for all registered strategies.
 
         Performs a two-step process for each strategy:
-        1. Tunes hyperparameters via ``GridSearchCV`` over the full dataset,
-           refitting the best estimator.
+        1. Tunes hyperparameters via ``GridSearchCV`` using an inner cross-validator
+           derived to fit within the outer training window.
         2. Simulates an out-of-sample rebalancing journey using
-           ``cross_val_predict`` with the best tuned estimator.
+           ``cross_val_predict`` with the outer cross-validator.
 
         Parameters
         ----------
         cv_type : {"walk_forward", "combinatorial", "randomised"}, default "walk_forward"
             The cross-validation protocol to use.
+        inner_cv_kwargs : dict or None, optional
+            Explicit constructor arguments for the inner CV splitter used in
+            hyperparameter search. If None, derived dynamically from the outer
+            training parameters.
         **cv_kwargs
             Additional keyword arguments forwarded to the underlying
             cross-validator constructor (e.g., ``train_size``, ``test_size``).
@@ -160,9 +165,28 @@ class PortfolioExperimentEngine:
             If ``cv_type`` is not one of the supported strings, or if
             ``universe.returns`` is unavailable.
         """
-        # 1. Resolve CV protocol
-        inner_cv = self._resolve_cv_splitter(cv_type, **cv_kwargs)
+        # 1. Resolve CV protocols
         outer_cv = self._resolve_cv_splitter(cv_type, **cv_kwargs)
+
+        if inner_cv_kwargs is not None:
+            inner_cv = self._resolve_cv_splitter(cv_type, **inner_cv_kwargs)
+        else:
+            resolved_inner_kwargs = dict(cv_kwargs)
+            if cv_type == "walk_forward":
+                outer_train = cv_kwargs.get("train_size", 252)
+                if outer_train <= 2:
+                    raise ValueError(
+                        f"Outer train_size={outer_train} is too small to derive inner walk-forward splits."
+                    )
+                inner_test = max(1, int(outer_train * 0.2))
+                inner_train = max(1, int(outer_train * 0.6))
+                if inner_train + inner_test > outer_train:
+                    inner_train = max(1, outer_train - inner_test)
+
+                resolved_inner_kwargs["train_size"] = inner_train
+                resolved_inner_kwargs["test_size"] = inner_test
+
+            inner_cv = self._resolve_cv_splitter(cv_type, **resolved_inner_kwargs)
 
         # 2. Extract returns (will raise ValueError if not fetched)
         returns = self._universe.returns
@@ -199,26 +223,27 @@ class PortfolioExperimentEngine:
     def run_online_evaluation(
         self,
         cv_type: str = "walk_forward",
+        burn_in_size: int | None = None,
         **cv_kwargs,
     ) -> Population:
         """Run online (streaming) evaluation of all registered strategies.
 
-        Mirrors run_robustness_test() but uses OnlineGridSearch and
-        online_predict to support incremental model updates. This is
-        appropriate for strategies using exponentially weighted estimators
-        (EWMu, EWCovariance) that support partial_fit().
-
-        Prefect Compatibility: This method is a pure function of self.strategies
-        and self.universe.returns. It holds no stateful connections between calls.
+        Mirrors run_robustness_test() but fits hyperparameter search on a
+        dedicated historical burn-in period prior to executing online prediction,
+        preventing look-ahead bias.
 
         Parameters
         ----------
         cv_type : str, optional
             Cross-validation strategy. One of: "walk_forward",
             "combinatorial", "randomised". Default is "walk_forward".
+        burn_in_size : int or None, optional
+            Number of initial observations allocated for hyperparameter tuning.
+            If None, defaults to the train_size or warmup_size specified in
+            cv_kwargs, or 252.
         **cv_kwargs
             Additional keyword arguments forwarded to the chosen CV splitter
-            constructor (e.g., train_size=252, test_size=63).
+            constructor or online prediction parameters.
 
         Returns
         -------
@@ -229,15 +254,27 @@ class PortfolioExperimentEngine:
         Raises
         ------
         ValueError
-            If cv_type is not one of the three permitted string values.
+            If cv_type is not one of the three permitted string values, or if
+            returns is shorter than burn_in_size.
         RuntimeError
             If no strategies have been registered via add_strategy().
         """
         if not self._strategies:
             raise RuntimeError("No strategies registered. Call add_strategy() first.")
 
-        cv = self._resolve_cv_splitter(cv_type, **cv_kwargs)
         returns = self._universe.returns
+
+        if burn_in_size is None:
+            burn_in_size = cv_kwargs.get("warmup_size", cv_kwargs.get("train_size", 252))
+
+        if burn_in_size >= len(returns):
+            raise ValueError(
+                f"burn_in_size={burn_in_size} must be strictly less than total "
+                f"observations ({len(returns)}) to allow out-of-sample evaluation."
+            )
+
+        burn_in_returns = returns.iloc[:burn_in_size]
+        cv = self._resolve_cv_splitter(cv_type, **cv_kwargs)
 
         collected = []
         for name, config in self._strategies.items():
@@ -249,14 +286,13 @@ class PortfolioExperimentEngine:
                 refit=True,
                 n_jobs=self._n_jobs,
             )
-            search.fit(returns)
+            search.fit(burn_in_returns)
             best_model = search.best_estimator_
 
             portfolio = online_predict(
                 best_model,
                 returns,
-                cv=cv,
-                n_jobs=self._n_jobs,
+                warmup_size=burn_in_size,
                 portfolio_params={"tag": name},
             )
 

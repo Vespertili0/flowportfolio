@@ -76,7 +76,29 @@ def test_build_entropy_prior_success(mock_entropy_pooling, stub_universe):
 
     # Assert
     assert prior is mock_instance
-    mock_entropy_pooling.assert_called_once_with(views=["AAPL > 0.05"], tau=[0.8])
+    mock_entropy_pooling.assert_called_once_with(
+        mean_views=["AAPL >= 0.05"], groups=None
+    )
+
+
+@patch("flowportfolio.priors.BlackLitterman")
+def test_build_black_litterman_prior_success(mock_bl, stub_universe):
+    mock_instance = MagicMock()
+    mock_bl.return_value = mock_instance
+
+    synthesiser = PriorSynthesiser(universe=stub_universe)
+    synthesiser.add_market_view("AAPL >= 0.05", confidence=0.8)
+
+    prior = synthesiser.build_black_litterman_prior(tau=0.05)
+
+    assert prior is mock_instance
+    mock_bl.assert_called_once_with(
+        views=["AAPL >= 0.05"],
+        tau=0.05,
+        view_confidences=[0.8],
+        groups=None,
+        risk_free_rate=0.0,
+    )
 
 
 def test_build_entropy_prior_raises_runtime_error(stub_universe):
