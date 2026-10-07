@@ -47,13 +47,11 @@ class StrategyBuilder:
         If constraints is not a list of strings or ConstraintSpec, or if prior is not a BasePrior.
     """
 
-    @property
-    def constraints(self) -> list[str] | ConstraintSpec:
-        """Accumulated strategy constraints."""
-        return self._constraints
+    _constraints: list[str] | ConstraintSpec
+    _linear_constraints: list[str]
+    _groups: dict[str, list[str]]
 
-    @constraints.setter
-    def constraints(self, value: list[str] | ConstraintSpec | None) -> None:
+    def _apply_constraints(self, value: list[str] | ConstraintSpec | None) -> None:
         if value is None:
             self._constraints = []
             self._linear_constraints = []
@@ -71,12 +69,21 @@ class StrategyBuilder:
         else:
             raise TypeError("constraints must be a list or ConstraintSpec.")
 
+    @property
+    def constraints(self) -> list[str] | ConstraintSpec:
+        """Accumulated strategy constraints."""
+        return self._constraints
+
+    @constraints.setter
+    def constraints(self, value: list[str] | ConstraintSpec | None) -> None:
+        self._apply_constraints(value)
+
     def __init__(
         self,
         constraints: list[str] | ConstraintSpec | None = None,
         prior: BasePrior | None = None,
     ) -> None:
-        self.constraints = constraints
+        self._apply_constraints(constraints)
 
         if prior is not None and not isinstance(prior, BasePrior):
             raise TypeError("prior must be an instance of BasePrior or None.")
