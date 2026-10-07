@@ -110,7 +110,7 @@ class Reporter:
                 f"Tag '{baseline_tag}' matched no portfolios in the population."
             )
 
-        combined = stress_pop + baseline_pop
+        combined = Population([*stress_pop, *baseline_pop])
 
         fig1 = combined.boxplot_measure(
             measure=RiskMeasure.CVAR,

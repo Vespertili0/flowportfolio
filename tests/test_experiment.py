@@ -192,8 +192,13 @@ def test_run_robustness_test_combinatorial(
     engine.add_strategy("Strat", DummyEstimator(), {})
     engine.run_robustness_test(cv_type="combinatorial", n_folds=5, n_test_folds=2)
 
+    # Inner CV is restricted to standard single-test-fold WalkForward
     call_args = mock_gscv.call_args[1]
-    assert isinstance(call_args["cv"], CombinatorialPurgedCV)
+    assert isinstance(call_args["cv"], WalkForward)
+
+    # Outer CV passed to cross_val_predict is CombinatorialPurgedCV
+    predict_cv = mock_cv_predict.call_args[1]["cv"]
+    assert isinstance(predict_cv, CombinatorialPurgedCV)
 
 
 @patch("flowportfolio.core.experiment.Population")
@@ -214,8 +219,47 @@ def test_run_robustness_test_randomised(
         cv_type="randomised", n_subsamples=10, walk_forward=base_cv, asset_subset_size=2
     )
 
+    # Inner CV is restricted to standard single-test-fold WalkForward
     call_args = mock_gscv.call_args[1]
-    assert isinstance(call_args["cv"], MultipleRandomizedCV)
+    assert isinstance(call_args["cv"], WalkForward)
+
+    # Outer CV passed to cross_val_predict is MultipleRandomizedCV
+    predict_cv = mock_cv_predict.call_args[1]["cv"]
+    assert isinstance(predict_cv, MultipleRandomizedCV)
+
+
+def test_run_robustness_test_invalid_inner_cv_type(stub_universe: Universe) -> None:
+    """Test ValueError is raised when non-single-test-fold splitter is requested for inner CV."""
+    engine = PortfolioExperimentEngine(stub_universe)
+    engine.add_strategy("Strat", DummyEstimator(), {})
+    with pytest.raises(
+        ValueError, match="Inner cross-validation splitter cannot be 'combinatorial'"
+    ):
+        engine.run_robustness_test(
+            cv_type="walk_forward",
+            inner_cv_kwargs={"cv_type": "combinatorial"},
+        )
+
+
+@patch("flowportfolio.core.experiment.Population")
+@patch("flowportfolio.core.experiment.cross_val_predict")
+@patch("flowportfolio.core.experiment.GridSearchCV")
+def test_run_robustness_test_collection_flattening(
+    mock_gscv: MagicMock,
+    mock_cv_predict: MagicMock,
+    mock_population: MagicMock,
+    stub_universe: Universe,
+) -> None:
+    """Test that multi-path Population predictions are flattened without nesting."""
+    p1 = MagicMock()
+    p2 = MagicMock()
+    mock_cv_predict.return_value = [p1, p2]
+
+    engine = PortfolioExperimentEngine(stub_universe)
+    engine.add_strategy("Strat", DummyEstimator(), {})
+    engine.run_robustness_test(cv_type="walk_forward", train_size=2, test_size=1)
+
+    mock_population.assert_called_once_with([p1, p2])
 
 
 def test_run_robustness_test_unknown_cv_type(stub_universe: Universe) -> None:

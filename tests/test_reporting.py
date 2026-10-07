@@ -243,6 +243,23 @@ def test_plot_stress_impact_success(
     )
 
 
+def test_plot_stress_impact_explicit_population_instantiation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test plot_stress_impact explicitly instantiates Population without relying on list addition."""
+    p_baseline = _make_mock_portfolio("Baseline", 1.0)
+    p_stress = _make_mock_portfolio("Stress", 0.8)
+
+    mock_fig = MagicMock()
+    monkeypatch.setattr(Population, "boxplot_measure", lambda self, **kwargs: mock_fig)
+    monkeypatch.setattr(Population, "plot_distribution", lambda self, **kwargs: mock_fig)
+
+    real_pop = Population([p_baseline, p_stress])
+    reporter = Reporter(real_pop)
+    reporter.plot_stress_impact("Stress", "Baseline")
+    assert mock_fig.show.call_count == 2
+
+
 def test_plot_stress_impact_missing_stress_tag() -> None:
     """Test plot_stress_impact raises ValueError if stress_tag matches no portfolios."""
     p_baseline = _make_mock_portfolio("Baseline", 1.0)

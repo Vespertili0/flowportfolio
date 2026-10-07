@@ -172,24 +172,37 @@ class PortfolioExperimentEngine:
             resolved_outer_kwargs.setdefault("test_size", 63)
         outer_cv = self._resolve_cv_splitter(cv_type, **resolved_outer_kwargs)
 
+        # 2. Extract returns (will raise ValueError if not fetched)
+        returns = self._universe.returns
+
         if inner_cv_kwargs is not None:
             resolved_explicit_inner = dict(inner_cv_kwargs)
-            if cv_type == "walk_forward":
+            inner_type = resolved_explicit_inner.pop("cv_type", "walk_forward")
+            if inner_type in ("combinatorial", "randomised"):
+                raise ValueError(
+                    f"Inner cross-validation splitter cannot be '{inner_type}'. "
+                    "Hyperparameter tuning via GridSearchCV is restricted to single-test-fold splitters such as 'walk_forward'."
+                )
+            if inner_type == "walk_forward":
                 if (
                     "train_size" not in resolved_explicit_inner
                     or "test_size" not in resolved_explicit_inner
                 ):
-                    outer_train = resolved_outer_kwargs.get("train_size", 252)
+                    outer_train = (
+                        resolved_outer_kwargs.get("train_size", 252)
+                        if cv_type == "walk_forward"
+                        else len(returns)
+                    )
                     inner_test = max(1, int(outer_train * 0.2))
                     inner_train = max(1, int(outer_train * 0.6))
                     if inner_train + inner_test > outer_train:
                         inner_train = max(1, outer_train - inner_test)
                     resolved_explicit_inner.setdefault("train_size", inner_train)
                     resolved_explicit_inner.setdefault("test_size", inner_test)
-            inner_cv = self._resolve_cv_splitter(cv_type, **resolved_explicit_inner)
+            inner_cv = self._resolve_cv_splitter(inner_type, **resolved_explicit_inner)
         else:
-            resolved_inner_kwargs = dict(cv_kwargs)
             if cv_type == "walk_forward":
+                resolved_inner_kwargs = dict(cv_kwargs)
                 outer_train = resolved_outer_kwargs.get("train_size", 252)
                 if outer_train <= 2:
                     raise ValueError(
@@ -203,10 +216,18 @@ class PortfolioExperimentEngine:
                 resolved_inner_kwargs["train_size"] = inner_train
                 resolved_inner_kwargs["test_size"] = inner_test
 
-            inner_cv = self._resolve_cv_splitter(cv_type, **resolved_inner_kwargs)
-
-        # 2. Extract returns (will raise ValueError if not fetched)
-        returns = self._universe.returns
+                inner_cv = self._resolve_cv_splitter("walk_forward", **resolved_inner_kwargs)
+            else:
+                # CombinatorialPurgedCV and MultipleRandomizedCV are multi-path splitters
+                # incompatible with GridSearchCV. Restrict inner tuning to standard single-test-fold WalkForward.
+                n_samples = len(returns)
+                inner_test = max(1, int(n_samples * 0.2))
+                inner_train = max(1, int(n_samples * 0.5))
+                if inner_train + inner_test > n_samples:
+                    inner_train = max(1, n_samples - inner_test)
+                inner_cv = self._resolve_cv_splitter(
+                    "walk_forward", train_size=inner_train, test_size=inner_test
+                )
 
         if not self._strategies:
             raise RuntimeError("No strategies registered. Call add_strategy() first.")
@@ -233,7 +254,10 @@ class PortfolioExperimentEngine:
                 portfolio_params={"tag": name},
             )
 
-            collected.append(portfolio)
+            if isinstance(portfolio, (Population, list)):
+                collected.extend(portfolio)
+            else:
+                collected.append(portfolio)
 
         return Population(collected)
 
