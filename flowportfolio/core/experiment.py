@@ -166,14 +166,31 @@ class PortfolioExperimentEngine:
             ``universe.returns`` is unavailable.
         """
         # 1. Resolve CV protocols
-        outer_cv = self._resolve_cv_splitter(cv_type, **cv_kwargs)
+        resolved_outer_kwargs = dict(cv_kwargs)
+        if cv_type == "walk_forward":
+            resolved_outer_kwargs.setdefault("train_size", 252)
+            resolved_outer_kwargs.setdefault("test_size", 63)
+        outer_cv = self._resolve_cv_splitter(cv_type, **resolved_outer_kwargs)
 
         if inner_cv_kwargs is not None:
-            inner_cv = self._resolve_cv_splitter(cv_type, **inner_cv_kwargs)
+            resolved_explicit_inner = dict(inner_cv_kwargs)
+            if cv_type == "walk_forward":
+                if (
+                    "train_size" not in resolved_explicit_inner
+                    or "test_size" not in resolved_explicit_inner
+                ):
+                    outer_train = resolved_outer_kwargs.get("train_size", 252)
+                    inner_test = max(1, int(outer_train * 0.2))
+                    inner_train = max(1, int(outer_train * 0.6))
+                    if inner_train + inner_test > outer_train:
+                        inner_train = max(1, outer_train - inner_test)
+                    resolved_explicit_inner.setdefault("train_size", inner_train)
+                    resolved_explicit_inner.setdefault("test_size", inner_test)
+            inner_cv = self._resolve_cv_splitter(cv_type, **resolved_explicit_inner)
         else:
             resolved_inner_kwargs = dict(cv_kwargs)
             if cv_type == "walk_forward":
-                outer_train = cv_kwargs.get("train_size", 252)
+                outer_train = resolved_outer_kwargs.get("train_size", 252)
                 if outer_train <= 2:
                     raise ValueError(
                         f"Outer train_size={outer_train} is too small to derive inner walk-forward splits."
@@ -276,7 +293,21 @@ class PortfolioExperimentEngine:
             )
 
         burn_in_returns = returns.iloc[:burn_in_size]
-        cv = self._resolve_cv_splitter(cv_type, **cv_kwargs)
+
+        resolved_cv_kwargs = dict(cv_kwargs)
+        if cv_type == "walk_forward":
+            if (
+                "train_size" not in resolved_cv_kwargs
+                or "test_size" not in resolved_cv_kwargs
+            ):
+                inner_test = max(1, int(burn_in_size * 0.2))
+                inner_train = max(1, int(burn_in_size * 0.6))
+                if inner_train + inner_test > burn_in_size:
+                    inner_train = max(1, burn_in_size - inner_test)
+                resolved_cv_kwargs.setdefault("train_size", inner_train)
+                resolved_cv_kwargs.setdefault("test_size", inner_test)
+
+        cv = self._resolve_cv_splitter(cv_type, **resolved_cv_kwargs)
 
         collected = []
         for name, config in self._strategies.items():

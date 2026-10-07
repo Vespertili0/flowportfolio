@@ -16,5 +16,6 @@ wheels/
 .env.*
 
 # Test and lint caches
+.mypy_cache/
 .pytest_cache/
 .ruff_cache/
