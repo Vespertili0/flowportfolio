@@ -265,7 +265,9 @@ class PortfolioExperimentEngine:
         returns = self._universe.returns
 
         if burn_in_size is None:
-            burn_in_size = cv_kwargs.get("warmup_size", cv_kwargs.get("train_size", 252))
+            burn_in_size = cv_kwargs.get(
+                "warmup_size", cv_kwargs.get("train_size", 252)
+            )
 
         if burn_in_size >= len(returns):
             raise ValueError(

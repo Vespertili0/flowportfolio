@@ -20,7 +20,7 @@ from collections import defaultdict
 
 import numpy as np
 import pandas as pd
-from skfolio import Population, RatioMeasure
+from skfolio import Population
 from skfolio.portfolio import Portfolio
 
 from flowportfolio.core.universe import Universe
@@ -218,9 +218,7 @@ class PortfolioDeltaEngine:
         df = pd.DataFrame(rows).set_index("group")
         return df
 
-    def calculate_rebalance_delta(
-        self, population: Population | None = None
-    ) -> dict:
+    def calculate_rebalance_delta(self, population: Population | None = None) -> dict:
         """Calculate the risk/return delta of holding vs rebalancing.
 
         Evaluates the current physical weights (hold scenario) and the target
