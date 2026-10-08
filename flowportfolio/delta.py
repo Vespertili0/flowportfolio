@@ -20,7 +20,7 @@ from collections import defaultdict
 
 import numpy as np
 import pandas as pd
-from skfolio import Population, RatioMeasure
+from skfolio import Population
 from skfolio.portfolio import Portfolio
 
 from flowportfolio.core.universe import Universe
@@ -218,21 +218,21 @@ class PortfolioDeltaEngine:
         df = pd.DataFrame(rows).set_index("group")
         return df
 
-    def calculate_rebalance_delta(self, population: Population) -> dict:
+    def calculate_rebalance_delta(self, population: Population | None = None) -> dict:
         """Calculate the risk/return delta of holding vs rebalancing.
 
-        Takes the skfolio ``Population`` object (e.g. from robustness
-        testing) and creates a pseudo-portfolio representing the current
-        physical weights applied to the universe's historical returns.
-        Computes Mean CVaR, Sharpe ratio, and Max Drawdown for both the
-        ``'hold'`` portfolio and the ``'rebalance'`` portfolio (best
-        strategy from the population, selected by maximum CVaR ratio).
+        Evaluates the current physical weights (hold scenario) and the target
+        weights (rebalance scenario) across the identical returns evaluation
+        window. If an out-of-sample ``Population`` is provided, the evaluation
+        window is aligned to the population's observation period. Computes CVaR,
+        Sharpe ratio, and Max Drawdown for both scenarios.
 
         Parameters
         ----------
-        population : Population
-            The out-of-sample population object containing the target
-            strategy portfolios.
+        population : Population or None, optional
+            The out-of-sample population object containing benchmarked strategy
+            portfolios. If provided, its observation window is used to evaluate
+            both current and target holdings.
 
         Returns
         -------
@@ -244,34 +244,53 @@ class PortfolioDeltaEngine:
         Raises
         ------
         TypeError
-            If ``population`` is not a ``skfolio.Population`` instance.
+            If ``population`` is not None and not a ``skfolio.Population`` instance.
         ValueError
-            If ``population`` is empty, or if ``universe.returns`` has not
-            been populated (i.e. ``fetch_data()`` has not been called).
+            If ``population`` is provided but empty, or if ``universe.returns``
+            has not been populated.
         """
-        if not isinstance(population, Population):
-            raise TypeError("population must be a skfolio.Population instance.")
-        if len(population) == 0:
-            raise ValueError("population must not be empty.")
+        if population is not None:
+            if not isinstance(population, Population):
+                raise TypeError("population must be a skfolio.Population instance.")
+            if len(population) == 0:
+                raise ValueError("population must not be empty.")
 
         # Retrieve universe returns — propagates ValueError if not fetched
         returns: pd.DataFrame = self._universe.returns
 
-        # Build weight vector aligned to returns column order; default 0.0
-        # for any universe ticker absent from current_weights.
-        weight_vector = np.array(
+        # Determine evaluation returns window
+        eval_returns = returns
+        if population is not None and len(population) > 0:
+            first_port = population[0]
+            port_returns = getattr(first_port, "returns", None)
+            if isinstance(port_returns, (pd.Series, pd.DataFrame)):
+                if (
+                    hasattr(port_returns, "index")
+                    and port_returns.index.isin(returns.index).any()
+                ):
+                    eval_returns = returns.loc[returns.index.isin(port_returns.index)]
+                elif len(port_returns) <= len(returns):
+                    eval_returns = returns.iloc[-len(port_returns) :]
+
+        # Build weight vectors aligned to returns column order
+        current_weight_vector = np.array(
             [self._current_weights.get(col, 0.0) for col in returns.columns],
             dtype=float,
         )
-
-        # Construct skfolio Portfolio for the "hold" scenario
-        hold_portfolio = Portfolio(
-            X=returns.to_numpy(),
-            weights=weight_vector,
+        target_weight_vector = np.array(
+            [self._target_weights.get(col, 0.0) for col in returns.columns],
+            dtype=float,
         )
 
-        # Select the best portfolio from the population by CVaR ratio
-        rebalance_portfolio = population.max_measure(RatioMeasure.CVAR_RATIO)
+        # Construct skfolio Portfolio for both scenarios over the identical window
+        hold_portfolio = Portfolio(
+            X=eval_returns.to_numpy(),
+            weights=current_weight_vector,
+        )
+        rebalance_portfolio = Portfolio(
+            X=eval_returns.to_numpy(),
+            weights=target_weight_vector,
+        )
 
         return {
             "hold": {

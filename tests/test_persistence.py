@@ -2,7 +2,7 @@ import json
 import re
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pandas as pd
@@ -53,6 +53,38 @@ def test_save_snapshot_success(manager, dummy_population, tmp_path):
     assert "sharpe" in port1_data
     assert "cvar" in port1_data
     assert "max_drawdown" in port1_data
+
+
+def test_save_snapshot_multi_period_portfolio(manager, tmp_path):
+    filepath = tmp_path / "test_mpp_snapshot.json"
+
+    sub_p1 = MagicMock()
+    sub_p1.weights_dict = {"A": 0.5, "B": 0.5}
+    sub_p2 = MagicMock()
+    sub_p2.weights_dict = {"A": 0.7, "B": 0.3}
+
+    mpp = MagicMock()
+    mpp.name = "mpp_strat"
+    mpp.tag = "mpp_tag"
+    mpp.portfolios = [sub_p1, sub_p2]
+    del mpp.weights_dict
+    mpp.sharpe_ratio = 1.8
+    mpp.cvar = 0.03
+    mpp.max_drawdown = 0.05
+
+    pop = MagicMock(spec=Population)
+    pop.__len__.return_value = 1
+    pop.__iter__.return_value = iter([mpp])
+
+    manager.save_snapshot(pop, str(filepath))
+
+    with filepath.open("r") as f:
+        data = json.load(f)
+
+    assert len(data["portfolios"]) == 1
+    p_data = data["portfolios"][0]
+    assert p_data["name"] == "mpp_strat"
+    assert p_data["weights"] == {"A": 0.7, "B": 0.3}
 
 
 def test_save_snapshot_type_error(manager, tmp_path):

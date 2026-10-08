@@ -6,7 +6,7 @@ using the fluent builder pattern in :class:`flowportfolio.core.constraints.Const
 
 import pytest
 
-from flowportfolio.core.constraints import ConstraintBuilder
+from flowportfolio.core.constraints import ConstraintBuilder, ConstraintSpec
 from flowportfolio.core.protocols import UniverseProtocol
 from flowportfolio.core.universe import Universe
 
@@ -182,6 +182,21 @@ def test_build_does_not_mutate(stub_universe: Universe) -> None:
     assert result1 == ["core >= 0.5"]
     assert result1 is not result2
     assert result1 == result2
+
+
+def test_build_returns_constraint_spec(stub_universe: Universe) -> None:
+    """Test build() returns a ConstraintSpec with both constraints and groups."""
+    builder = ConstraintBuilder(stub_universe)
+    builder.min_group("core", 0.5)
+    spec = builder.build()
+
+    assert isinstance(spec, ConstraintSpec)
+    assert spec.linear_constraints == ["core >= 0.5"]
+    assert spec.groups == {
+        "A": ["core"],
+        "B": ["core"],
+        "C": ["satellite"],
+    }
 
 
 # ---------------------------------------------------------------------------

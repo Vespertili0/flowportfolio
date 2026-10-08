@@ -53,11 +53,18 @@ class PersistenceManager:
 
         portfolios_data = []
         for port in population:
+            weights = None
+            if hasattr(port, "portfolios") and port.portfolios:
+                terminal_port = port.portfolios[-1]
+                weights = getattr(terminal_port, "weights_dict", None)
+            if weights is None:
+                weights = getattr(port, "weights_dict", None) or {}
+
             portfolios_data.append(
                 {
                     "name": port.name,
                     "tag": port.tag,
-                    "weights": port.weights_dict,
+                    "weights": weights,
                     "sharpe": float(port.sharpe_ratio),
                     "cvar": float(port.cvar),
                     "max_drawdown": float(port.max_drawdown),

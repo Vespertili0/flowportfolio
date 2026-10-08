@@ -159,17 +159,18 @@ def test_run_robustness_test_walk_forward(
         cv_type="walk_forward", train_size=252, test_size=63
     )
 
-    # Verify CV object type and instantiation
-    call_args = mock_gscv.call_args[1]
+    # Verify inner CV was derived dynamically to fit inside outer train_size
+    call_args = mock_gscv.call_args[1] if mock_gscv.call_args else {}
     assert isinstance(call_args["cv"], WalkForward)
-    assert call_args["cv"].train_size == 252
-    assert call_args["cv"].test_size == 63
+    assert call_args["cv"].train_size == 151
+    assert call_args["cv"].test_size == 50
 
-    # Verify predict were called
+    # Verify predict was called with outer CV
     mock_cv_predict.assert_called_once()
-
-    # Verify tag injection and output
     predict_kwargs = mock_cv_predict.call_args[1]
+    assert isinstance(predict_kwargs["cv"], WalkForward)
+    assert predict_kwargs["cv"].train_size == 252
+    assert predict_kwargs["cv"].test_size == 63
     assert predict_kwargs["portfolio_params"] == {"tag": "MyStrat"}
 
     # Verify Population was called with collected mock
@@ -191,8 +192,13 @@ def test_run_robustness_test_combinatorial(
     engine.add_strategy("Strat", DummyEstimator(), {})
     engine.run_robustness_test(cv_type="combinatorial", n_folds=5, n_test_folds=2)
 
-    call_args = mock_gscv.call_args[1]
-    assert isinstance(call_args["cv"], CombinatorialPurgedCV)
+    # Inner CV is restricted to standard single-test-fold WalkForward
+    call_args = mock_gscv.call_args[1] if mock_gscv.call_args else {}
+    assert isinstance(call_args["cv"], WalkForward)
+
+    # Outer CV passed to cross_val_predict is CombinatorialPurgedCV
+    predict_cv = mock_cv_predict.call_args[1]["cv"]
+    assert isinstance(predict_cv, CombinatorialPurgedCV)
 
 
 @patch("flowportfolio.core.experiment.Population")
@@ -213,8 +219,47 @@ def test_run_robustness_test_randomised(
         cv_type="randomised", n_subsamples=10, walk_forward=base_cv, asset_subset_size=2
     )
 
-    call_args = mock_gscv.call_args[1]
-    assert isinstance(call_args["cv"], MultipleRandomizedCV)
+    # Inner CV is restricted to standard single-test-fold WalkForward
+    call_args = mock_gscv.call_args[1] if mock_gscv.call_args else {}
+    assert isinstance(call_args["cv"], WalkForward)
+
+    # Outer CV passed to cross_val_predict is MultipleRandomizedCV
+    predict_cv = mock_cv_predict.call_args[1]["cv"]
+    assert isinstance(predict_cv, MultipleRandomizedCV)
+
+
+def test_run_robustness_test_invalid_inner_cv_type(stub_universe: Universe) -> None:
+    """Test ValueError is raised when non-single-test-fold splitter is requested for inner CV."""
+    engine = PortfolioExperimentEngine(stub_universe)
+    engine.add_strategy("Strat", DummyEstimator(), {})
+    with pytest.raises(
+        ValueError, match="Inner cross-validation splitter cannot be 'combinatorial'"
+    ):
+        engine.run_robustness_test(
+            cv_type="walk_forward",
+            inner_cv_kwargs={"cv_type": "combinatorial"},
+        )
+
+
+@patch("flowportfolio.core.experiment.Population")
+@patch("flowportfolio.core.experiment.cross_val_predict")
+@patch("flowportfolio.core.experiment.GridSearchCV")
+def test_run_robustness_test_collection_flattening(
+    mock_gscv: MagicMock,
+    mock_cv_predict: MagicMock,
+    mock_population: MagicMock,
+    stub_universe: Universe,
+) -> None:
+    """Test that multi-path Population predictions are flattened without nesting."""
+    p1 = MagicMock()
+    p2 = MagicMock()
+    mock_cv_predict.return_value = [p1, p2]
+
+    engine = PortfolioExperimentEngine(stub_universe)
+    engine.add_strategy("Strat", DummyEstimator(), {})
+    engine.run_robustness_test(cv_type="walk_forward", train_size=10, test_size=1)
+
+    mock_population.assert_called_once_with([p1, p2])
 
 
 def test_run_robustness_test_unknown_cv_type(stub_universe: Universe) -> None:
@@ -230,3 +275,65 @@ def test_run_robustness_test_no_fetch(stub_universe_no_returns: Universe) -> Non
     engine.add_strategy("Strat", DummyEstimator(), {})
     with pytest.raises(ValueError, match="Returns are not yet available"):
         engine.run_robustness_test(train_size=252, test_size=63)
+
+
+@patch("flowportfolio.core.experiment.Population")
+@patch("flowportfolio.core.experiment.cross_val_predict")
+@patch("flowportfolio.core.experiment.GridSearchCV")
+def test_run_robustness_test_explicit_inner_cv_kwargs(
+    mock_gscv: MagicMock,
+    mock_cv_predict: MagicMock,
+    mock_population: MagicMock,
+    stub_universe: Universe,
+) -> None:
+    """Test execution with explicit inner_cv_kwargs."""
+    engine = PortfolioExperimentEngine(stub_universe)
+    engine.add_strategy("MyStrat", DummyEstimator(), {"p": [1]})
+
+    engine.run_robustness_test(
+        cv_type="walk_forward",
+        inner_cv_kwargs={"train_size": 100, "test_size": 25},
+        train_size=252,
+        test_size=63,
+    )
+
+    call_args = mock_gscv.call_args[1] if mock_gscv.call_args else {}
+    assert isinstance(call_args["cv"], WalkForward)
+    assert call_args["cv"].train_size == 100
+    assert call_args["cv"].test_size == 25
+
+
+@patch("flowportfolio.core.experiment.Population")
+@patch("flowportfolio.core.experiment.online_predict")
+@patch("flowportfolio.core.experiment.OnlineGridSearch")
+def test_run_online_evaluation_burn_in(
+    mock_online_search: MagicMock,
+    mock_online_predict: MagicMock,
+    mock_population: MagicMock,
+    stub_universe: Universe,
+) -> None:
+    """Test run_online_evaluation fits strictly on burn_in_size to prevent look-ahead bias."""
+    df = pd.DataFrame(
+        {"A": [0.01] * 10, "B": [-0.01] * 10},
+        index=pd.date_range("2026-01-01", periods=10),
+    )
+    stub_universe._returns = df
+
+    search_instance = MagicMock()
+    mock_online_search.return_value = search_instance
+
+    engine = PortfolioExperimentEngine(stub_universe)
+    engine.add_strategy("OnlineStrat", DummyEstimator(), {})
+
+    engine.run_online_evaluation(burn_in_size=4)
+
+    # Verify fit was called strictly on the burn-in slice of returns (first 4 rows)
+    search_instance.fit.assert_called_once()
+    fit_arg = search_instance.fit.call_args[0][0]
+    assert len(fit_arg) == 4
+
+    # Verify online_predict was called with warmup_size=4
+    mock_online_predict.assert_called_once()
+    predict_kwargs = mock_online_predict.call_args[1]
+    assert predict_kwargs["warmup_size"] == 4
+    assert predict_kwargs["portfolio_params"] == {"tag": "OnlineStrat"}

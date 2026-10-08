@@ -7,7 +7,54 @@ asset universe structure.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from dataclasses import dataclass, field
+
 from flowportfolio.core.protocols import UniverseProtocol
+
+
+@dataclass(frozen=True)
+class ConstraintSpec:
+    """Structured container holding linear constraints and asset group mappings.
+
+    This specification satisfies both the ``linear_constraints`` string
+    grammar and the asset grouping dictionary contract expected by ``skfolio``
+    optimisers. It implements sequence dunder methods so that existing code and
+    tests expecting a ``list[str]`` continue to operate seamlessly.
+
+    Parameters
+    ----------
+    linear_constraints : list[str], optional
+        List of formatted linear constraint expressions (e.g. ``["core >= 0.40"]``).
+    groups : dict[str, list[str]], optional
+        Mapping of asset ticker to list of group labels
+        (e.g. ``{"AAPL": ["tech"]}``).
+    """
+
+    linear_constraints: list[str] = field(default_factory=list)
+    groups: dict[str, list[str]] = field(default_factory=dict)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.linear_constraints)
+
+    def __len__(self) -> int:
+        return len(self.linear_constraints)
+
+    def __getitem__(self, index: int) -> str:
+        return self.linear_constraints[index]
+
+    def __contains__(self, item: object) -> bool:
+        return item in self.linear_constraints
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, ConstraintSpec):
+            return (
+                self.linear_constraints == other.linear_constraints
+                and self.groups == other.groups
+            )
+        if isinstance(other, list):
+            return self.linear_constraints == other
+        return False
 
 
 class ConstraintBuilder:
@@ -170,16 +217,45 @@ class ConstraintBuilder:
 
         return self
 
-    def build(self) -> list[str]:
-        """Compile the accumulated constraints.
+    def build(self) -> ConstraintSpec:
+        """Compile the accumulated constraints and asset group bindings.
 
         Returns
         -------
-        list[str]
-            A new list containing the string constraints, suitable for passing
-            to ``skfolio`` optimisers.
+        ConstraintSpec
+            A structured constraint specification containing the string
+            constraints and asset group bindings from the universe, suitable
+            for passing to ``skfolio`` optimisers.
         """
-        return list(self._constraints)
+        raw_metadata = (
+            self._universe.metadata
+            if isinstance(getattr(self._universe, "metadata", None), dict)
+            else {}
+        )
+        groups: dict[str, list[str]] = {}
+
+        # Include all universe tickers
+        tickers = (
+            self._universe.tickers
+            if isinstance(getattr(self._universe, "tickers", None), list)
+            else []
+        )
+        for ticker in tickers:
+            if ticker in raw_metadata:
+                val = raw_metadata[ticker]
+                groups[ticker] = [val] if isinstance(val, str) else list(val)
+            else:
+                groups[ticker] = []
+
+        # Include any remaining metadata tickers
+        for ticker, val in raw_metadata.items():
+            if ticker not in groups:
+                groups[ticker] = [val] if isinstance(val, str) else list(val)
+
+        return ConstraintSpec(
+            linear_constraints=list(self._constraints),
+            groups=groups,
+        )
 
     def reset(self) -> ConstraintBuilder:
         """Clear all accumulated constraints and return self.
