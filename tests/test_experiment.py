@@ -160,7 +160,7 @@ def test_run_robustness_test_walk_forward(
     )
 
     # Verify inner CV was derived dynamically to fit inside outer train_size
-    call_args = mock_gscv.call_args[1]
+    call_args = mock_gscv.call_args[1] if mock_gscv.call_args else {}
     assert isinstance(call_args["cv"], WalkForward)
     assert call_args["cv"].train_size == 151
     assert call_args["cv"].test_size == 50
@@ -193,7 +193,7 @@ def test_run_robustness_test_combinatorial(
     engine.run_robustness_test(cv_type="combinatorial", n_folds=5, n_test_folds=2)
 
     # Inner CV is restricted to standard single-test-fold WalkForward
-    call_args = mock_gscv.call_args[1]
+    call_args = mock_gscv.call_args[1] if mock_gscv.call_args else {}
     assert isinstance(call_args["cv"], WalkForward)
 
     # Outer CV passed to cross_val_predict is CombinatorialPurgedCV
@@ -220,7 +220,7 @@ def test_run_robustness_test_randomised(
     )
 
     # Inner CV is restricted to standard single-test-fold WalkForward
-    call_args = mock_gscv.call_args[1]
+    call_args = mock_gscv.call_args[1] if mock_gscv.call_args else {}
     assert isinstance(call_args["cv"], WalkForward)
 
     # Outer CV passed to cross_val_predict is MultipleRandomizedCV
@@ -257,7 +257,7 @@ def test_run_robustness_test_collection_flattening(
 
     engine = PortfolioExperimentEngine(stub_universe)
     engine.add_strategy("Strat", DummyEstimator(), {})
-    engine.run_robustness_test(cv_type="walk_forward", train_size=2, test_size=1)
+    engine.run_robustness_test(cv_type="walk_forward", train_size=10, test_size=1)
 
     mock_population.assert_called_once_with([p1, p2])
 
@@ -297,7 +297,7 @@ def test_run_robustness_test_explicit_inner_cv_kwargs(
         test_size=63,
     )
 
-    call_args = mock_gscv.call_args[1]
+    call_args = mock_gscv.call_args[1] if mock_gscv.call_args else {}
     assert isinstance(call_args["cv"], WalkForward)
     assert call_args["cv"].train_size == 100
     assert call_args["cv"].test_size == 25

@@ -252,7 +252,9 @@ def test_plot_stress_impact_explicit_population_instantiation(
 
     mock_fig = MagicMock()
     monkeypatch.setattr(Population, "boxplot_measure", lambda self, **kwargs: mock_fig)
-    monkeypatch.setattr(Population, "plot_distribution", lambda self, **kwargs: mock_fig)
+    monkeypatch.setattr(
+        Population, "plot_distribution", lambda self, **kwargs: mock_fig
+    )
 
     real_pop = Population([p_baseline, p_stress])
     reporter = Reporter(real_pop)

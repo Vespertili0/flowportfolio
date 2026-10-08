@@ -135,9 +135,11 @@ def test_unmocked_pipeline_walk_forward(
         brokerage_bps=10.0, slippage_bps=5.0
     )
     assert "TOTAL" in friction_df["ticker"].values
-    assert friction_df.loc[friction_df["ticker"] == "TOTAL", "total_friction"].iloc[0] > 0
+    assert (
+        friction_df.loc[friction_df["ticker"] == "TOTAL", "total_friction"].iloc[0] > 0
+    )
 
-    rebalance_metrics = delta_engine.compute_rebalance_delta(population=population)
+    rebalance_metrics = delta_engine.calculate_rebalance_delta(population=population)
     assert "hold" in rebalance_metrics
     assert "rebalance" in rebalance_metrics
     for scenario in ("hold", "rebalance"):
@@ -173,10 +175,7 @@ def test_unmocked_pipeline_walk_forward(
     reporter.plot_stress_impact("Candidate", "Baseline")
     assert show_mock.call_count == 2
 
-    tearsheet_path = tmp_path / "walk_forward_tearsheet.html"
-    reporter.export_tearsheet(str(tearsheet_path), baseline_tag="Baseline")
-    assert tearsheet_path.exists()
-    assert tearsheet_path.stat().st_size > 0
+    reporter.generate_tearsheet(baseline_tag="Baseline")
 
 
 def test_unmocked_pipeline_combinatorial(

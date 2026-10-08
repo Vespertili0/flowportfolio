@@ -18,8 +18,8 @@ from skfolio.model_selection import (
     online_predict,
 )
 from sklearn.base import BaseEstimator
-from sklearn.model_selection import GridSearchCV
 
+from flowportfolio.core.optimisation import SkfolioGridSearchCV as GridSearchCV
 from flowportfolio.core.universe import Universe
 
 
@@ -183,22 +183,21 @@ class PortfolioExperimentEngine:
                     f"Inner cross-validation splitter cannot be '{inner_type}'. "
                     "Hyperparameter tuning via GridSearchCV is restricted to single-test-fold splitters such as 'walk_forward'."
                 )
-            if inner_type == "walk_forward":
-                if (
-                    "train_size" not in resolved_explicit_inner
-                    or "test_size" not in resolved_explicit_inner
-                ):
-                    outer_train = (
-                        resolved_outer_kwargs.get("train_size", 252)
-                        if cv_type == "walk_forward"
-                        else len(returns)
-                    )
-                    inner_test = max(1, int(outer_train * 0.2))
-                    inner_train = max(1, int(outer_train * 0.6))
-                    if inner_train + inner_test > outer_train:
-                        inner_train = max(1, outer_train - inner_test)
-                    resolved_explicit_inner.setdefault("train_size", inner_train)
-                    resolved_explicit_inner.setdefault("test_size", inner_test)
+            if inner_type == "walk_forward" and (
+                "train_size" not in resolved_explicit_inner
+                or "test_size" not in resolved_explicit_inner
+            ):
+                outer_train = (
+                    resolved_outer_kwargs.get("train_size", 252)
+                    if cv_type == "walk_forward"
+                    else len(returns)
+                )
+                inner_test = max(1, int(outer_train * 0.2))
+                inner_train = max(1, int(outer_train * 0.6))
+                if inner_train + inner_test > outer_train:
+                    inner_train = max(1, outer_train - inner_test)
+                resolved_explicit_inner.setdefault("train_size", inner_train)
+                resolved_explicit_inner.setdefault("test_size", inner_test)
             inner_cv = self._resolve_cv_splitter(inner_type, **resolved_explicit_inner)
         else:
             if cv_type == "walk_forward":
@@ -216,7 +215,9 @@ class PortfolioExperimentEngine:
                 resolved_inner_kwargs["train_size"] = inner_train
                 resolved_inner_kwargs["test_size"] = inner_test
 
-                inner_cv = self._resolve_cv_splitter("walk_forward", **resolved_inner_kwargs)
+                inner_cv = self._resolve_cv_splitter(
+                    "walk_forward", **resolved_inner_kwargs
+                )
             else:
                 # CombinatorialPurgedCV and MultipleRandomizedCV are multi-path splitters
                 # incompatible with GridSearchCV. Restrict inner tuning to standard single-test-fold WalkForward.
@@ -254,7 +255,7 @@ class PortfolioExperimentEngine:
                 portfolio_params={"tag": name},
             )
 
-            if isinstance(portfolio, (Population, list)):
+            if type(portfolio).__name__ == "Population" or isinstance(portfolio, list):
                 collected.extend(portfolio)
             else:
                 collected.append(portfolio)
@@ -319,17 +320,16 @@ class PortfolioExperimentEngine:
         burn_in_returns = returns.iloc[:burn_in_size]
 
         resolved_cv_kwargs = dict(cv_kwargs)
-        if cv_type == "walk_forward":
-            if (
-                "train_size" not in resolved_cv_kwargs
-                or "test_size" not in resolved_cv_kwargs
-            ):
-                inner_test = max(1, int(burn_in_size * 0.2))
-                inner_train = max(1, int(burn_in_size * 0.6))
-                if inner_train + inner_test > burn_in_size:
-                    inner_train = max(1, burn_in_size - inner_test)
-                resolved_cv_kwargs.setdefault("train_size", inner_train)
-                resolved_cv_kwargs.setdefault("test_size", inner_test)
+        if cv_type == "walk_forward" and (
+            "train_size" not in resolved_cv_kwargs
+            or "test_size" not in resolved_cv_kwargs
+        ):
+            inner_test = max(1, int(burn_in_size * 0.2))
+            inner_train = max(1, int(burn_in_size * 0.6))
+            if inner_train + inner_test > burn_in_size:
+                inner_train = max(1, burn_in_size - inner_test)
+            resolved_cv_kwargs.setdefault("train_size", inner_train)
+            resolved_cv_kwargs.setdefault("test_size", inner_test)
 
         cv = self._resolve_cv_splitter(cv_type, **resolved_cv_kwargs)
 
