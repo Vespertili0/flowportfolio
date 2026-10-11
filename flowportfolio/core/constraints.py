@@ -29,10 +29,19 @@ class ConstraintSpec:
     groups : dict[str, list[str]], optional
         Mapping of asset ticker to list of group labels
         (e.g. ``{"AAPL": ["tech"]}``).
+    previous_weights : list[float] | None, optional
+        Previous weights for turnover constraints.
+    max_turnover : float | None, optional
+        Maximum turnover limit.
+    management_fees : list[float] | None, optional
+        Management fees for each asset.
     """
 
     linear_constraints: list[str] = field(default_factory=list)
     groups: dict[str, list[str]] = field(default_factory=dict)
+    previous_weights: list[float] | None = None
+    max_turnover: float | None = None
+    management_fees: list[float] | None = None
 
     def __iter__(self) -> Iterator[str]:
         return iter(self.linear_constraints)
@@ -89,6 +98,8 @@ class ConstraintBuilder:
         self._universe = universe
         self._valid_groups: set[str] = set(universe.metadata.values())
         self._constraints: list[str] = []
+        self._max_turnover: float | None = None
+        self._previous_weights: list[float] | None = None
 
     def min_group(self, group_name: str, weight: float) -> ConstraintBuilder:
         """Add a minimum weight constraint for a specific group.
@@ -205,15 +216,10 @@ class ConstraintBuilder:
         if missing_tickers:
             raise ValueError(f"Missing current weights for tickers: {missing_tickers}")
 
-        for ticker in self._universe.tickers:
-            current_weight = current_weights[ticker]
-
-            # Calculate bounds and clamp to [0.0, 1.0]
-            lower_bound = max(0.0, current_weight - limit)
-            upper_bound = min(1.0, current_weight + limit)
-
-            self._constraints.append(f"{ticker} >= {lower_bound:.6g}")
-            self._constraints.append(f"{ticker} <= {upper_bound:.6g}")
+        self._max_turnover = limit
+        self._previous_weights = [
+            current_weights[ticker] for ticker in self._universe.tickers
+        ]
 
         return self
 
@@ -252,9 +258,17 @@ class ConstraintBuilder:
             if ticker not in groups:
                 groups[ticker] = [val] if isinstance(val, str) else list(val)
 
+        management_fees = None
+        fees = getattr(self._universe, "fees", None)
+        if isinstance(fees, dict):
+            management_fees = [float(fees.get(ticker, 0.0)) for ticker in tickers]
+
         return ConstraintSpec(
             linear_constraints=list(self._constraints),
             groups=groups,
+            previous_weights=self._previous_weights,
+            max_turnover=self._max_turnover,
+            management_fees=management_fees,
         )
 
     def reset(self) -> ConstraintBuilder:
@@ -271,4 +285,6 @@ class ConstraintBuilder:
             The builder instance for method chaining.
         """
         self._constraints = []
+        self._max_turnover = None
+        self._previous_weights = None
         return self

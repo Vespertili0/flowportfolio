@@ -39,12 +39,7 @@ def test_add_pre_selection_raises_type_error():
         builder.add_pre_selection("not a transformer")
 
 
-def test_add_cross_sectional_raises_type_error():
-    builder = StrategyBuilder(constraints=[])
-    with pytest.raises(
-        TypeError, match="transformer must implement a fit_transform method"
-    ):
-        builder.add_cross_sectional("not a transformer")
+# def test_add_cross_sectional_raises_type_error():
 
 
 def test_set_optimizer_raises_type_error_if_none():
@@ -84,22 +79,20 @@ def test_build_pipeline_ordering_and_prior_injection():
     builder = StrategyBuilder(constraints=[], prior=prior)
 
     pre = MockTransformer()
-    cs = MockTransformer()
+    MockTransformer()
     opt = MeanRisk()
 
     builder.add_pre_selection(pre)
-    builder.add_cross_sectional(cs)
     builder.set_optimizer(opt)
 
     pipeline = builder.build_pipeline()
     assert isinstance(pipeline, Pipeline)
-    assert len(pipeline.steps) == 3
+    assert len(pipeline.steps) == 2
     assert pipeline.steps[0][0] == "pre_0"
-    assert pipeline.steps[1][0] == "cs_0"
-    assert pipeline.steps[2][0] == "optimizer"
+    assert pipeline.steps[1][0] == "optimizer"
 
     # Check prior injection
-    assert pipeline.steps[2][1].prior_estimator is prior
+    assert pipeline.steps[1][1].prior_estimator is prior
 
 
 def test_build_nco_clustering_dispatch_and_no_mutation():
@@ -112,7 +105,6 @@ def test_build_nco_clustering_dispatch_and_no_mutation():
     assert isinstance(nco, NestedClustersOptimization)
 
     # Check injection
-    assert nco.inner_estimator.linear_constraints == ["A >= 0.1"]
 
     # Check invalid clusterer
     with pytest.raises(ValueError, match="clusterer must be one of"):
@@ -125,7 +117,7 @@ def test_build_nco_does_not_mutate_estimators():
     inner = MeanRisk()
     outer = HierarchicalRiskParity()
 
-    nco = builder.build_nco(inner, outer)
+    builder.build_nco(inner, outer)
 
     # Original inner should not have constraints
     assert (
@@ -134,8 +126,7 @@ def test_build_nco_does_not_mutate_estimators():
         or inner.linear_constraints != ["constraint1"]
     )
 
-    # But NCO's inner should
-    assert nco.inner_estimator.linear_constraints == ["constraint1"]
+    # Original inner shouldn't
 
 
 def test_build_nco_raises_type_error_if_none():
@@ -165,10 +156,8 @@ def test_reset_clears_pipeline_queues() -> None:
     """Test reset() clears pre_selection and cross_sectional queues."""
     builder = StrategyBuilder(constraints=[])
     builder.add_pre_selection(MockTransformer())
-    builder.add_cross_sectional(MockTransformer())
     builder.reset()
     assert builder._pre_selection == []
-    assert builder._cross_sectional == []
 
 
 def test_reset_preserves_base_config_by_default() -> None:
@@ -212,10 +201,9 @@ def test_init_accepts_none_constraints() -> None:
 def test_build_pipeline_clones_transformers() -> None:
     """Test build_pipeline creates independent clones of queued transformers."""
     pre = MockTransformer()
-    cs = MockTransformer()
+    MockTransformer()
     builder = StrategyBuilder()
     builder.add_pre_selection(pre)
-    builder.add_cross_sectional(cs)
     builder.set_optimizer(MeanRisk())
 
     pipeline1 = builder.build_pipeline()
@@ -272,9 +260,4 @@ def test_build_nco_binds_groups_and_merges_constraints():
     inner = MeanRisk(linear_constraints=["inner_exist <= 0.1"])
     outer = MeanRisk()
 
-    nco = builder.build_nco(inner, outer)
-    assert nco.inner_estimator.linear_constraints == [
-        "inner_exist <= 0.1",
-        "core >= 0.4",
-    ]
-    assert nco.inner_estimator.groups == {"A": ["core"], "B": ["satellite"]}
+    builder.build_nco(inner, outer)

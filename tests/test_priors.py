@@ -77,7 +77,7 @@ def test_build_entropy_prior_success(mock_entropy_pooling, stub_universe):
     # Assert
     assert prior is mock_instance
     mock_entropy_pooling.assert_called_once_with(
-        mean_views=["AAPL >= 0.05"], groups=None
+        mean_views=["AAPL >= 0.0001984126984126984"], groups=None
     )
 
 
@@ -93,7 +93,7 @@ def test_build_black_litterman_prior_success(mock_bl, stub_universe):
 
     assert prior is mock_instance
     mock_bl.assert_called_once_with(
-        views=["AAPL >= 0.05"],
+        views=["AAPL >= 0.0001984126984126984"],
         tau=0.05,
         view_confidences=[0.8],
         groups=None,

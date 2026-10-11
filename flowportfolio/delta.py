@@ -227,6 +227,10 @@ class PortfolioDeltaEngine:
         window is aligned to the population's observation period. Computes CVaR,
         Sharpe ratio, and Max Drawdown for both scenarios.
 
+        Note: The ``hold_portfolio`` models a constant-mix portfolio with
+        periodic rebalancing back to initial weights rather than a true
+        un-rebalanced asset drift over time.
+
         Parameters
         ----------
         population : Population or None, optional
@@ -337,9 +341,9 @@ class PortfolioDeltaEngine:
         Returns
         -------
         pd.DataFrame
-            DataFrame with columns: ``'ticker'``, ``'turnover'``,
-            ``'transaction_cost'``, ``'annual_ter'``, and
-            ``'total_friction'``. Includes a final summary row labelled
+            DataFrame with columns: ``'ticker'``, ``'gross_weight_traded'``,
+            ``'one_way_turnover'``, ``'transaction_cost'``, ``'annual_ter'``,
+            and ``'annual_ter_savings'``. Includes a final summary row labelled
             ``'TOTAL'`` with summed values across all assets.
 
         Raises
@@ -363,18 +367,23 @@ class PortfolioDeltaEngine:
             current_w = float(self._current_weights.get(ticker, 0.0))
             target_w = float(self._target_weights.get(ticker, 0.0))
 
-            turnover = abs(target_w - current_w)
-            transaction_cost = turnover * total_bps / 10_000.0
+            gross_weight_traded = abs(target_w - current_w)
+            one_way_turnover = gross_weight_traded / 2.0
+
+            transaction_cost = gross_weight_traded * total_bps / 10_000.0
+
             annual_ter = target_w * float(fees.get(ticker, 0.0))
-            total_friction = transaction_cost + annual_ter
+            current_ter = current_w * float(fees.get(ticker, 0.0))
+            annual_ter_savings = current_ter - annual_ter
 
             rows.append(
                 {
                     "ticker": ticker,
-                    "turnover": turnover,
+                    "gross_weight_traded": gross_weight_traded,
+                    "one_way_turnover": one_way_turnover,
                     "transaction_cost": transaction_cost,
                     "annual_ter": annual_ter,
-                    "total_friction": total_friction,
+                    "annual_ter_savings": annual_ter_savings,
                 }
             )
 
@@ -382,10 +391,11 @@ class PortfolioDeltaEngine:
             rows,
             columns=[
                 "ticker",
-                "turnover",
+                "gross_weight_traded",
+                "one_way_turnover",
                 "transaction_cost",
                 "annual_ter",
-                "total_friction",
+                "annual_ter_savings",
             ],
         )
 
@@ -394,10 +404,11 @@ class PortfolioDeltaEngine:
             [
                 {
                     "ticker": "TOTAL",
-                    "turnover": df["turnover"].sum(),
+                    "gross_weight_traded": df["gross_weight_traded"].sum(),
+                    "one_way_turnover": df["one_way_turnover"].sum(),
                     "transaction_cost": df["transaction_cost"].sum(),
                     "annual_ter": df["annual_ter"].sum(),
-                    "total_friction": df["total_friction"].sum(),
+                    "annual_ter_savings": df["annual_ter_savings"].sum(),
                 }
             ]
         )

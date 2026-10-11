@@ -118,31 +118,23 @@ def test_unknown_group_raises(stub_universe: Universe) -> None:
 
 
 def test_max_turnover_output(stub_universe: Universe) -> None:
-    """Test max_turnover correctly computes upper and lower bounds."""
+    """Test max_turnover correctly stores parameters."""
     builder = ConstraintBuilder(stub_universe)
     current_weights = {"A": 0.4, "B": 0.4, "C": 0.2}
     result = builder.max_turnover(limit=0.1, current_weights=current_weights).build()
 
-    # 3 tickers * 2 bounds each = 6 constraints
-    assert len(result) == 6
-    assert "A >= 0.3" in result
-    assert "A <= 0.5" in result
-    assert "B >= 0.3" in result
-    assert "B <= 0.5" in result
-    assert "C >= 0.1" in result
-    assert "C <= 0.3" in result
+    assert result.max_turnover == 0.1
+    assert result.previous_weights == [0.4, 0.4, 0.2]
 
 
 def test_max_turnover_clamping(stub_universe: Universe) -> None:
-    """Test max_turnover clamps bounds to [0.0, 1.0]."""
+    """Test max_turnover stores parameters correctly without clamping."""
     builder = ConstraintBuilder(stub_universe)
-    # C weight is 0.05, limit is 0.1 -> lower bound clamped to 0.0
-    # A weight is 0.95, limit is 0.1 -> upper bound clamped to 1.0
     current_weights = {"A": 0.95, "B": 0.0, "C": 0.05}
     result = builder.max_turnover(limit=0.1, current_weights=current_weights).build()
 
-    assert "A <= 1" in result
-    assert "C >= 0" in result
+    assert result.max_turnover == 0.1
+    assert result.previous_weights == [0.95, 0.0, 0.05]
 
 
 def test_max_turnover_invalid_limit(stub_universe: Universe) -> None:

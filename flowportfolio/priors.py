@@ -16,8 +16,6 @@ from skfolio.prior import (
 
 from flowportfolio.core.universe import Universe
 
-_TICKER_REGEX = re.compile(r"[A-Z][A-Z0-9_.]*")
-
 
 class PriorSynthesiser:
     """Builds skfolio prior objects for injection into portfolio optimisers.
@@ -86,29 +84,43 @@ class PriorSynthesiser:
         if not (0.0 <= confidence <= 1.0):
             raise ValueError("confidence must be between 0.0 and 1.0")
 
-        # Extract uppercase alphanumeric identifiers resembling tickers.
-        extracted_tickers = _TICKER_REGEX.findall(view_str)
         valid_tickers = set(self._universe.tickers)
 
-        # Check that the view references at least one known ticker — catches
-        # purely numeric expressions or views with no ticker-like tokens at all.
-        if not any(t in valid_tickers for t in extracted_tickers):
+        # Tokenize by non-word chars (keeping dots and hyphens if possible) to find tickers
+        words = re.findall(r"[\w.-]+", view_str)
+        extracted_tickers = [w for w in words if w in valid_tickers]
+
+        # Find tokens that look like tickers but aren't in valid_tickers
+        potential_tickers = [
+            w
+            for w in words
+            if re.match(r"^[A-Za-z][A-Za-z0-9_.-]*$", w) and w not in valid_tickers
+        ]
+
+        if not extracted_tickers:
             raise ValueError(
                 f"View '{view_str}' does not reference any valid tickers. "
                 f"Universe tickers: {sorted(valid_tickers)}"
             )
 
-        # Reject any extracted token that looks like a ticker but is absent from
-        # the universe — prevents silently ignoring mis-typed tickers.
-        for ticker in extracted_tickers:
-            if ticker not in valid_tickers:
-                raise ValueError(
-                    f"View '{view_str}' references ticker '{ticker}' which is "
-                    f"not present in the universe."
-                )
+        for ticker in potential_tickers:
+            raise ValueError(
+                f"View '{view_str}' references ticker '{ticker}' which is "
+                f"not present in the universe."
+            )
 
         normalised_view = self._normalise_view_operators(view_str)
-        self._views.append({"view": normalised_view, "confidence": confidence})
+
+        # Scale annualised views to daily returns (divide by 252)
+        def scale_match(match):
+            val = float(match.group(0))
+            return str(val / 252.0)
+
+        scaled_view = re.sub(
+            r"-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", scale_match, normalised_view
+        )
+
+        self._views.append({"view": scaled_view, "confidence": confidence})
         return self
 
     @staticmethod
@@ -232,17 +244,22 @@ class PriorSynthesiser:
 
         return BlackLitterman(**kwargs)
 
-    def build_synthetic_prior(self, n_samples: int = 5000) -> SyntheticData:
-        """Generate synthetic return paths using a VineCopula model.
+    def build_synthetic_prior(
+        self, n_samples: int = 5000, random_state: int | None = None
+    ) -> SyntheticData:
+        """Build a synthetic prior estimator using a VineCopula model.
 
-        Fits a VineCopula to universe.returns and generates n_samples
-        synthetic paths that preserve empirical tail dependencies.
+        Builds a SyntheticData estimator that, when fitted in the pipeline,
+        will fit a VineCopula to universe.returns and generate n_samples
+        synthetic paths preserving empirical tail dependencies.
         Used for stress-testing portfolio allocations.
 
         Parameters
         ----------
         n_samples : int, optional
             Number of synthetic return paths to generate. Default is 5000.
+        random_state : int or None, optional
+            Seed for the random number generator used by the VineCopula.
 
         Returns
         -------
@@ -256,4 +273,7 @@ class PriorSynthesiser:
         if n_samples < 100:
             raise ValueError(f"n_samples must be at least 100, got {n_samples}")
 
-        return SyntheticData(distribution_estimator=VineCopula(), n_samples=n_samples)
+        return SyntheticData(
+            distribution_estimator=VineCopula(random_state=random_state),
+            n_samples=n_samples,
+        )

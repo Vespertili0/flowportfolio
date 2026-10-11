@@ -56,16 +56,25 @@ class StrategyBuilder:
             self._constraints = []
             self._linear_constraints = []
             self._groups = {}
+            self._previous_weights = None
+            self._max_turnover = None
+            self._management_fees = None
         elif isinstance(value, ConstraintSpec):
             self._constraints = value
             self._linear_constraints = list(value.linear_constraints)
             self._groups = dict(value.groups)
+            self._previous_weights = value.previous_weights
+            self._max_turnover = value.max_turnover
+            self._management_fees = value.management_fees
         elif isinstance(value, list):
             if not all(isinstance(c, str) for c in value):
                 raise TypeError("All constraints must be strings.")
             self._constraints = list(value)
             self._linear_constraints = list(value)
             self._groups = {}
+            self._previous_weights = None
+            self._max_turnover = None
+            self._management_fees = None
         else:
             raise TypeError("constraints must be a list or ConstraintSpec.")
 
@@ -90,7 +99,6 @@ class StrategyBuilder:
 
         self.prior = prior
         self._pre_selection: list = []
-        self._cross_sectional: list = []
         self._optimizer = None
         self._fallback = None
         self._fallbacks: list = []
@@ -124,35 +132,6 @@ class StrategyBuilder:
         self._pre_selection.append(transformer)
         return self
 
-    def add_cross_sectional(self, transformer) -> StrategyBuilder:
-        """Add a cross-sectional transformer to the pipeline queue.
-
-        Cross-sectional transformers normalise data row-by-row across the
-        asset universe at each point in time. They execute after pre-selection
-        transformers and before the optimizer.
-
-        Parameters
-        ----------
-        transformer : skfolio-compatible transformer
-            Must implement fit_transform(X). Examples: CSStandardScaler,
-            CSGaussianRankScaler, CSTanhShrinker.
-
-        Returns
-        -------
-        StrategyBuilder
-            Returns self for method chaining.
-
-        Raises
-        ------
-        TypeError
-            If transformer does not implement fit_transform.
-        """
-        if not callable(getattr(transformer, "fit_transform", None)):
-            raise TypeError("transformer must implement a fit_transform method.")
-
-        self._cross_sectional.append(transformer)
-        return self
-
     def set_optimizer(
         self,
         optimizer,
@@ -168,12 +147,9 @@ class StrategyBuilder:
             HierarchicalRiskParity).
         fallback : skfolio optimizer or None, optional
             A single fallback estimator to attempt if the primary
-            optimizer fails. If provided, sets raise_on_failure=False on
-            the primary optimizer.
+            optimizer fails.
         fallbacks : list or None, optional
-            Ordered list of fallback optimizers for backward compatibility.
-            If fallback is not explicitly provided and fallbacks is given,
-            the first element of fallbacks is used.
+            Ordered list of fallback optimizers.
 
         Returns
         -------
@@ -193,39 +169,48 @@ class StrategyBuilder:
         if optimizer is None:
             raise TypeError("optimizer must not be None.")
 
-        resolved_fallback = fallback
-        if resolved_fallback is None and fallbacks:
-            resolved_fallback = fallbacks[0]
+        fbs = []
+        if fallback is not None:
+            fbs.append(fallback)
+        if fallbacks is not None:
+            fbs.extend(fallbacks)
 
         self._optimizer = _safe_clone(optimizer)
-        self._fallback = _safe_clone(resolved_fallback)
-        self._fallbacks = [self._fallback] if self._fallback is not None else []
+        self._fallbacks = [_safe_clone(f) for f in fbs]
 
-        if self._optimizer is not None:
-            if self._fallback is not None:
-                if not hasattr(self._optimizer, "raise_on_failure"):
-                    raise TypeError(
-                        "The provided optimizer does not support fallback semantics."
-                    )
-
-                self._optimizer.raise_on_failure = False
-                self._optimizer.fallback = self._fallback
-
-            if hasattr(self._optimizer, "linear_constraints"):
-                if self._linear_constraints:
-                    existing = (
-                        getattr(self._optimizer, "linear_constraints", None) or []
-                    )
-                    merged = list(existing) + [
-                        c for c in self._linear_constraints if c not in existing
-                    ]
-                    self._optimizer.linear_constraints = merged
-
-            if hasattr(self._optimizer, "groups") and self._groups:
-                existing_groups = getattr(self._optimizer, "groups", None) or {}
+        def _inject_constraints(opt):
+            if hasattr(opt, "linear_constraints") and self._linear_constraints:
+                existing = getattr(opt, "linear_constraints", None) or []
+                merged = list(existing) + [
+                    c for c in self._linear_constraints if c not in existing
+                ]
+                opt.linear_constraints = merged
+            if hasattr(opt, "groups") and self._groups:
+                existing_groups = getattr(opt, "groups", None) or {}
                 merged_groups = dict(existing_groups)
                 merged_groups.update(self._groups)
-                self._optimizer.groups = merged_groups
+                opt.groups = merged_groups
+            if hasattr(opt, "previous_weights") and self._previous_weights is not None:
+                opt.previous_weights = self._previous_weights
+            if hasattr(opt, "max_turnover") and self._max_turnover is not None:
+                opt.max_turnover = self._max_turnover
+            if (
+                hasattr(opt, "management_fees")
+                and getattr(self, "_management_fees", None) is not None
+            ):
+                opt.management_fees = self._management_fees
+
+        _inject_constraints(self._optimizer)
+
+        current = self._optimizer
+        for fb in self._fallbacks:
+            if current is None or not hasattr(current, "fallback"):
+                raise TypeError(
+                    "The provided optimizer does not support fallback semantics."
+                )
+            _inject_constraints(fb)
+            setattr(current, "fallback", fb)
+            current = fb
 
         return self
 
@@ -250,7 +235,6 @@ class StrategyBuilder:
             The builder instance for method chaining.
         """
         self._pre_selection = []
-        self._cross_sectional = []
         self._optimizer = None
         self._fallback = None
         self._fallbacks = []
@@ -285,9 +269,6 @@ class StrategyBuilder:
         for i, transformer in enumerate(self._pre_selection):
             steps.append((f"pre_{i}", _safe_clone(transformer)))
 
-        for i, transformer in enumerate(self._cross_sectional):
-            steps.append((f"cs_{i}", _safe_clone(transformer)))
-
         cloned_optimizer = _safe_clone(self._optimizer)
         if self._linear_constraints and hasattr(cloned_optimizer, "linear_constraints"):
             existing = getattr(cloned_optimizer, "linear_constraints", None) or []
@@ -302,6 +283,19 @@ class StrategyBuilder:
             merged_groups.update(self._groups)
             cloned_optimizer.groups = merged_groups
 
+        if (
+            hasattr(cloned_optimizer, "previous_weights")
+            and self._previous_weights is not None
+        ):
+            cloned_optimizer.previous_weights = self._previous_weights
+        if hasattr(cloned_optimizer, "max_turnover") and self._max_turnover is not None:
+            cloned_optimizer.max_turnover = self._max_turnover
+        if (
+            hasattr(cloned_optimizer, "management_fees")
+            and getattr(self, "_management_fees", None) is not None
+        ):
+            cloned_optimizer.management_fees = self._management_fees
+
         if self.prior is not None and hasattr(cloned_optimizer, "prior_estimator"):
             cloned_optimizer.prior_estimator = self.prior
 
@@ -314,6 +308,7 @@ class StrategyBuilder:
         inner_estimator,
         outer_estimator,
         clusterer: str = "ward",
+        random_state: int | None = None,
     ) -> NestedClustersOptimization:
         """Assemble a Nested Clusters Optimisation ensemble.
 
@@ -355,27 +350,16 @@ class StrategyBuilder:
         cloned_inner = _safe_clone(inner_estimator)
         cloned_outer = _safe_clone(outer_estimator)
 
-        if hasattr(cloned_inner, "linear_constraints"):
-            if self._linear_constraints:
-                existing = getattr(cloned_inner, "linear_constraints", None) or []
-                merged = list(existing) + [
-                    c for c in self._linear_constraints if c not in existing
-                ]
-                cloned_inner.linear_constraints = merged
-
-        if hasattr(cloned_inner, "groups") and self._groups:
-            existing_groups = getattr(cloned_inner, "groups", None) or {}
-            merged_groups = dict(existing_groups)
-            merged_groups.update(self._groups)
-            cloned_inner.groups = merged_groups
-
-        if self.prior is not None and hasattr(cloned_outer, "prior_estimator"):
-            cloned_outer.prior_estimator = self.prior
+        if self.prior is not None:
+            if hasattr(cloned_inner, "prior_estimator"):
+                cloned_inner.prior_estimator = self.prior
+            if hasattr(cloned_outer, "prior_estimator"):
+                cloned_outer.prior_estimator = self.prior
 
         if clusterer == "kmeans":
             from sklearn.cluster import KMeans
 
-            clustering_estimator = KMeans()
+            clustering_estimator = KMeans(random_state=random_state)
         else:
             from skfolio.cluster import HierarchicalClustering, LinkageMethod
 

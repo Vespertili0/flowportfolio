@@ -143,12 +143,12 @@ def test_calculate_net_friction(stub_universe):
     df = engine.calculate_net_friction(brokerage_bps=10.0, slippage_bps=5.0)
 
     # Check shape
-    assert "turnover" in df.columns
+    assert "gross_weight_traded" in df.columns
     assert "transaction_cost" in df.columns
 
     # AAPL turnover = 0.1, MSFT = 0.1, GOOG = 0.2
     # Total turnover = 0.4
-    total_turnover = df[df["ticker"] == "TOTAL"]["turnover"].iloc[0]
+    total_turnover = df[df["ticker"] == "TOTAL"]["gross_weight_traded"].iloc[0]
     assert np.isclose(total_turnover, 0.4)
 
 

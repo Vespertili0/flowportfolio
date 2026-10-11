@@ -136,7 +136,8 @@ def test_unmocked_pipeline_walk_forward(
     )
     assert "TOTAL" in friction_df["ticker"].values
     assert (
-        friction_df.loc[friction_df["ticker"] == "TOTAL", "total_friction"].iloc[0] > 0
+        friction_df.loc[friction_df["ticker"] == "TOTAL", "transaction_cost"].iloc[0]
+        > 0
     )
 
     rebalance_metrics = delta_engine.calculate_rebalance_delta(population=population)
