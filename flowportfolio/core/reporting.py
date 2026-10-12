@@ -331,6 +331,31 @@ class Reporter:
         table_md = self._generate_metrics_table()
         best_strategy, top_holdings = self._get_best_strategy_and_holdings()
 
+        baseline_section = ""
+        baseline_portfolios = [
+            p for p in self._population if getattr(p, "tag", None) == baseline_tag
+        ]
+        if baseline_portfolios:
+            baseline_cvar_ratios = [
+                getattr(p, "cvar_ratio", None)
+                for p in baseline_portfolios
+                if getattr(p, "cvar_ratio", None) is not None
+                and not np.isnan(getattr(p, "cvar_ratio", None))
+            ]
+            if baseline_cvar_ratios:
+                baseline_median_cvar = float(np.median(baseline_cvar_ratios))
+                baseline_section = (
+                    f"\n\n## Baseline Strategy Analysis\n\n"
+                    f"**Baseline Tag:** {baseline_tag}\n"
+                    f"**Baseline Median CVaR Ratio:** {baseline_median_cvar:.4f}"
+                )
+            else:
+                baseline_section = (
+                    f"\n\n## Baseline Strategy Analysis\n\n"
+                    f"**Baseline Tag:** {baseline_tag}\n"
+                    f"**Baseline Median CVaR Ratio:** N/A"
+                )
+
         report = (
             f"# Portfolio Population Report\n\n"
             f"**Generated:** {timestamp}\n\n"
@@ -338,7 +363,8 @@ class Reporter:
             f"{table_md}\n\n"
             f"## Best Strategy Analysis\n\n"
             f"**Best Tag (by median CVaR Ratio):** {best_strategy}\n"
-            f"**Top 5 Holdings:** {top_holdings}\n"
+            f"**Top 5 Holdings:** {top_holdings}"
+            f"{baseline_section}\n"
         )
         return report
 

@@ -20,7 +20,7 @@ from skfolio.model_selection import (
     cross_val_predict,
     online_predict,
 )
-from sklearn.base import BaseEstimator
+from sklearn.base import BaseEstimator, clone
 
 from flowportfolio.core.optimisation import SkfolioGridSearchCV as GridSearchCV
 from flowportfolio.core.protocols import UniverseProtocol
@@ -103,7 +103,7 @@ class PortfolioExperimentEngine:
             raise ValueError(f"Strategy '{name}' is already registered.")
 
         self._strategies[name] = {
-            "estimator": estimator,
+            "estimator": clone(estimator),
             "grid": dict(grid),
         }
 

@@ -124,20 +124,19 @@ synthetic_prior = synthesiser.build_synthetic_prior(n_samples=5000)
 
 ### 2. Strategy Assembly & Pipeline Construction
 
-Build leak-proof `sklearn` pipelines with pre-selection filters, cross-sectional scalers, and fallback optimisers:
+Build leak-proof `sklearn` pipelines with pre-selection filters and fallback optimisers:
 
 ```python
 from flowportfolio import StrategyBuilder
-from skfolio.preprocessing import DropCorrelated, CSStandardScaler
+from skfolio.preprocessing import DropCorrelated
 from skfolio.optimization import MeanRisk, HierarchicalRiskParity
 
 builder = StrategyBuilder(constraints=constraints)
 
 pipeline = (
     builder.add_pre_selection(DropCorrelated(threshold=0.85))
-    .add_cross_sectional(CSStandardScaler())
     .set_optimizer(
-        optimizer=MeanRisk(linear_constraints=constraints),
+        optimizer=MeanRisk(),
         fallbacks=[HierarchicalRiskParity()],
     )
     .build_pipeline()
