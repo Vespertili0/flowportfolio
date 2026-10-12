@@ -7,12 +7,15 @@ plotting capabilities.
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from skfolio import Population, RatioMeasure, RiskMeasure
+
+logger = logging.getLogger(__name__)
 
 
 class Reporter:
@@ -56,7 +59,8 @@ class Reporter:
         """
         try:
             figures = self.get_plotly_figures(baseline_tag=baseline_tag)
-        except ValueError:
+        except ValueError as e:
+            logger.warning("Failed to generate plot in Tearsheet: %s", e)
             return
 
         for fig in figures.values():
@@ -155,15 +159,28 @@ class Reporter:
         if not tag_list:
             raise ValueError("Population contains no tagged portfolios.")
 
-        if baseline_tag not in tag_list:
+        # baseline_tag is inserted even if absent from the population in original code
+        # The prompt says: "only query tags present in the underlying Population"
+        valid_population_tags = {
+            p.tag for p in self._population if getattr(p, "tag", None) is not None
+        }
+        if baseline_tag not in tag_list and baseline_tag in valid_population_tags:
             tag_list.insert(0, baseline_tag)
 
-        fig1 = self._population.boxplot_measure(
+        unrolled = []
+        for p in self._population:
+            if hasattr(p, "portfolios"):
+                unrolled.extend(p.portfolios)
+            else:
+                unrolled.append(p)
+        unrolled_population = Population(unrolled)
+
+        fig1 = unrolled_population.boxplot_measure(
             measure=RatioMeasure.CVAR_RATIO,
             tag_list=tag_list,
         )
 
-        fig2 = self._population.plot_distribution(
+        fig2 = unrolled_population.plot_distribution(
             measure_list=[RatioMeasure.AVERAGE_DRAWDOWN_RATIO],
             tag_list=tag_list,
         )
@@ -333,22 +350,22 @@ class Reporter:
         )
 
     def _best_tag_by_median_cvar(self, tag_list: list[str]) -> str:
-        valid_tags = [
-            t
-            for t in dict.fromkeys(tag_list)
-            if any(getattr(p, "tag", None) == t for p in self._population)
-        ]
+        import collections
+
+        tag_to_cvar = collections.defaultdict(list)
+        for p in self._population:
+            tag = getattr(p, "tag", None)
+            if tag is not None and tag in tag_list:
+                cvar_ratio = getattr(p, "cvar_ratio", None)
+                if cvar_ratio is not None and not np.isnan(cvar_ratio):
+                    tag_to_cvar[tag].append(cvar_ratio)
+
+        valid_tags = list(tag_to_cvar.keys())
         if not valid_tags:
             raise ValueError("No portfolios with matching tags found in population.")
 
         def safe_median(tag: str) -> float:
-            cvar_ratios = [
-                p.cvar_ratio
-                for p in self._population
-                if getattr(p, "tag", None) == tag
-                and getattr(p, "cvar_ratio", None) is not None
-                and not np.isnan(p.cvar_ratio)
-            ]
+            cvar_ratios = tag_to_cvar[tag]
             return float(np.median(cvar_ratios)) if cvar_ratios else float("-inf")
 
         return max(valid_tags, key=safe_median)

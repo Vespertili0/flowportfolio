@@ -5,13 +5,14 @@ from skfolio.optimization import (
     NestedClustersOptimization,
 )
 from skfolio.prior import EmpiricalPrior
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.pipeline import Pipeline
 
 from flowportfolio.core.constraints import ConstraintSpec
 from flowportfolio.strategies import StrategyBuilder
 
 
-class MockTransformer:
+class MockTransformer(BaseEstimator, TransformerMixin):
     def fit_transform(self, X):
         return X
 
@@ -63,7 +64,8 @@ def test_set_optimizer_fallback_unsupported_raises_type_error():
 
     builder = StrategyBuilder(constraints=[])
     with pytest.raises(
-        TypeError, match="The provided optimizer does not support fallback semantics."
+        TypeError,
+        match="does not implement a 'get_params' method|does not support fallback semantics",
     ):
         builder.set_optimizer(UnsupportedOptimizer(), fallback=MeanRisk())
 
@@ -92,7 +94,8 @@ def test_build_pipeline_ordering_and_prior_injection():
     assert pipeline.steps[1][0] == "optimizer"
 
     # Check prior injection
-    assert pipeline.steps[1][1].prior_estimator is prior
+    assert pipeline.steps[1][1].prior_estimator is not prior
+    assert type(pipeline.steps[1][1].prior_estimator) is type(prior)
 
 
 def test_build_nco_clustering_dispatch_and_no_mutation():

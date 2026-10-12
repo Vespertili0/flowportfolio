@@ -118,7 +118,7 @@ def test_save_snapshot_os_error(manager, dummy_population, tmp_path):
     filepath = tmp_path / "test.json"
 
     with (
-        patch("pathlib.Path.open", side_effect=OSError("Disk full")),
+        patch("os.fdopen", side_effect=OSError("Disk full")),
         pytest.raises(
             RuntimeError, match=re.escape(f"Failed to save snapshot to {filepath}")
         ),
@@ -178,9 +178,9 @@ def test_export_gitops_artifact_default_label(manager, dummy_population, tmp_pat
 
     now = datetime.now(UTC)
     year, week, _ = now.isocalendar()
-    expected_filename = f"rebalance_{year}_W{week:02d}.json"
-
-    assert path.name == expected_filename
+    assert path.name.startswith(
+        f"rebalance_{year}_W{week:02d}_"
+    ) and path.name.endswith(".json")
     assert path.exists()
 
 

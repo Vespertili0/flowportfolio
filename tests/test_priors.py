@@ -25,7 +25,7 @@ def stub_universe() -> Universe:
 
 
 def test_init_raises_type_error():
-    with pytest.raises(TypeError, match="universe must be an instance of"):
+    with pytest.raises(TypeError, match="universe must implement UniverseProtocol"):
         PriorSynthesiser(universe="not a universe")
 
 

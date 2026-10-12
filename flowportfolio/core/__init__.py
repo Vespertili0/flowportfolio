@@ -14,8 +14,15 @@ __all__ = [
     "ConstraintBuilder",
     "ConstraintSpec",
     "DataFetchError",
+    "DataProviderProtocol",
     "PortfolioExperimentEngine",
     "Reporter",
     "Universe",
     "UniverseProtocol",
+    "YFinanceProvider",
+    "validate_fee",
+    "validate_weight",
 ]
+
+from flowportfolio.core.data import DataProviderProtocol, YFinanceProvider
+from flowportfolio.core.validation import validate_fee, validate_weight

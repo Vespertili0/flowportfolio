@@ -9,10 +9,11 @@ computation via ``skfolio``'s canonical preprocessing pipeline.
 from __future__ import annotations
 
 import pandas as pd
-import yfinance as yf
 from skfolio.preprocessing import prices_to_returns
 
+from flowportfolio.core.data import DataProviderProtocol, YFinanceProvider
 from flowportfolio.core.protocols import UniverseProtocol  # noqa: F401
+from flowportfolio.core.validation import validate_fee
 
 
 class DataFetchError(Exception):
@@ -75,6 +76,8 @@ class Universe:
             raise ValueError("tickers must not be empty.")
         if not all(isinstance(t, str) for t in tickers):
             raise ValueError("All elements of tickers must be strings.")
+        if len(tickers) != len(set(tickers)):
+            raise ValueError("Duplicate tickers are not allowed.")
 
         # --- metadata validation ---
         if not isinstance(metadata, dict):
@@ -87,10 +90,10 @@ class Universe:
         # --- fees validation ---
         if not isinstance(fees, dict):
             raise TypeError("fees must be a dict.")
-        if not all(
-            isinstance(k, str) and isinstance(v, (int, float)) for k, v in fees.items()
-        ):
+        if not all(isinstance(k, str) for k in fees):
             raise TypeError("fees must map string keys to numeric values.")
+        for v in fees.values():
+            validate_fee(v)
 
         # --- coverage checks ---
         missing_metadata = set(tickers) - set(metadata.keys())
@@ -170,7 +173,7 @@ class Universe:
         """
         if self._returns is None:
             raise ValueError("Returns are not yet available. Call fetch_data() first.")
-        return self._returns
+        return self._returns.copy()
 
     # ------------------------------------------------------------------
     # Public methods
@@ -180,11 +183,12 @@ class Universe:
         self,
         start: str | None = None,
         end: str | None = None,
+        data_provider: DataProviderProtocol | None = None,
     ) -> None:
         """Download adjusted close prices and compute daily returns.
 
-        Fetches adjusted close prices from ``yfinance`` for all tickers in
-        the universe, then computes daily simple returns using
+        Fetches adjusted close prices from the provided data provider for all
+        tickers in the universe, then computes daily simple returns using
         :func:`skfolio.preprocessing.prices_to_returns`. Both raw prices
         and returns are stored internally.
 
@@ -201,33 +205,35 @@ class Universe:
         end : str, optional
             End date for data retrieval in ``YYYY-MM-DD`` format.
             If ``None``, retrieves data up to and including the current date.
+        data_provider : DataProviderProtocol, optional
+            The data provider to fetch data. Defaults to YFinanceProvider.
 
         Raises
         ------
         DataFetchError
-            If ``yfinance`` raises any exception during the download.
+            If the data provider raises any exception during the download.
         ValueError
             If no data is returned, if the downloaded data is missing the
             ``"Close"`` price level, if any requested ticker is absent from
             the downloaded data, or if the resulting returns DataFrame is
             empty.
         """
+        if data_provider is None:
+            data_provider = YFinanceProvider()
+
         try:
-            data = yf.download(
+            data = data_provider.fetch(
                 tickers=self._tickers,
                 start=start,
                 end=end,
-                auto_adjust=True,
-                progress=False,
             )
+        except ValueError:
+            raise
         except Exception as exc:
             raise DataFetchError(
-                "Failed to download price data from yfinance. "
+                "Failed to download price data. "
                 "Check network connectivity and that all tickers are valid."
             ) from exc
-
-        if data.empty:
-            raise ValueError("yfinance returned an empty DataFrame.")
 
         # yfinance returns a MultiIndex DataFrame (Attribute × Ticker) for
         # multiple tickers, and a flat-column DataFrame for a single ticker.
@@ -260,7 +266,7 @@ class Universe:
         # Compute returns using skfolio's canonical preprocessing function.
         # This ensures the returns DataFrame layout is compatible with all
         # skfolio optimisers and cross-validation utilities.
-        returns = prices_to_returns(prices)
+        returns = prices_to_returns(prices, drop_inceptions_nan=False, fill_nan=False)
 
         if returns.empty:
             raise ValueError(
@@ -275,7 +281,7 @@ class Universe:
         Truncates the returns DataFrame to start from the latest
         ``first_valid_index`` across all assets, removing all leading
         ``NaN`` rows. This aligns all assets to a common start date,
-        preventing survivorship bias and NaN-related failures in
+        ensuring date synchronisation and preventing NaN-related failures in
         ``skfolio`` cross-validation.
 
         Raises

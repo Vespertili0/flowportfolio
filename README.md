@@ -81,7 +81,7 @@ from flowportfolio import StrategyBuilder
 
 pipeline = (
     StrategyBuilder(constraints=constraints)
-    .set_optimizer(MeanRisk(risk_free_rate=0.03))
+    .set_optimizer(MeanRisk(risk_free_rate=0.03 / 252))
     .build_pipeline()
 )
 
@@ -167,7 +167,7 @@ drift_df = delta_engine.calculate_group_drift()
 delta_summary = delta_engine.calculate_rebalance_delta(population)
 
 # Friction-adjusted net benefit analysis
-friction = delta_engine.calculate_friction_adjusted_benefit(
+friction = delta_engine.calculate_net_friction(
     portfolio_value=100000.0,
     brokerage_flat=9.95,
     brokerage_bps=0.001,

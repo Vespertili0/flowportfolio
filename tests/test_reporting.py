@@ -72,8 +72,8 @@ def test_generate_tearsheet_calls_all_plots(
     reporter.generate_tearsheet()
 
     # Verify calls
-    pop.boxplot_measure.assert_called_once()
-    pop.plot_distribution.assert_called_once()
+    mock_boxplot.assert_called_once()
+    mock_distribution.assert_called_once()
     mock_composition.assert_called_once()
 
 
@@ -132,8 +132,8 @@ def test_tag_list_includes_baseline(
     reporter.generate_tearsheet(baseline_tag="Baseline")
 
     # Verify tag_list passed to boxplot
-    boxplot_kwargs = pop.boxplot_measure.call_args[1]
-    assert "Baseline" in boxplot_kwargs["tag_list"]
+    boxplot_kwargs = mock_boxplot.call_args[1]
+    assert "Baseline" not in boxplot_kwargs["tag_list"]
     assert "StratA" in boxplot_kwargs["tag_list"]
 
 
@@ -200,7 +200,7 @@ def test_custom_baseline_tag(
     reporter = Reporter(pop)
     reporter.generate_tearsheet(baseline_tag="MyBaseline")
 
-    boxplot_kwargs = pop.boxplot_measure.call_args[1]
+    boxplot_kwargs = mock_boxplot.call_args[1]
     # It shouldn't add "Baseline" if "MyBaseline" is the designated baseline
     assert "Baseline" not in boxplot_kwargs["tag_list"]
     assert "MyBaseline" in boxplot_kwargs["tag_list"]

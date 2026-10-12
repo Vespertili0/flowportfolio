@@ -1,23 +1,18 @@
 from __future__ import annotations
 
-import copy
-
 from skfolio.optimization import NestedClustersOptimization
 from skfolio.prior import BasePrior
-from sklearn.base import clone
+from sklearn.base import BaseEstimator, TransformerMixin, clone
 from sklearn.pipeline import Pipeline
 
 from flowportfolio.core.constraints import ConstraintSpec
 
 
 def _safe_clone(estimator):
-    """Clone an estimator safely, falling back to deepcopy for non-sklearn objects."""
+    """Clone an estimator safely."""
     if estimator is None:
         return None
-    try:
-        return clone(estimator)
-    except TypeError:
-        return copy.deepcopy(estimator)
+    return clone(estimator)
 
 
 class StrategyBuilder:
@@ -27,9 +22,6 @@ class StrategyBuilder:
     NestedClustersOptimization ensembles. Consumes pre-selection transformers,
     cross-sectional scalers, a prior, and an optimizer, then stitches them
     into a single leak-proof estimator.
-
-    Prefect Compatibility: All build_*() methods are pure functions of
-    internal queue state and return serialisable estimator objects.
 
     Parameters
     ----------
@@ -103,7 +95,9 @@ class StrategyBuilder:
         self._fallback = None
         self._fallbacks: list = []
 
-    def add_pre_selection(self, transformer) -> StrategyBuilder:
+    def add_pre_selection(
+        self, transformer: TransformerMixin | BaseEstimator
+    ) -> StrategyBuilder:
         """Add a pre-selection transformer to the pipeline queue.
 
         Pre-selection transformers dynamically filter the asset universe
@@ -209,7 +203,7 @@ class StrategyBuilder:
                     "The provided optimizer does not support fallback semantics."
                 )
             _inject_constraints(fb)
-            setattr(current, "fallback", fb)
+            current.fallback = fb
             current = fb
 
         return self
@@ -297,7 +291,7 @@ class StrategyBuilder:
             cloned_optimizer.management_fees = self._management_fees
 
         if self.prior is not None and hasattr(cloned_optimizer, "prior_estimator"):
-            cloned_optimizer.prior_estimator = self.prior
+            cloned_optimizer.prior_estimator = clone(self.prior)
 
         steps.append(("optimizer", cloned_optimizer))
 
@@ -352,9 +346,9 @@ class StrategyBuilder:
 
         if self.prior is not None:
             if hasattr(cloned_inner, "prior_estimator"):
-                cloned_inner.prior_estimator = self.prior
+                cloned_inner.prior_estimator = clone(self.prior)
             if hasattr(cloned_outer, "prior_estimator"):
-                cloned_outer.prior_estimator = self.prior
+                cloned_outer.prior_estimator = clone(self.prior)
 
         if clusterer == "kmeans":
             from sklearn.cluster import KMeans

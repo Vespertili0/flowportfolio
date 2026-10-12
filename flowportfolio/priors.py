@@ -14,7 +14,7 @@ from skfolio.prior import (
     SyntheticData,
 )
 
-from flowportfolio.core.universe import Universe
+from flowportfolio.core.protocols import UniverseProtocol
 
 
 class PriorSynthesiser:
@@ -24,9 +24,6 @@ class PriorSynthesiser:
     pipeline. It translates raw Universe returns and user-defined market views
     into fully configured skfolio prior objects. It does not run optimisations
     itself.
-
-    Prefect Compatibility: All build_*() methods are pure functions of
-    internal state and are safe to wrap as Prefect @task decorators.
 
     Parameters
     ----------
@@ -41,11 +38,9 @@ class PriorSynthesiser:
         If universe is not an instance of flowportfolio.core.universe.Universe.
     """
 
-    def __init__(self, universe: Universe) -> None:
-        if not isinstance(universe, Universe):
-            raise TypeError(
-                "universe must be an instance of flowportfolio.core.universe.Universe"
-            )
+    def __init__(self, universe: UniverseProtocol) -> None:
+        if not isinstance(universe, UniverseProtocol):
+            raise TypeError("universe must implement UniverseProtocol")
         self._universe = universe
         self._views: list[dict] = []
 

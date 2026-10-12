@@ -8,11 +8,7 @@ benefit of executing a portfolio rebalance versus holding current positions,
 factoring in group drift, Total Expense Ratio (TER), slippage, and brokerage
 friction.
 
-**Prefect Compatibility:** All public methods are pure functions of the
-constructor's stored state. They accept explicit data structures and return
-serialisable outputs, ensuring zero friction inside Prefect ``@task``
-execution contexts.
-"""
+**"""
 
 from __future__ import annotations
 
@@ -23,7 +19,7 @@ import pandas as pd
 from skfolio import Population
 from skfolio.portfolio import Portfolio
 
-from flowportfolio.core.universe import Universe
+from flowportfolio.core.protocols import UniverseProtocol
 
 
 class PortfolioDeltaEngine:
@@ -32,10 +28,6 @@ class PortfolioDeltaEngine:
     This engine quantifies the trade-off of executing a rebalance versus
     holding current positions (net of transaction friction and management
     fees).
-
-    Prefect Compatibility: All methods are pure functions of the
-    constructor's stored state and are safe to wrap as Prefect ``@task``
-    decorators.
 
     Parameters
     ----------
@@ -62,13 +54,13 @@ class PortfolioDeltaEngine:
 
     def __init__(
         self,
-        universe: Universe,
+        universe: UniverseProtocol,
         current_weights: dict[str, float],
         target_weights: dict[str, float],
     ) -> None:
         # --- type validation ---
-        if not isinstance(universe, Universe):
-            raise TypeError("universe must be a Universe instance.")
+        if not isinstance(universe, UniverseProtocol):
+            raise TypeError("universe must implement UniverseProtocol.")
         if not isinstance(current_weights, dict):
             raise TypeError("current_weights must be a dict.")
         if not isinstance(target_weights, dict):
@@ -142,7 +134,7 @@ class PortfolioDeltaEngine:
                 f"target_weights is missing universe tickers: {sorted(missing_target)}."
             )
 
-        self._universe: Universe = universe
+        self._universe: UniverseProtocol = universe
         self._current_weights: dict[str, float] = dict(current_weights)
         self._target_weights: dict[str, float] = dict(target_weights)
 

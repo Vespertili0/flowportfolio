@@ -1,4 +1,4 @@
-FROM python:3.12-slim AS base
+FROM python:3.12-slim@sha256:2b4f19dae3a777dfc3b76730bda1e82e1f66ab2a2686fa93ca78edbfb4f04ffe AS base
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -30,14 +30,6 @@ COPY flowportfolio/ ./flowportfolio/
 # Full sync: installs flowportfolio into the already-populated venv.
 RUN uv sync --frozen --no-dev
 
-# ----------------------------------------------------------------
-# Stage: orchestrator-builder
-# Extends builder with the locked `orchestrator` optional dependency
-# group (Prefect).
-# ----------------------------------------------------------------
-FROM builder AS orchestrator-builder
-
-RUN uv sync --frozen --extra orchestrator --no-dev
 
 # ----------------------------------------------------------------
 # Stage: runtime
@@ -59,22 +51,10 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH="/app/.venv/bin:$PATH"
 
-COPY --from=builder --chown=appuser:appgroup /app/.venv /app/.venv
+COPY --from=builder --chown=root:root /app/.venv /app/.venv
 COPY --from=builder --chown=appuser:appgroup /app/flowportfolio /app/flowportfolio
 
 USER appuser
 
 # Default entrypoint verifying import
 CMD ["python", "-c", "import flowportfolio; print('flowportfolio', flowportfolio.__version__)"]
-
-# ----------------------------------------------------------------
-# Stage: orchestrator
-# Inherits the shared runtime base and copies the orchestrator-specific
-# venv (with locked Prefect).
-# ----------------------------------------------------------------
-FROM runtime AS orchestrator
-
-COPY --from=orchestrator-builder --chown=appuser:appgroup /app/.venv /app/.venv
-COPY --from=builder --chown=appuser:appgroup /app/flowportfolio /app/flowportfolio
-
-CMD ["prefect", "worker", "start", "--pool", "default-agent-pool"]

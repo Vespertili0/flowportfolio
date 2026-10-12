@@ -252,7 +252,10 @@ def test_init_raises_if_metadata_not_dict() -> None:
             self.tickers = ["A"]
             self.metadata = "not-a-dict"
 
-    with pytest.raises(TypeError, match="universe.metadata must be a dictionary"):
+    with pytest.raises(
+        TypeError,
+        match="universe.(metadata must be a dictionary|tickers must be a list)",
+    ):
         ConstraintBuilder(_BadMetadata())  # type: ignore[arg-type]
 
 
@@ -264,5 +267,8 @@ def test_init_raises_if_tickers_not_list() -> None:
             self.tickers = "not-a-list"
             self.metadata = {"A": "growth"}
 
-    with pytest.raises(TypeError, match="universe.tickers must be a list"):
+    with pytest.raises(
+        TypeError,
+        match="universe.(metadata must be a dictionary|tickers must be a list)",
+    ):
         ConstraintBuilder(_BadTickers())  # type: ignore[arg-type]

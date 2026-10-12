@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import os
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -16,11 +19,20 @@ class PersistenceManager:
 
     Provides mechanisms to record, serialise, and reconstruct historical
     allocation advice, enabling version-controlled Git-Ops audit trails.
-    Designed for stateless execution within Prefect workflows.
+
     """
 
     def __init__(self) -> None:
         pass
+
+    def _sanitize_nans(self, data):
+        if isinstance(data, dict):
+            return {k: self._sanitize_nans(v) for k, v in data.items()}
+        elif isinstance(data, list):
+            return [self._sanitize_nans(i) for i in data]
+        elif isinstance(data, float) and math.isnan(data):
+            return None
+        return data
 
     def save_snapshot(self, population: Population, filepath: str) -> None:
         """Serialise a Population's portfolio summary statistics and weights to JSON.
@@ -76,10 +88,15 @@ class PersistenceManager:
             "portfolios": portfolios_data,
         }
 
+        data = self._sanitize_nans(data)
         try:
-            with path.open("w", encoding="utf-8") as f:
+            fd, tmp_name = tempfile.mkstemp(dir=path.parent, text=True)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=4)
+            os.replace(tmp_name, path)
         except OSError as e:
+            if "tmp_name" in locals() and os.path.exists(tmp_name):
+                os.remove(tmp_name)
             raise RuntimeError(f"Failed to save snapshot to {path}") from e
 
     def load_snapshot(self, filepath: str) -> dict:
@@ -97,12 +114,11 @@ class PersistenceManager:
         if ".." in path.parts:
             raise ValueError(f"Invalid filepath (path traversal detected): {filepath}")
 
-        if not path.exists():
-            raise FileNotFoundError(f"Snapshot file not found: {filepath}")
-
         try:
             with path.open("r", encoding="utf-8") as f:
                 return json.load(f)
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Snapshot file not found: {filepath}")
         except OSError as e:
             raise RuntimeError(f"Failed to read snapshot from {filepath}") from e
         except json.JSONDecodeError as e:
@@ -137,7 +153,8 @@ class PersistenceManager:
         else:
             now = datetime.now(UTC)
             year, week, _ = now.isocalendar()
-            filename = f"rebalance_{year}_W{week:02d}.json"
+            ts = now.strftime("%Y%m%d_%H%M%S")
+            filename = f"rebalance_{year}_W{week:02d}_{ts}.json"
 
         export_path = Path(export_dir) / filename
         self.save_snapshot(population, str(export_path))
@@ -226,4 +243,5 @@ class PersistenceManager:
 
         df = pd.DataFrame(records)
         df.set_index("timestamp", inplace=True)
+        df.sort_index(inplace=True)
         return df

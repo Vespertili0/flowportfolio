@@ -7,7 +7,10 @@ multiple investment strategies using ``skfolio``.
 
 from __future__ import annotations
 
-from skfolio import Population, RatioMeasure
+from typing import Any, TypedDict
+
+from skfolio import Population
+from skfolio.measures import RatioMeasure
 from skfolio.metrics import make_scorer
 from skfolio.model_selection import (
     CombinatorialPurgedCV,
@@ -20,11 +23,16 @@ from skfolio.model_selection import (
 from sklearn.base import BaseEstimator
 
 from flowportfolio.core.optimisation import SkfolioGridSearchCV as GridSearchCV
-from flowportfolio.core.universe import Universe
+from flowportfolio.core.protocols import UniverseProtocol
+
+
+class StrategyConfig(TypedDict):
+    estimator: BaseEstimator
+    grid: dict
 
 
 class PortfolioExperimentEngine:
-    """Automates hyperparameter tuning and cross-validation pipelines.
+    """Automates hyperparameter tuning via nested cross-validation.
 
     Maintains a registry of named strategies and evaluates them uniformly
     against a common asset universe and cross-validation protocol.
@@ -45,20 +53,20 @@ class PortfolioExperimentEngine:
 
     def __init__(
         self,
-        universe: Universe,
+        universe: UniverseProtocol,
         n_jobs: int = -1,
     ) -> None:
-        if not isinstance(universe, Universe):
-            raise TypeError("universe must be a Universe instance.")
+        if not isinstance(universe, UniverseProtocol):
+            raise TypeError("universe must implement UniverseProtocol.")
         self._universe = universe
         self._n_jobs = n_jobs
-        self._strategies: dict[str, dict] = {}
+        self._strategies: dict[str, StrategyConfig] = {}
 
     def add_strategy(
         self,
         name: str,
         estimator: BaseEstimator,
-        grid: dict,
+        grid: dict[str, Any],
     ) -> None:
         """Register a new strategy for benchmarking.
 
@@ -243,7 +251,7 @@ class PortfolioExperimentEngine:
                 cv=inner_cv,
                 scoring=make_scorer(RatioMeasure.CVAR_RATIO),
                 refit=True,
-                n_jobs=self._n_jobs,
+                n_jobs=1,
             )
 
             # b. Out-of-sample journey simulation
@@ -341,7 +349,7 @@ class PortfolioExperimentEngine:
                 cv=cv,
                 scoring=make_scorer(RatioMeasure.CVAR_RATIO),
                 refit=True,
-                n_jobs=self._n_jobs,
+                n_jobs=1,
             )
             search.fit(burn_in_returns)
             best_model = search.best_estimator_

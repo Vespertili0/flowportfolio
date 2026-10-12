@@ -7,6 +7,7 @@ asset universe structure.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 
@@ -86,7 +87,7 @@ class ConstraintBuilder:
     """
 
     def __init__(self, universe: UniverseProtocol) -> None:
-        if not isinstance(universe, UniverseProtocol):
+        if not hasattr(universe, "tickers") or not hasattr(universe, "metadata"):
             raise TypeError(
                 "universe must implement UniverseProtocol "
                 "(requires 'tickers: list[str]' and 'metadata: dict[str, str]' properties)."
@@ -119,10 +120,15 @@ class ConstraintBuilder:
         Raises
         ------
         ValueError
-            If the group is not found in the universe metadata.
+            If the group is not found in the universe metadata, weight is out of bounds,
+            or group_name is invalid.
         """
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", group_name):
+            raise ValueError(f"Invalid group name: '{group_name}'")
         if group_name not in self._valid_groups:
             raise ValueError(f"Group '{group_name}' not found in universe metadata.")
+        if not (0.0 <= weight <= 1.0):
+            raise ValueError(f"Weight must be between 0.0 and 1.0, got {weight}")
         self._constraints.append(f"{group_name} >= {weight:.6g}")
         return self
 
@@ -144,10 +150,15 @@ class ConstraintBuilder:
         Raises
         ------
         ValueError
-            If the group is not found in the universe metadata.
+            If the group is not found in the universe metadata, weight is out of bounds,
+            or group_name is invalid.
         """
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", group_name):
+            raise ValueError(f"Invalid group name: '{group_name}'")
         if group_name not in self._valid_groups:
             raise ValueError(f"Group '{group_name}' not found in universe metadata.")
+        if not (0.0 <= weight <= 1.0):
+            raise ValueError(f"Weight must be between 0.0 and 1.0, got {weight}")
         self._constraints.append(f"{group_name} <= {weight:.6g}")
         return self
 
@@ -171,11 +182,17 @@ class ConstraintBuilder:
         Raises
         ------
         ValueError
-            If any of the groups are not found in the universe metadata.
+            If any of the groups are not found in the universe metadata, weight is out of bounds,
+            or group names are invalid.
         """
         for group in group_names:
+            if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", group):
+                raise ValueError(f"Invalid group name: '{group}'")
             if group not in self._valid_groups:
                 raise ValueError(f"Group '{group}' not found in universe metadata.")
+
+        if not (0.0 <= weight <= 1.0):
+            raise ValueError(f"Weight must be between 0.0 and 1.0, got {weight}")
 
         combined_str = " + ".join(group_names)
         self._constraints.append(f"{combined_str} <= {weight:.6g}")

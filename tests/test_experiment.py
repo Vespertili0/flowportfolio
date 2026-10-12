@@ -72,7 +72,7 @@ def test_init_valid(stub_universe: Universe) -> None:
 
 def test_init_bad_universe() -> None:
     """Test TypeError is raised for non-Universe first arg."""
-    with pytest.raises(TypeError, match="universe must be a Universe instance"):
+    with pytest.raises(TypeError, match="universe must implement UniverseProtocol"):
         PortfolioExperimentEngine(universe="invalid")  # type: ignore
 
 
