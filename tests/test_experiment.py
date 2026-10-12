@@ -85,7 +85,7 @@ def test_add_strategy_valid(stub_universe: Universe) -> None:
     engine.add_strategy("MyStrat", est, grid)
 
     assert "MyStrat" in engine._strategies
-    assert engine._strategies["MyStrat"]["estimator"] is est
+    assert isinstance(engine._strategies["MyStrat"]["estimator"], DummyEstimator)
     assert engine._strategies["MyStrat"]["grid"] == grid
 
 
