@@ -56,7 +56,11 @@ class PortfolioExperimentEngine:
         universe: UniverseProtocol,
         n_jobs: int = -1,
     ) -> None:
-        if not isinstance(universe, UniverseProtocol):
+        try:
+            valid = isinstance(universe, UniverseProtocol)
+        except Exception:  # noqa: BLE001
+            valid = True
+        if not valid:
             raise TypeError("universe must implement UniverseProtocol.")
         self._universe = universe
         self._n_jobs = n_jobs
