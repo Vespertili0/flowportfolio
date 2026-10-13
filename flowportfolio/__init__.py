@@ -16,7 +16,7 @@ from flowportfolio.strategies import StrategyBuilder
 try:
     __version__ = _metadata_version("flowportfolio")
 except PackageNotFoundError:  # pragma: no cover
-    __version__ = "0.0.0.dev0"
+    __version__ = "0.5.0"
 
 __all__ = [
     "ConstraintBuilder",
