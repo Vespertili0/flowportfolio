@@ -365,6 +365,9 @@ class PortfolioExperimentEngine:
                 portfolio_params={"tag": name},
             )
 
-            collected.append(portfolio)
+            if type(portfolio).__name__ == "Population" or isinstance(portfolio, list):
+                collected.extend(portfolio)
+            else:
+                collected.append(portfolio)
 
         return Population(collected)

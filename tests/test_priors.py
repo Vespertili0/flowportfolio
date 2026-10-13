@@ -117,3 +117,11 @@ def test_build_synthetic_prior_raises_value_error(stub_universe):
     synthesiser = PriorSynthesiser(universe=stub_universe)
     with pytest.raises(ValueError, match="n_samples must be at least 100"):
         synthesiser.build_synthetic_prior(n_samples=50)
+
+
+def test_add_market_view_ticker_with_digits():
+    u = MagicMock(spec=Universe)
+    u.tickers = ["SP500", "TLT20"]
+    synthesiser = PriorSynthesiser(universe=u)
+    synthesiser.add_market_view("SP500 >= 0.05", confidence=0.8)
+    assert synthesiser._views[0]["view"].startswith("SP500 >=")

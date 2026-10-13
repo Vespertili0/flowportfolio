@@ -112,7 +112,9 @@ class PriorSynthesiser:
             return str(val / 252.0)
 
         scaled_view = re.sub(
-            r"-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", scale_match, normalised_view
+            r"(?<![A-Za-z0-9_])[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?(?![A-Za-z0-9_])",
+            scale_match,
+            normalised_view,
         )
 
         self._views.append({"view": scaled_view, "confidence": confidence})

@@ -24,16 +24,17 @@ class SkfolioGridSearchCV(BaseOptimization, GridSearchCV):
     def fit(self, X: Any, y: Any = None, **fit_params: Any) -> "SkfolioGridSearchCV":
         GridSearchCV.fit(self, X, y, **fit_params)
 
-        # In scikit-learn Pipelines, the weights_ attribute resides in the final estimator
-        if isinstance(self.best_estimator_, Pipeline):
-            self.weights_ = self.best_estimator_.steps[-1][1].weights_
-            if hasattr(self.best_estimator_.steps[-1][1], "feature_names_in_"):
-                self.feature_names_in_ = self.best_estimator_.steps[-1][
-                    1
-                ].feature_names_in_
-        else:
-            self.weights_ = self.best_estimator_.weights_
-            if hasattr(self.best_estimator_, "feature_names_in_"):
-                self.feature_names_in_ = self.best_estimator_.feature_names_in_
+        inner = (
+            self.best_estimator_.steps[-1][1]
+            if isinstance(self.best_estimator_, Pipeline)
+            else self.best_estimator_
+        )
+        self.weights_ = getattr(inner, "weights_", None)
+        if hasattr(inner, "feature_names_in_"):
+            self.feature_names_in_ = inner.feature_names_in_
+        if hasattr(inner, "fallback_chain_"):
+            self.fallback_chain_ = inner.fallback_chain_
+        if hasattr(inner, "error_"):
+            self.error_ = inner.error_
 
         return self

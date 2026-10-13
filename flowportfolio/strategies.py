@@ -264,34 +264,40 @@ class StrategyBuilder:
             steps.append((f"pre_{i}", _safe_clone(transformer)))
 
         cloned_optimizer = _safe_clone(self._optimizer)
-        if self._linear_constraints and hasattr(cloned_optimizer, "linear_constraints"):
-            existing = getattr(cloned_optimizer, "linear_constraints", None) or []
-            merged = list(existing) + [
-                c for c in self._linear_constraints if c not in existing
-            ]
-            cloned_optimizer.linear_constraints = merged
 
-        if self._groups and hasattr(cloned_optimizer, "groups"):
-            existing_groups = getattr(cloned_optimizer, "groups", None) or {}
-            merged_groups = dict(existing_groups)
-            merged_groups.update(self._groups)
-            cloned_optimizer.groups = merged_groups
+        def _inject(opt):
+            if opt is None:
+                return
+            if self._linear_constraints and hasattr(opt, "linear_constraints"):
+                existing = getattr(opt, "linear_constraints", None) or []
+                merged = list(existing) + [
+                    c for c in self._linear_constraints if c not in existing
+                ]
+                opt.linear_constraints = merged
 
-        if (
-            hasattr(cloned_optimizer, "previous_weights")
-            and self._previous_weights is not None
-        ):
-            cloned_optimizer.previous_weights = self._previous_weights
-        if hasattr(cloned_optimizer, "max_turnover") and self._max_turnover is not None:
-            cloned_optimizer.max_turnover = self._max_turnover
-        if (
-            hasattr(cloned_optimizer, "management_fees")
-            and getattr(self, "_management_fees", None) is not None
-        ):
-            cloned_optimizer.management_fees = self._management_fees
+            if self._groups and hasattr(opt, "groups"):
+                existing_groups = getattr(opt, "groups", None) or {}
+                merged_groups = dict(existing_groups)
+                merged_groups.update(self._groups)
+                opt.groups = merged_groups
 
-        if self.prior is not None and hasattr(cloned_optimizer, "prior_estimator"):
-            cloned_optimizer.prior_estimator = clone(self.prior)
+            if hasattr(opt, "previous_weights") and self._previous_weights is not None:
+                opt.previous_weights = self._previous_weights
+            if hasattr(opt, "max_turnover") and self._max_turnover is not None:
+                opt.max_turnover = self._max_turnover
+            if (
+                hasattr(opt, "management_fees")
+                and getattr(self, "_management_fees", None) is not None
+            ):
+                opt.management_fees = self._management_fees
+
+            if self.prior is not None and hasattr(opt, "prior_estimator"):
+                opt.prior_estimator = clone(self.prior)
+
+            if hasattr(opt, "fallback") and opt.fallback is not None:
+                _inject(opt.fallback)
+
+        _inject(cloned_optimizer)
 
         steps.append(("optimizer", cloned_optimizer))
 

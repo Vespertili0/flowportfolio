@@ -272,6 +272,12 @@ class Reporter:
 
         weights = getattr(best_portfolio, "weights", None)
         assets = getattr(best_portfolio, "assets", None)
+        if weights is None and hasattr(best_portfolio, "portfolios"):
+            portfolios = getattr(best_portfolio, "portfolios", None)
+            if isinstance(portfolios, list) and len(portfolios) > 0:
+                terminal_portfolio = portfolios[-1]
+                weights = getattr(terminal_portfolio, "weights", None)
+                assets = getattr(terminal_portfolio, "assets", None)
 
         if weights is None or len(weights) == 0:
             top_holdings = "N/A (No weights available)"
@@ -336,11 +342,11 @@ class Reporter:
             p for p in self._population if getattr(p, "tag", None) == baseline_tag
         ]
         if baseline_portfolios:
-            baseline_cvar_ratios = [
-                getattr(p, "cvar_ratio", None)
+            baseline_cvar_ratios: list[float] = [
+                float(val)
                 for p in baseline_portfolios
-                if getattr(p, "cvar_ratio", None) is not None
-                and not np.isnan(getattr(p, "cvar_ratio", None))
+                if (val := getattr(p, "cvar_ratio", None)) is not None
+                and not np.isnan(float(val))
             ]
             if baseline_cvar_ratios:
                 baseline_median_cvar = float(np.median(baseline_cvar_ratios))

@@ -272,3 +272,13 @@ def test_init_raises_if_tickers_not_list() -> None:
         match="universe.(metadata must be a dictionary|tickers must be a list)",
     ):
         ConstraintBuilder(_BadTickers())  # type: ignore[arg-type]
+
+
+def test_constraint_spec_equality_all_fields() -> None:
+    """Test ConstraintSpec equality checks all fields when comparing with another spec."""
+    s1 = ConstraintSpec(linear_constraints=["A >= 0.5"], max_turnover=0.1)
+    s2 = ConstraintSpec(linear_constraints=["A >= 0.5"], max_turnover=0.2)
+    s3 = ConstraintSpec(linear_constraints=["A >= 0.5"], max_turnover=0.1)
+    assert s1 != s2
+    assert s1 == s3
+    assert s1 == ["A >= 0.5"]

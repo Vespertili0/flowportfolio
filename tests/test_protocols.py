@@ -83,3 +83,16 @@ def test_universe_protocol_empty_class() -> None:
 
     instance = EmptyClass()
     assert not isinstance(instance, UniverseProtocol)
+
+
+def test_validate_weight_and_fee_nan() -> None:
+    """Test validate_weight and validate_fee reject NaN values."""
+    import pytest
+
+    from flowportfolio.core.validation import validate_fee, validate_weight
+
+    with pytest.raises(ValueError, match="between 0.0 and 1.0"):
+        validate_weight(float("nan"))
+
+    with pytest.raises(ValueError, match="between 0.0 and 1.0"):
+        validate_fee(float("nan"))

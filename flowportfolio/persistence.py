@@ -89,15 +89,25 @@ class PersistenceManager:
         }
 
         data = self._sanitize_nans(data)
+        fd, tmp_name = tempfile.mkstemp(dir=path.parent, text=True)
         try:
-            fd, tmp_name = tempfile.mkstemp(dir=path.parent, text=True)
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=4)
             os.replace(tmp_name, path)
         except OSError as e:
-            if "tmp_name" in locals() and os.path.exists(tmp_name):
-                os.remove(tmp_name)
+            if os.path.exists(tmp_name):
+                try:
+                    os.remove(tmp_name)
+                except OSError:
+                    pass
             raise RuntimeError(f"Failed to save snapshot to {path}") from e
+        except Exception:
+            if os.path.exists(tmp_name):
+                try:
+                    os.remove(tmp_name)
+                except OSError:
+                    pass
+            raise
 
     def load_snapshot(self, filepath: str) -> dict:
         """Load a JSON snapshot dict from the specified filepath.

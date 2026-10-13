@@ -507,3 +507,18 @@ def test_to_markdown_artifact_unlabelled_assets() -> None:
 
     assert "Asset_0" in report or "0" in report
     assert "port_unlabelled" in report
+
+
+def test_to_markdown_artifact_multi_period_portfolio() -> None:
+    """Test formatting when best portfolio is a MultiPeriodPortfolio."""
+    from skfolio import MultiPeriodPortfolio
+
+    df = pd.DataFrame(np.random.randn(10, 2) / 100, columns=["AAPL", "MSFT"])
+    p = Portfolio(X=df, weights=np.array([0.6, 0.4]), name="p1", tag="StratA")
+    mp = MultiPeriodPortfolio(portfolios=[p], name="mp_port", tag="StratA")
+
+    pop = Population([mp])
+    reporter = Reporter(pop)
+    report = reporter.to_markdown_artifact()
+    assert "AAPL (60.00%)" in report
+    assert "MSFT (40.00%)" in report

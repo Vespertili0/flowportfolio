@@ -61,6 +61,9 @@ class ConstraintSpec:
             return (
                 self.linear_constraints == other.linear_constraints
                 and self.groups == other.groups
+                and self.previous_weights == other.previous_weights
+                and self.max_turnover == other.max_turnover
+                and self.management_fees == other.management_fees
             )
         if isinstance(other, list):
             return self.linear_constraints == other
