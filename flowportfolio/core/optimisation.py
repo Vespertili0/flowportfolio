@@ -1,5 +1,7 @@
+from collections.abc import Callable
 from typing import Any
 
+import numpy as np
 from skfolio.optimization import BaseOptimization
 from sklearn.model_selection import GridSearchCV
 from sklearn.pipeline import Pipeline
@@ -12,12 +14,34 @@ class SkfolioGridSearchCV(BaseOptimization, GridSearchCV):
     it exposes weights_ and predict correctly as an optimization estimator.
     """
 
-    def __init__(self, estimator: Any = None, param_grid: Any = None, **kwargs: Any):
-        if estimator is None:
-            # When cloned by scikit-learn without parameters? Shouldn't happen unless estimator/param_grid aren't in get_params()
-            pass
+    def __init__(
+        self,
+        estimator: Any = None,
+        param_grid: Any = None,
+        *,
+        scoring: Any = None,
+        n_jobs: int | None = None,
+        refit: bool | str | Callable[..., Any] = True,
+        cv: Any = None,
+        verbose: int = 0,
+        pre_dispatch: int | str = "2*n_jobs",
+        error_score: float | str = np.nan,
+        return_train_score: bool = False,
+        **kwargs: Any,
+    ):
         GridSearchCV.__init__(
-            self, estimator=estimator, param_grid=param_grid, **kwargs
+            self,
+            estimator=estimator,
+            param_grid=param_grid,
+            scoring=scoring,
+            n_jobs=n_jobs,
+            refit=refit,
+            cv=cv,
+            verbose=verbose,
+            pre_dispatch=pre_dispatch,
+            error_score=error_score,
+            return_train_score=return_train_score,
+            **kwargs,
         )
         BaseOptimization.__init__(self)
 
