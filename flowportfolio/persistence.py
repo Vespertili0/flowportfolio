@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import os
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -16,11 +19,20 @@ class PersistenceManager:
 
     Provides mechanisms to record, serialise, and reconstruct historical
     allocation advice, enabling version-controlled Git-Ops audit trails.
-    Designed for stateless execution within Prefect workflows.
+
     """
 
     def __init__(self) -> None:
         pass
+
+    def _sanitize_nans(self, data):
+        if isinstance(data, dict):
+            return {k: self._sanitize_nans(v) for k, v in data.items()}
+        elif isinstance(data, list):
+            return [self._sanitize_nans(i) for i in data]
+        elif isinstance(data, float) and math.isnan(data):
+            return None
+        return data
 
     def save_snapshot(self, population: Population, filepath: str) -> None:
         """Serialise a Population's portfolio summary statistics and weights to JSON.
@@ -53,11 +65,18 @@ class PersistenceManager:
 
         portfolios_data = []
         for port in population:
+            weights = None
+            if hasattr(port, "portfolios") and port.portfolios:
+                terminal_port = port.portfolios[-1]
+                weights = getattr(terminal_port, "weights_dict", None)
+            if weights is None:
+                weights = getattr(port, "weights_dict", None) or {}
+
             portfolios_data.append(
                 {
                     "name": port.name,
                     "tag": port.tag,
-                    "weights": port.weights_dict,
+                    "weights": weights,
                     "sharpe": float(port.sharpe_ratio),
                     "cvar": float(port.cvar),
                     "max_drawdown": float(port.max_drawdown),
@@ -69,11 +88,26 @@ class PersistenceManager:
             "portfolios": portfolios_data,
         }
 
+        data = self._sanitize_nans(data)
+        fd, tmp_name = tempfile.mkstemp(dir=path.parent, text=True)
         try:
-            with path.open("w", encoding="utf-8") as f:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=4)
+            os.replace(tmp_name, path)
         except OSError as e:
+            if os.path.exists(tmp_name):
+                try:
+                    os.remove(tmp_name)
+                except OSError:
+                    pass
             raise RuntimeError(f"Failed to save snapshot to {path}") from e
+        except Exception:
+            if os.path.exists(tmp_name):
+                try:
+                    os.remove(tmp_name)
+                except OSError:
+                    pass
+            raise
 
     def load_snapshot(self, filepath: str) -> dict:
         """Load a JSON snapshot dict from the specified filepath.
@@ -90,12 +124,11 @@ class PersistenceManager:
         if ".." in path.parts:
             raise ValueError(f"Invalid filepath (path traversal detected): {filepath}")
 
-        if not path.exists():
-            raise FileNotFoundError(f"Snapshot file not found: {filepath}")
-
         try:
             with path.open("r", encoding="utf-8") as f:
                 return json.load(f)
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Snapshot file not found: {filepath}")
         except OSError as e:
             raise RuntimeError(f"Failed to read snapshot from {filepath}") from e
         except json.JSONDecodeError as e:
@@ -130,7 +163,8 @@ class PersistenceManager:
         else:
             now = datetime.now(UTC)
             year, week, _ = now.isocalendar()
-            filename = f"rebalance_{year}_W{week:02d}.json"
+            ts = now.strftime("%Y%m%d_%H%M%S")
+            filename = f"rebalance_{year}_W{week:02d}_{ts}.json"
 
         export_path = Path(export_dir) / filename
         self.save_snapshot(population, str(export_path))
@@ -219,4 +253,5 @@ class PersistenceManager:
 
         df = pd.DataFrame(records)
         df.set_index("timestamp", inplace=True)
+        df.sort_index(inplace=True)
         return df

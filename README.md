@@ -81,7 +81,7 @@ from flowportfolio import StrategyBuilder
 
 pipeline = (
     StrategyBuilder(constraints=constraints)
-    .set_optimizer(MeanRisk(risk_free_rate=0.03))
+    .set_optimizer(MeanRisk(risk_free_rate=0.03 / 252))
     .build_pipeline()
 )
 
@@ -124,20 +124,19 @@ synthetic_prior = synthesiser.build_synthetic_prior(n_samples=5000)
 
 ### 2. Strategy Assembly & Pipeline Construction
 
-Build leak-proof `sklearn` pipelines with pre-selection filters, cross-sectional scalers, and fallback optimisers:
+Build leak-proof `sklearn` pipelines with pre-selection filters and fallback optimisers:
 
 ```python
 from flowportfolio import StrategyBuilder
-from skfolio.preprocessing import DropCorrelated, CSStandardScaler
+from skfolio.preprocessing import DropCorrelated
 from skfolio.optimization import MeanRisk, HierarchicalRiskParity
 
 builder = StrategyBuilder(constraints=constraints)
 
 pipeline = (
     builder.add_pre_selection(DropCorrelated(threshold=0.85))
-    .add_cross_sectional(CSStandardScaler())
     .set_optimizer(
-        optimizer=MeanRisk(linear_constraints=constraints),
+        optimizer=MeanRisk(),
         fallbacks=[HierarchicalRiskParity()],
     )
     .build_pipeline()
@@ -167,7 +166,7 @@ drift_df = delta_engine.calculate_group_drift()
 delta_summary = delta_engine.calculate_rebalance_delta(population)
 
 # Friction-adjusted net benefit analysis
-friction = delta_engine.calculate_friction_adjusted_benefit(
+friction = delta_engine.calculate_net_friction(
     portfolio_value=100000.0,
     brokerage_flat=9.95,
     brokerage_bps=0.001,

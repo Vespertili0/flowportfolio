@@ -72,8 +72,8 @@ def test_generate_tearsheet_calls_all_plots(
     reporter.generate_tearsheet()
 
     # Verify calls
-    pop.boxplot_measure.assert_called_once()
-    pop.plot_distribution.assert_called_once()
+    mock_boxplot.assert_called_once()
+    mock_distribution.assert_called_once()
     mock_composition.assert_called_once()
 
 
@@ -132,8 +132,8 @@ def test_tag_list_includes_baseline(
     reporter.generate_tearsheet(baseline_tag="Baseline")
 
     # Verify tag_list passed to boxplot
-    boxplot_kwargs = pop.boxplot_measure.call_args[1]
-    assert "Baseline" in boxplot_kwargs["tag_list"]
+    boxplot_kwargs = mock_boxplot.call_args[1]
+    assert "Baseline" not in boxplot_kwargs["tag_list"]
     assert "StratA" in boxplot_kwargs["tag_list"]
 
 
@@ -200,7 +200,7 @@ def test_custom_baseline_tag(
     reporter = Reporter(pop)
     reporter.generate_tearsheet(baseline_tag="MyBaseline")
 
-    boxplot_kwargs = pop.boxplot_measure.call_args[1]
+    boxplot_kwargs = mock_boxplot.call_args[1]
     # It shouldn't add "Baseline" if "MyBaseline" is the designated baseline
     assert "Baseline" not in boxplot_kwargs["tag_list"]
     assert "MyBaseline" in boxplot_kwargs["tag_list"]
@@ -241,6 +241,25 @@ def test_plot_stress_impact_success(
     fig2.update_layout.assert_called_once_with(
         title="Max Drawdown Distribution: Stress vs Baseline"
     )
+
+
+def test_plot_stress_impact_explicit_population_instantiation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test plot_stress_impact explicitly instantiates Population without relying on list addition."""
+    p_baseline = _make_mock_portfolio("Baseline", 1.0)
+    p_stress = _make_mock_portfolio("Stress", 0.8)
+
+    mock_fig = MagicMock()
+    monkeypatch.setattr(Population, "boxplot_measure", lambda self, **kwargs: mock_fig)
+    monkeypatch.setattr(
+        Population, "plot_distribution", lambda self, **kwargs: mock_fig
+    )
+
+    real_pop = Population([p_baseline, p_stress])
+    reporter = Reporter(real_pop)
+    reporter.plot_stress_impact("Stress", "Baseline")
+    assert mock_fig.show.call_count == 2
 
 
 def test_plot_stress_impact_missing_stress_tag() -> None:
@@ -488,3 +507,18 @@ def test_to_markdown_artifact_unlabelled_assets() -> None:
 
     assert "Asset_0" in report or "0" in report
     assert "port_unlabelled" in report
+
+
+def test_to_markdown_artifact_multi_period_portfolio() -> None:
+    """Test formatting when best portfolio is a MultiPeriodPortfolio."""
+    from skfolio import MultiPeriodPortfolio
+
+    df = pd.DataFrame(np.random.randn(10, 2) / 100, columns=["AAPL", "MSFT"])
+    p = Portfolio(X=df, weights=np.array([0.6, 0.4]), name="p1", tag="StratA")
+    mp = MultiPeriodPortfolio(portfolios=[p], name="mp_port", tag="StratA")
+
+    pop = Population([mp])
+    reporter = Reporter(pop)
+    report = reporter.to_markdown_artifact()
+    assert "AAPL (60.00%)" in report
+    assert "MSFT (40.00%)" in report

@@ -8,11 +8,7 @@ benefit of executing a portfolio rebalance versus holding current positions,
 factoring in group drift, Total Expense Ratio (TER), slippage, and brokerage
 friction.
 
-**Prefect Compatibility:** All public methods are pure functions of the
-constructor's stored state. They accept explicit data structures and return
-serialisable outputs, ensuring zero friction inside Prefect ``@task``
-execution contexts.
-"""
+**"""
 
 from __future__ import annotations
 
@@ -20,10 +16,10 @@ from collections import defaultdict
 
 import numpy as np
 import pandas as pd
-from skfolio import Population, RatioMeasure
+from skfolio import Population
 from skfolio.portfolio import Portfolio
 
-from flowportfolio.core.universe import Universe
+from flowportfolio.core.protocols import UniverseProtocol
 
 
 class PortfolioDeltaEngine:
@@ -32,10 +28,6 @@ class PortfolioDeltaEngine:
     This engine quantifies the trade-off of executing a rebalance versus
     holding current positions (net of transaction friction and management
     fees).
-
-    Prefect Compatibility: All methods are pure functions of the
-    constructor's stored state and are safe to wrap as Prefect ``@task``
-    decorators.
 
     Parameters
     ----------
@@ -62,13 +54,13 @@ class PortfolioDeltaEngine:
 
     def __init__(
         self,
-        universe: Universe,
+        universe: UniverseProtocol,
         current_weights: dict[str, float],
         target_weights: dict[str, float],
     ) -> None:
         # --- type validation ---
-        if not isinstance(universe, Universe):
-            raise TypeError("universe must be a Universe instance.")
+        if not isinstance(universe, UniverseProtocol):
+            raise TypeError("universe must implement UniverseProtocol.")
         if not isinstance(current_weights, dict):
             raise TypeError("current_weights must be a dict.")
         if not isinstance(target_weights, dict):
@@ -142,7 +134,7 @@ class PortfolioDeltaEngine:
                 f"target_weights is missing universe tickers: {sorted(missing_target)}."
             )
 
-        self._universe: Universe = universe
+        self._universe: UniverseProtocol = universe
         self._current_weights: dict[str, float] = dict(current_weights)
         self._target_weights: dict[str, float] = dict(target_weights)
 
@@ -218,21 +210,25 @@ class PortfolioDeltaEngine:
         df = pd.DataFrame(rows).set_index("group")
         return df
 
-    def calculate_rebalance_delta(self, population: Population) -> dict:
+    def calculate_rebalance_delta(self, population: Population | None = None) -> dict:
         """Calculate the risk/return delta of holding vs rebalancing.
 
-        Takes the skfolio ``Population`` object (e.g. from robustness
-        testing) and creates a pseudo-portfolio representing the current
-        physical weights applied to the universe's historical returns.
-        Computes Mean CVaR, Sharpe ratio, and Max Drawdown for both the
-        ``'hold'`` portfolio and the ``'rebalance'`` portfolio (best
-        strategy from the population, selected by maximum CVaR ratio).
+        Evaluates the current physical weights (hold scenario) and the target
+        weights (rebalance scenario) across the identical returns evaluation
+        window. If an out-of-sample ``Population`` is provided, the evaluation
+        window is aligned to the population's observation period. Computes CVaR,
+        Sharpe ratio, and Max Drawdown for both scenarios.
+
+        Note: The ``hold_portfolio`` models a constant-mix portfolio with
+        periodic rebalancing back to initial weights rather than a true
+        un-rebalanced asset drift over time.
 
         Parameters
         ----------
-        population : Population
-            The out-of-sample population object containing the target
-            strategy portfolios.
+        population : Population or None, optional
+            The out-of-sample population object containing benchmarked strategy
+            portfolios. If provided, its observation window is used to evaluate
+            both current and target holdings.
 
         Returns
         -------
@@ -244,34 +240,53 @@ class PortfolioDeltaEngine:
         Raises
         ------
         TypeError
-            If ``population`` is not a ``skfolio.Population`` instance.
+            If ``population`` is not None and not a ``skfolio.Population`` instance.
         ValueError
-            If ``population`` is empty, or if ``universe.returns`` has not
-            been populated (i.e. ``fetch_data()`` has not been called).
+            If ``population`` is provided but empty, or if ``universe.returns``
+            has not been populated.
         """
-        if not isinstance(population, Population):
-            raise TypeError("population must be a skfolio.Population instance.")
-        if len(population) == 0:
-            raise ValueError("population must not be empty.")
+        if population is not None:
+            if not isinstance(population, Population):
+                raise TypeError("population must be a skfolio.Population instance.")
+            if len(population) == 0:
+                raise ValueError("population must not be empty.")
 
         # Retrieve universe returns — propagates ValueError if not fetched
         returns: pd.DataFrame = self._universe.returns
 
-        # Build weight vector aligned to returns column order; default 0.0
-        # for any universe ticker absent from current_weights.
-        weight_vector = np.array(
+        # Determine evaluation returns window
+        eval_returns = returns
+        if population is not None and len(population) > 0:
+            first_port = population[0]
+            port_returns = getattr(first_port, "returns", None)
+            if isinstance(port_returns, (pd.Series, pd.DataFrame)):
+                if (
+                    hasattr(port_returns, "index")
+                    and port_returns.index.isin(returns.index).any()
+                ):
+                    eval_returns = returns.loc[returns.index.isin(port_returns.index)]
+                elif len(port_returns) <= len(returns):
+                    eval_returns = returns.iloc[-len(port_returns) :]
+
+        # Build weight vectors aligned to returns column order
+        current_weight_vector = np.array(
             [self._current_weights.get(col, 0.0) for col in returns.columns],
             dtype=float,
         )
-
-        # Construct skfolio Portfolio for the "hold" scenario
-        hold_portfolio = Portfolio(
-            X=returns.to_numpy(),
-            weights=weight_vector,
+        target_weight_vector = np.array(
+            [self._target_weights.get(col, 0.0) for col in returns.columns],
+            dtype=float,
         )
 
-        # Select the best portfolio from the population by CVaR ratio
-        rebalance_portfolio = population.max_measure(RatioMeasure.CVAR_RATIO)
+        # Construct skfolio Portfolio for both scenarios over the identical window
+        hold_portfolio = Portfolio(
+            X=eval_returns.to_numpy(),
+            weights=current_weight_vector,
+        )
+        rebalance_portfolio = Portfolio(
+            X=eval_returns.to_numpy(),
+            weights=target_weight_vector,
+        )
 
         return {
             "hold": {
@@ -318,9 +333,9 @@ class PortfolioDeltaEngine:
         Returns
         -------
         pd.DataFrame
-            DataFrame with columns: ``'ticker'``, ``'turnover'``,
-            ``'transaction_cost'``, ``'annual_ter'``, and
-            ``'total_friction'``. Includes a final summary row labelled
+            DataFrame with columns: ``'ticker'``, ``'gross_weight_traded'``,
+            ``'one_way_turnover'``, ``'transaction_cost'``, ``'annual_ter'``,
+            and ``'annual_ter_savings'``. Includes a final summary row labelled
             ``'TOTAL'`` with summed values across all assets.
 
         Raises
@@ -344,18 +359,23 @@ class PortfolioDeltaEngine:
             current_w = float(self._current_weights.get(ticker, 0.0))
             target_w = float(self._target_weights.get(ticker, 0.0))
 
-            turnover = abs(target_w - current_w)
-            transaction_cost = turnover * total_bps / 10_000.0
+            gross_weight_traded = abs(target_w - current_w)
+            one_way_turnover = gross_weight_traded / 2.0
+
+            transaction_cost = gross_weight_traded * total_bps / 10_000.0
+
             annual_ter = target_w * float(fees.get(ticker, 0.0))
-            total_friction = transaction_cost + annual_ter
+            current_ter = current_w * float(fees.get(ticker, 0.0))
+            annual_ter_savings = current_ter - annual_ter
 
             rows.append(
                 {
                     "ticker": ticker,
-                    "turnover": turnover,
+                    "gross_weight_traded": gross_weight_traded,
+                    "one_way_turnover": one_way_turnover,
                     "transaction_cost": transaction_cost,
                     "annual_ter": annual_ter,
-                    "total_friction": total_friction,
+                    "annual_ter_savings": annual_ter_savings,
                 }
             )
 
@@ -363,10 +383,11 @@ class PortfolioDeltaEngine:
             rows,
             columns=[
                 "ticker",
-                "turnover",
+                "gross_weight_traded",
+                "one_way_turnover",
                 "transaction_cost",
                 "annual_ter",
-                "total_friction",
+                "annual_ter_savings",
             ],
         )
 
@@ -375,10 +396,11 @@ class PortfolioDeltaEngine:
             [
                 {
                     "ticker": "TOTAL",
-                    "turnover": df["turnover"].sum(),
+                    "gross_weight_traded": df["gross_weight_traded"].sum(),
+                    "one_way_turnover": df["one_way_turnover"].sum(),
                     "transaction_cost": df["transaction_cost"].sum(),
                     "annual_ter": df["annual_ter"].sum(),
-                    "total_friction": df["total_friction"].sum(),
+                    "annual_ter_savings": df["annual_ter_savings"].sum(),
                 }
             ]
         )

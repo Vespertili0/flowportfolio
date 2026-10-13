@@ -143,12 +143,12 @@ def test_calculate_net_friction(stub_universe):
     df = engine.calculate_net_friction(brokerage_bps=10.0, slippage_bps=5.0)
 
     # Check shape
-    assert "turnover" in df.columns
+    assert "gross_weight_traded" in df.columns
     assert "transaction_cost" in df.columns
 
     # AAPL turnover = 0.1, MSFT = 0.1, GOOG = 0.2
     # Total turnover = 0.4
-    total_turnover = df[df["ticker"] == "TOTAL"]["turnover"].iloc[0]
+    total_turnover = df[df["ticker"] == "TOTAL"]["gross_weight_traded"].iloc[0]
     assert np.isclose(total_turnover, 0.4)
 
 
@@ -174,16 +174,17 @@ def test_calculate_rebalance_delta(mock_portfolio, stub_universe):
     mock_hold.cvar = 0.05
     mock_hold.sharpe_ratio = 1.5
     mock_hold.max_drawdown = 0.1
-    mock_portfolio.return_value = mock_hold
+
+    mock_rebalance = MagicMock()
+    mock_rebalance.cvar = 0.04
+    mock_rebalance.sharpe_ratio = 2.0
+    mock_rebalance.max_drawdown = 0.08
+
+    mock_portfolio.side_effect = [mock_hold, mock_rebalance]
 
     mock_pop = MagicMock(spec=Population)
     mock_pop.__len__.return_value = 1
-
-    mock_best = MagicMock()
-    mock_best.cvar = 0.04
-    mock_best.sharpe_ratio = 2.0
-    mock_best.max_drawdown = 0.08
-    mock_pop.max_measure.return_value = mock_best
+    mock_pop.__getitem__.return_value = MagicMock()
 
     res = engine.calculate_rebalance_delta(mock_pop)
 
@@ -191,3 +192,4 @@ def test_calculate_rebalance_delta(mock_portfolio, stub_universe):
     assert "rebalance" in res
     assert res["hold"]["cvar"] == 0.05
     assert res["rebalance"]["sharpe"] == 2.0
+    assert mock_portfolio.call_count == 2

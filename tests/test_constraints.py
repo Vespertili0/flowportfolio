@@ -6,7 +6,7 @@ using the fluent builder pattern in :class:`flowportfolio.core.constraints.Const
 
 import pytest
 
-from flowportfolio.core.constraints import ConstraintBuilder
+from flowportfolio.core.constraints import ConstraintBuilder, ConstraintSpec
 from flowportfolio.core.protocols import UniverseProtocol
 from flowportfolio.core.universe import Universe
 
@@ -118,31 +118,23 @@ def test_unknown_group_raises(stub_universe: Universe) -> None:
 
 
 def test_max_turnover_output(stub_universe: Universe) -> None:
-    """Test max_turnover correctly computes upper and lower bounds."""
+    """Test max_turnover correctly stores parameters."""
     builder = ConstraintBuilder(stub_universe)
     current_weights = {"A": 0.4, "B": 0.4, "C": 0.2}
     result = builder.max_turnover(limit=0.1, current_weights=current_weights).build()
 
-    # 3 tickers * 2 bounds each = 6 constraints
-    assert len(result) == 6
-    assert "A >= 0.3" in result
-    assert "A <= 0.5" in result
-    assert "B >= 0.3" in result
-    assert "B <= 0.5" in result
-    assert "C >= 0.1" in result
-    assert "C <= 0.3" in result
+    assert result.max_turnover == 0.1
+    assert result.previous_weights == [0.4, 0.4, 0.2]
 
 
 def test_max_turnover_clamping(stub_universe: Universe) -> None:
-    """Test max_turnover clamps bounds to [0.0, 1.0]."""
+    """Test max_turnover stores parameters correctly without clamping."""
     builder = ConstraintBuilder(stub_universe)
-    # C weight is 0.05, limit is 0.1 -> lower bound clamped to 0.0
-    # A weight is 0.95, limit is 0.1 -> upper bound clamped to 1.0
     current_weights = {"A": 0.95, "B": 0.0, "C": 0.05}
     result = builder.max_turnover(limit=0.1, current_weights=current_weights).build()
 
-    assert "A <= 1" in result
-    assert "C >= 0" in result
+    assert result.max_turnover == 0.1
+    assert result.previous_weights == [0.95, 0.0, 0.05]
 
 
 def test_max_turnover_invalid_limit(stub_universe: Universe) -> None:
@@ -182,6 +174,21 @@ def test_build_does_not_mutate(stub_universe: Universe) -> None:
     assert result1 == ["core >= 0.5"]
     assert result1 is not result2
     assert result1 == result2
+
+
+def test_build_returns_constraint_spec(stub_universe: Universe) -> None:
+    """Test build() returns a ConstraintSpec with both constraints and groups."""
+    builder = ConstraintBuilder(stub_universe)
+    builder.min_group("core", 0.5)
+    spec = builder.build()
+
+    assert isinstance(spec, ConstraintSpec)
+    assert spec.linear_constraints == ["core >= 0.5"]
+    assert spec.groups == {
+        "A": ["core"],
+        "B": ["core"],
+        "C": ["satellite"],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +252,10 @@ def test_init_raises_if_metadata_not_dict() -> None:
             self.tickers = ["A"]
             self.metadata = "not-a-dict"
 
-    with pytest.raises(TypeError, match="universe.metadata must be a dictionary"):
+    with pytest.raises(
+        TypeError,
+        match="universe.(metadata must be a dictionary|tickers must be a list)",
+    ):
         ConstraintBuilder(_BadMetadata())  # type: ignore[arg-type]
 
 
@@ -257,5 +267,18 @@ def test_init_raises_if_tickers_not_list() -> None:
             self.tickers = "not-a-list"
             self.metadata = {"A": "growth"}
 
-    with pytest.raises(TypeError, match="universe.tickers must be a list"):
+    with pytest.raises(
+        TypeError,
+        match="universe.(metadata must be a dictionary|tickers must be a list)",
+    ):
         ConstraintBuilder(_BadTickers())  # type: ignore[arg-type]
+
+
+def test_constraint_spec_equality_all_fields() -> None:
+    """Test ConstraintSpec equality checks all fields when comparing with another spec."""
+    s1 = ConstraintSpec(linear_constraints=["A >= 0.5"], max_turnover=0.1)
+    s2 = ConstraintSpec(linear_constraints=["A >= 0.5"], max_turnover=0.2)
+    s3 = ConstraintSpec(linear_constraints=["A >= 0.5"], max_turnover=0.1)
+    assert s1 != s2
+    assert s1 == s3
+    assert s1 == ["A >= 0.5"]

@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
+import pandas as pd
+
 
 @runtime_checkable
 class UniverseProtocol(Protocol):
@@ -35,4 +37,14 @@ class UniverseProtocol(Protocol):
     @property
     def metadata(self) -> dict[str, str]:
         """Mapping of ticker symbol to group tag string."""
+        ...
+
+    @property
+    def returns(self) -> pd.DataFrame:
+        """Daily asset returns DataFrame."""
+        ...
+
+    @property
+    def fees(self) -> dict[str, float]:
+        """Asset management fees mapping."""
         ...

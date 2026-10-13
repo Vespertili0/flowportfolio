@@ -25,7 +25,7 @@ def stub_universe() -> Universe:
 
 
 def test_init_raises_type_error():
-    with pytest.raises(TypeError, match="universe must be an instance of"):
+    with pytest.raises(TypeError, match="universe must implement UniverseProtocol"):
         PriorSynthesiser(universe="not a universe")
 
 
@@ -76,7 +76,29 @@ def test_build_entropy_prior_success(mock_entropy_pooling, stub_universe):
 
     # Assert
     assert prior is mock_instance
-    mock_entropy_pooling.assert_called_once_with(views=["AAPL > 0.05"], tau=[0.8])
+    mock_entropy_pooling.assert_called_once_with(
+        mean_views=["AAPL >= 0.0001984126984126984"], groups=None
+    )
+
+
+@patch("flowportfolio.priors.BlackLitterman")
+def test_build_black_litterman_prior_success(mock_bl, stub_universe):
+    mock_instance = MagicMock()
+    mock_bl.return_value = mock_instance
+
+    synthesiser = PriorSynthesiser(universe=stub_universe)
+    synthesiser.add_market_view("AAPL >= 0.05", confidence=0.8)
+
+    prior = synthesiser.build_black_litterman_prior(tau=0.05)
+
+    assert prior is mock_instance
+    mock_bl.assert_called_once_with(
+        views=["AAPL >= 0.0001984126984126984"],
+        tau=0.05,
+        view_confidences=[0.8],
+        groups=None,
+        risk_free_rate=0.0,
+    )
 
 
 def test_build_entropy_prior_raises_runtime_error(stub_universe):
@@ -95,3 +117,11 @@ def test_build_synthetic_prior_raises_value_error(stub_universe):
     synthesiser = PriorSynthesiser(universe=stub_universe)
     with pytest.raises(ValueError, match="n_samples must be at least 100"):
         synthesiser.build_synthetic_prior(n_samples=50)
+
+
+def test_add_market_view_ticker_with_digits():
+    u = MagicMock(spec=Universe)
+    u.tickers = ["SP500", "TLT20"]
+    synthesiser = PriorSynthesiser(universe=u)
+    synthesiser.add_market_view("SP500 >= 0.05", confidence=0.8)
+    assert synthesiser._views[0]["view"].startswith("SP500 >=")
