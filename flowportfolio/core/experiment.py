@@ -138,6 +138,34 @@ class PortfolioExperimentEngine:
             )
         return _map[cv_type](**cv_kwargs)
 
+    @staticmethod
+    def _resolve_outer_train_size(
+        cv_type: str,
+        outer_cv: Any,
+        outer_kwargs: dict[str, Any],
+        n_samples: int,
+        returns: Any,
+    ) -> int:
+        """Determine the (minimum) number of observations in an outer training fold."""
+        if cv_type == "walk_forward":
+            return int(outer_kwargs.get("train_size", 252))
+
+        if cv_type == "combinatorial":
+            try:
+                return max(
+                    1, min(len(train_idx) for train_idx, _ in outer_cv.split(returns))
+                )
+            except Exception:  # noqa: BLE001
+                n_folds = outer_kwargs.get("n_folds", 10)
+                n_test_folds = outer_kwargs.get("n_test_folds", 8)
+                return max(1, int(n_samples * (n_folds - n_test_folds) / n_folds))
+
+        base_cv = outer_kwargs.get("walk_forward")
+        train_size = getattr(base_cv, "train_size", None)
+        if isinstance(train_size, int):
+            return min(train_size, n_samples)
+        return n_samples
+
     def run_robustness_test(
         self,
         cv_type: str = "walk_forward",
@@ -187,6 +215,12 @@ class PortfolioExperimentEngine:
         # 2. Extract returns (will raise ValueError if not fetched)
         returns = self._universe.returns
 
+        # Determine the size of the outer training window, which bounds the data
+        # available to the inner hyperparameter search.
+        outer_train = self._resolve_outer_train_size(
+            cv_type, outer_cv, resolved_outer_kwargs, len(returns), returns
+        )
+
         if inner_cv_kwargs is not None:
             resolved_explicit_inner = dict(inner_cv_kwargs)
             inner_type = resolved_explicit_inner.pop("cv_type", "walk_forward")
@@ -199,11 +233,6 @@ class PortfolioExperimentEngine:
                 "train_size" not in resolved_explicit_inner
                 or "test_size" not in resolved_explicit_inner
             ):
-                outer_train = (
-                    resolved_outer_kwargs.get("train_size", 252)
-                    if cv_type == "walk_forward"
-                    else len(returns)
-                )
                 inner_test = max(1, int(outer_train * 0.2))
                 inner_train = max(1, int(outer_train * 0.6))
                 if inner_train + inner_test > outer_train:
@@ -214,7 +243,6 @@ class PortfolioExperimentEngine:
         else:
             if cv_type == "walk_forward":
                 resolved_inner_kwargs = dict(cv_kwargs)
-                outer_train = resolved_outer_kwargs.get("train_size", 252)
                 if outer_train <= 2:
                     raise ValueError(
                         f"Outer train_size={outer_train} is too small to derive inner walk-forward splits."
@@ -233,11 +261,10 @@ class PortfolioExperimentEngine:
             else:
                 # CombinatorialPurgedCV and MultipleRandomizedCV are multi-path splitters
                 # incompatible with GridSearchCV. Restrict inner tuning to standard single-test-fold WalkForward.
-                n_samples = len(returns)
-                inner_test = max(1, int(n_samples * 0.2))
-                inner_train = max(1, int(n_samples * 0.5))
-                if inner_train + inner_test > n_samples:
-                    inner_train = max(1, n_samples - inner_test)
+                inner_test = max(1, int(outer_train * 0.2))
+                inner_train = max(1, int(outer_train * 0.6))
+                if inner_train + inner_test > outer_train:
+                    inner_train = max(1, outer_train - inner_test)
                 inner_cv = self._resolve_cv_splitter(
                     "walk_forward", train_size=inner_train, test_size=inner_test
                 )
