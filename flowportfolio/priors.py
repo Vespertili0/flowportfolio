@@ -39,7 +39,9 @@ class PriorSynthesiser:
     """
 
     def __init__(self, universe: UniverseProtocol) -> None:
-        if not isinstance(universe, UniverseProtocol):
+        from flowportfolio.core.protocols import is_universe_protocol
+
+        if not is_universe_protocol(universe):
             raise TypeError("universe must implement UniverseProtocol")
         self._universe = universe
         self._views: list[dict] = []
@@ -57,8 +59,11 @@ class PriorSynthesiser:
         Parameters
         ----------
         view_str : str
-            A view expression referencing asset tickers present in the universe.
-            Example: "SPY >= 0.05" (SPY expected to return >=5% annualised).
+            A view expression referencing asset tickers or metadata group names
+            present in the universe. Example: "SPY >= 0.05" (SPY expected to
+            return >=5% annualised). Only the right-hand-side scalar constant is
+            converted to a daily return (divided by 252.0); left-hand-side
+            coefficients are left untouched.
         confidence : float
             Confidence in this view, between 0.0 (no confidence) and 1.0
             (certainty). Maps to view confidences in Black-Litterman and
@@ -74,48 +79,64 @@ class PriorSynthesiser:
         ValueError
             If confidence is not in [0.0, 1.0].
         ValueError
-            If view_str references a ticker not in universe.tickers.
+            If view_str references an identifier that is neither a ticker in
+            universe.tickers nor a group in universe.metadata.
+        ValueError
+            If view_str has no valid comparison operator or its right-hand
+            side is not a scalar numeric return.
         """
         if not (0.0 <= confidence <= 1.0):
             raise ValueError("confidence must be between 0.0 and 1.0")
 
         valid_tickers = set(self._universe.tickers)
+        valid_groups = (
+            set(self._universe.metadata.values())
+            if isinstance(getattr(self._universe, "metadata", None), dict)
+            else set()
+        )
+        valid_identifiers = valid_tickers | valid_groups
 
-        # Tokenize by non-word chars (keeping dots and hyphens if possible) to find tickers
+        # Tokenize by non-word chars (keeping dots and hyphens if possible) to find identifiers
         words = re.findall(r"[\w.-]+", view_str)
-        extracted_tickers = [w for w in words if w in valid_tickers]
+        extracted_ids = [w for w in words if w in valid_identifiers]
 
-        # Find tokens that look like tickers but aren't in valid_tickers
-        potential_tickers = [
+        # Find tokens that look like identifiers but are not valid
+        potential_ids = [
             w
             for w in words
-            if re.match(r"^[A-Za-z][A-Za-z0-9_.-]*$", w) and w not in valid_tickers
+            if re.match(r"^[A-Za-z][A-Za-z0-9_.-]*$", w) and w not in valid_identifiers
         ]
 
-        if not extracted_tickers:
+        if not extracted_ids:
             raise ValueError(
-                f"View '{view_str}' does not reference any valid tickers. "
-                f"Universe tickers: {sorted(valid_tickers)}"
+                f"View '{view_str}' does not reference any valid tickers or groups. "
+                f"Valid identifiers: {sorted(valid_identifiers)}"
             )
 
-        for ticker in potential_tickers:
+        for unknown_id in potential_ids:
             raise ValueError(
-                f"View '{view_str}' references ticker '{ticker}' which is "
-                f"not present in the universe."
+                f"View '{view_str}' references identifier '{unknown_id}' which is "
+                f"not present in universe tickers or metadata groups."
             )
 
         normalised_view = self._normalise_view_operators(view_str)
+        parts = re.split(r"(>=|<=|==)", normalised_view, maxsplit=1)
+        if len(parts) != 3:
+            raise ValueError(
+                f"View '{view_str}' must contain a valid comparison operator (==, >=, <=)."
+            )
 
-        # Scale annualised views to daily returns (divide by 252)
-        def scale_match(match):
-            val = float(match.group(0))
-            return str(val / 252.0)
+        lhs, op, rhs = parts[0].strip(), parts[1], parts[2].strip()
+        try:
+            rhs_annual = float(rhs)
+        except ValueError as exc:
+            raise ValueError(
+                f"Right-hand side of view '{view_str}' must be a scalar numeric return, got '{rhs}'."
+            ) from exc
 
-        scaled_view = re.sub(
-            r"(?<![A-Za-z0-9_])[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?(?![A-Za-z0-9_])",
-            scale_match,
-            normalised_view,
-        )
+        # Scale only the annualised RHS constant to a daily return (divide by 252)
+        scaled_rhs = rhs_annual / 252.0
+        scaled_view = f"{lhs} {op} {scaled_rhs}"
 
         self._views.append({"view": scaled_view, "confidence": confidence})
         return self
@@ -198,7 +219,8 @@ class PriorSynthesiser:
         prior_estimator : BasePrior or None, optional
             Prior distribution estimator. If None, skfolio default is used.
         risk_free_rate : float, default 0.0
-            Risk-free rate.
+            Annualised risk-free rate; converted internally to a daily rate
+            (divided by 252.0) to match the frequency of the returns and views.
 
         Returns
         -------
@@ -234,7 +256,7 @@ class PriorSynthesiser:
             "tau": tau,
             "view_confidences": confidences,
             "groups": groups_arg,
-            "risk_free_rate": risk_free_rate,
+            "risk_free_rate": risk_free_rate / 252.0,
         }
         if prior_estimator is not None:
             kwargs["prior_estimator"] = prior_estimator

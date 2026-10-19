@@ -6,7 +6,7 @@ flowportfolio modules.
 
 from flowportfolio.core.constraints import ConstraintBuilder, ConstraintSpec
 from flowportfolio.core.experiment import PortfolioExperimentEngine
-from flowportfolio.core.protocols import UniverseProtocol
+from flowportfolio.core.protocols import UniverseProtocol, is_universe_protocol
 from flowportfolio.core.reporting import Reporter
 from flowportfolio.core.universe import DataFetchError, Universe
 
@@ -20,6 +20,7 @@ __all__ = [
     "Universe",
     "UniverseProtocol",
     "YFinanceProvider",
+    "is_universe_protocol",
     "validate_fee",
     "validate_weight",
 ]

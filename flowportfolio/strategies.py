@@ -55,9 +55,17 @@ class StrategyBuilder:
             self._constraints = value
             self._linear_constraints = list(value.linear_constraints)
             self._groups = dict(value.groups)
-            self._previous_weights = value.previous_weights
+            self._previous_weights = (
+                dict(value.previous_weights)
+                if value.previous_weights is not None
+                else None
+            )
             self._max_turnover = value.max_turnover
-            self._management_fees = value.management_fees
+            self._management_fees = (
+                dict(value.management_fees)
+                if value.management_fees is not None
+                else None
+            )
         elif isinstance(value, list):
             if not all(isinstance(c, str) for c in value):
                 raise TypeError("All constraints must be strings.")
@@ -126,6 +134,50 @@ class StrategyBuilder:
         self._pre_selection.append(transformer)
         return self
 
+    def _inject_into_estimator(self, opt, include_prior: bool = True) -> None:
+        """Inject accumulated constraints (and optionally the prior) into ``opt``.
+
+        Recurses into ``opt.fallback`` when present so the whole fallback
+        chain shares the same constraint configuration.
+
+        Parameters
+        ----------
+        opt : skfolio optimizer or None
+            The estimator to mutate in place. ``None`` is ignored.
+        include_prior : bool, default True
+            Whether to clone ``self.prior`` into ``opt.prior_estimator``.
+        """
+        if opt is None:
+            return
+        if self._linear_constraints and hasattr(opt, "linear_constraints"):
+            existing = getattr(opt, "linear_constraints", None) or []
+            merged = list(existing) + [
+                c for c in self._linear_constraints if c not in existing
+            ]
+            opt.linear_constraints = merged
+
+        if self._groups and hasattr(opt, "groups"):
+            existing_groups = getattr(opt, "groups", None) or {}
+            merged_groups = dict(existing_groups)
+            merged_groups.update(self._groups)
+            opt.groups = merged_groups
+
+        if hasattr(opt, "previous_weights") and self._previous_weights is not None:
+            opt.previous_weights = dict(self._previous_weights)
+        if hasattr(opt, "max_turnover") and self._max_turnover is not None:
+            opt.max_turnover = self._max_turnover
+        if (
+            hasattr(opt, "management_fees")
+            and getattr(self, "_management_fees", None) is not None
+        ):
+            opt.management_fees = dict(self._management_fees)
+
+        if include_prior and self.prior is not None and hasattr(opt, "prior_estimator"):
+            opt.prior_estimator = clone(self.prior)
+
+        if hasattr(opt, "fallback") and opt.fallback is not None:
+            self._inject_into_estimator(opt.fallback, include_prior=include_prior)
+
     def set_optimizer(
         self,
         optimizer,
@@ -172,29 +224,7 @@ class StrategyBuilder:
         self._optimizer = _safe_clone(optimizer)
         self._fallbacks = [_safe_clone(f) for f in fbs]
 
-        def _inject_constraints(opt):
-            if hasattr(opt, "linear_constraints") and self._linear_constraints:
-                existing = getattr(opt, "linear_constraints", None) or []
-                merged = list(existing) + [
-                    c for c in self._linear_constraints if c not in existing
-                ]
-                opt.linear_constraints = merged
-            if hasattr(opt, "groups") and self._groups:
-                existing_groups = getattr(opt, "groups", None) or {}
-                merged_groups = dict(existing_groups)
-                merged_groups.update(self._groups)
-                opt.groups = merged_groups
-            if hasattr(opt, "previous_weights") and self._previous_weights is not None:
-                opt.previous_weights = self._previous_weights
-            if hasattr(opt, "max_turnover") and self._max_turnover is not None:
-                opt.max_turnover = self._max_turnover
-            if (
-                hasattr(opt, "management_fees")
-                and getattr(self, "_management_fees", None) is not None
-            ):
-                opt.management_fees = self._management_fees
-
-        _inject_constraints(self._optimizer)
+        self._inject_into_estimator(self._optimizer, include_prior=False)
 
         current = self._optimizer
         for fb in self._fallbacks:
@@ -202,7 +232,7 @@ class StrategyBuilder:
                 raise TypeError(
                     "The provided optimizer does not support fallback semantics."
                 )
-            _inject_constraints(fb)
+            self._inject_into_estimator(fb, include_prior=False)
             current.fallback = fb
             current = fb
 
@@ -265,39 +295,7 @@ class StrategyBuilder:
 
         cloned_optimizer = _safe_clone(self._optimizer)
 
-        def _inject(opt):
-            if opt is None:
-                return
-            if self._linear_constraints and hasattr(opt, "linear_constraints"):
-                existing = getattr(opt, "linear_constraints", None) or []
-                merged = list(existing) + [
-                    c for c in self._linear_constraints if c not in existing
-                ]
-                opt.linear_constraints = merged
-
-            if self._groups and hasattr(opt, "groups"):
-                existing_groups = getattr(opt, "groups", None) or {}
-                merged_groups = dict(existing_groups)
-                merged_groups.update(self._groups)
-                opt.groups = merged_groups
-
-            if hasattr(opt, "previous_weights") and self._previous_weights is not None:
-                opt.previous_weights = self._previous_weights
-            if hasattr(opt, "max_turnover") and self._max_turnover is not None:
-                opt.max_turnover = self._max_turnover
-            if (
-                hasattr(opt, "management_fees")
-                and getattr(self, "_management_fees", None) is not None
-            ):
-                opt.management_fees = self._management_fees
-
-            if self.prior is not None and hasattr(opt, "prior_estimator"):
-                opt.prior_estimator = clone(self.prior)
-
-            if hasattr(opt, "fallback") and opt.fallback is not None:
-                _inject(opt.fallback)
-
-        _inject(cloned_optimizer)
+        self._inject_into_estimator(cloned_optimizer)
 
         steps.append(("optimizer", cloned_optimizer))
 
@@ -312,9 +310,11 @@ class StrategyBuilder:
     ) -> NestedClustersOptimization:
         """Assemble a Nested Clusters Optimisation ensemble.
 
-        Constraints are applied to the inner estimator (within-cluster
-        optimisation). The prior (if set) is applied to the outer estimator
-        (cross-cluster capital allocation).
+        Linear group constraints and turnover limits cannot be enforced
+        inside isolated sub-clusters and are rejected. Daily management fees
+        and a compatible prior (e.g. EmpiricalPrior, SyntheticData) are
+        applied to the inner estimator only; the outer estimator receives
+        neither, as it operates on synthetic cluster return series.
 
         Parameters
         ----------
@@ -336,7 +336,10 @@ class StrategyBuilder:
         TypeError
             If inner_estimator or outer_estimator is None.
         ValueError
-            If clusterer is not one of the permitted values.
+            If clusterer is not one of the permitted values, if linear group
+            constraints or turnover limits have been configured (they cannot
+            be enforced inside isolated sub-clusters), or if the prior is a
+            ticker-level view prior (BlackLitterman or EntropyPooling).
         """
         if inner_estimator is None:
             raise TypeError("inner_estimator must not be None.")
@@ -347,14 +350,37 @@ class StrategyBuilder:
         if not isinstance(clusterer, str) or clusterer not in permitted_clusterers:
             raise ValueError(f"clusterer must be one of {permitted_clusterers}")
 
+        if (
+            self._linear_constraints
+            or self._max_turnover is not None
+            or self._previous_weights is not None
+        ):
+            raise ValueError(
+                "Cross-asset linear constraints and turnover limits cannot be enforced "
+                "inside isolated NestedClustersOptimization sub-clusters."
+            )
+
+        from skfolio.prior import BlackLitterman, EntropyPooling
+
+        if self.prior is not None and isinstance(
+            self.prior, (BlackLitterman, EntropyPooling)
+        ):
+            raise ValueError(
+                "Ticker-level view priors (BlackLitterman, EntropyPooling) cannot be "
+                "applied to NestedClustersOptimization because sub-clusters and outer "
+                "cluster allocations do not preserve the full ticker universe."
+            )
+
         cloned_inner = _safe_clone(inner_estimator)
         cloned_outer = _safe_clone(outer_estimator)
 
-        if self.prior is not None:
-            if hasattr(cloned_inner, "prior_estimator"):
-                cloned_inner.prior_estimator = clone(self.prior)
-            if hasattr(cloned_outer, "prior_estimator"):
-                cloned_outer.prior_estimator = clone(self.prior)
+        if self._management_fees is not None and hasattr(
+            cloned_inner, "management_fees"
+        ):
+            cloned_inner.management_fees = dict(self._management_fees)
+
+        if self.prior is not None and hasattr(cloned_inner, "prior_estimator"):
+            cloned_inner.prior_estimator = clone(self.prior)
 
         if clusterer == "kmeans":
             from sklearn.cluster import KMeans

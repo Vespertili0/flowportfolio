@@ -12,6 +12,7 @@ friction.
 
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 
 import numpy as np
@@ -19,7 +20,9 @@ import pandas as pd
 from skfolio import Population
 from skfolio.portfolio import Portfolio
 
-from flowportfolio.core.protocols import UniverseProtocol
+from flowportfolio.core.protocols import UniverseProtocol, is_universe_protocol
+
+logger = logging.getLogger(__name__)
 
 
 class PortfolioDeltaEngine:
@@ -59,7 +62,7 @@ class PortfolioDeltaEngine:
         target_weights: dict[str, float],
     ) -> None:
         # --- type validation ---
-        if not isinstance(universe, UniverseProtocol):
+        if not is_universe_protocol(universe):
             raise TypeError("universe must implement UniverseProtocol.")
         if not isinstance(current_weights, dict):
             raise TypeError("current_weights must be a dict.")
@@ -210,18 +213,28 @@ class PortfolioDeltaEngine:
         df = pd.DataFrame(rows).set_index("group")
         return df
 
-    def calculate_rebalance_delta(self, population: Population | None = None) -> dict:
+    def calculate_rebalance_delta(
+        self,
+        population: Population | None = None,
+        strategy_tag: str | None = None,
+    ) -> dict:
         """Calculate the risk/return delta of holding vs rebalancing.
 
         Evaluates the current physical weights (hold scenario) and the target
         weights (rebalance scenario) across the identical returns evaluation
         window. If an out-of-sample ``Population`` is provided, the evaluation
-        window is aligned to the population's observation period. Computes CVaR,
-        Sharpe ratio, and Max Drawdown for both scenarios.
+        window is aligned to the selected portfolio's observation period
+        (via its ``returns_df`` index). Computes CVaR, Sharpe ratio, and Max
+        Drawdown for both scenarios.
 
-        Note: The ``hold_portfolio`` models a constant-mix portfolio with
-        periodic rebalancing back to initial weights rather than a true
-        un-rebalanced asset drift over time.
+        Note: The ``hold_portfolio`` models an un-rebalanced buy-and-hold
+        portfolio whose weights drift with asset returns
+        (``weight_drift=True``). When the selected out-of-sample portfolio
+        exposes pre-computed metrics, those are used for the rebalance
+        scenario so that no in-sample back-projection of terminal
+        ``target_weights`` is performed. When no population is supplied,
+        ``target_weights`` are evaluated over the full ``universe.returns``,
+        which is an in-sample historical projection and is logged as such.
 
         Parameters
         ----------
@@ -229,6 +242,9 @@ class PortfolioDeltaEngine:
             The out-of-sample population object containing benchmarked strategy
             portfolios. If provided, its observation window is used to evaluate
             both current and target holdings.
+        strategy_tag : str or None, optional
+            Tag of the portfolio within ``population`` to evaluate. If
+            ``None``, the first portfolio in the population is used.
 
         Returns
         -------
@@ -242,8 +258,9 @@ class PortfolioDeltaEngine:
         TypeError
             If ``population`` is not None and not a ``skfolio.Population`` instance.
         ValueError
-            If ``population`` is provided but empty, or if ``universe.returns``
-            has not been populated.
+            If ``population`` is provided but empty, if ``strategy_tag`` matches
+            no portfolio in ``population``, or if ``universe.returns`` has not
+            been populated.
         """
         if population is not None:
             if not isinstance(population, Population):
@@ -253,12 +270,26 @@ class PortfolioDeltaEngine:
 
         # Retrieve universe returns — propagates ValueError if not fetched
         returns: pd.DataFrame = self._universe.returns
-
-        # Determine evaluation returns window
         eval_returns = returns
+        selected_port = None
+
         if population is not None and len(population) > 0:
-            first_port = population[0]
-            port_returns = getattr(first_port, "returns", None)
+            if strategy_tag is not None:
+                matched = [
+                    p for p in population if getattr(p, "tag", None) == strategy_tag
+                ]
+                if not matched:
+                    raise ValueError(
+                        f"No portfolio with tag '{strategy_tag}' found in population."
+                    )
+                selected_port = matched[0]
+            else:
+                selected_port = population[0]
+
+            port_returns = getattr(selected_port, "returns_df", None)
+            if port_returns is None:
+                port_returns = getattr(selected_port, "returns", None)
+
             if isinstance(port_returns, (pd.Series, pd.DataFrame)):
                 if (
                     hasattr(port_returns, "index")
@@ -267,26 +298,57 @@ class PortfolioDeltaEngine:
                     eval_returns = returns.loc[returns.index.isin(port_returns.index)]
                 elif len(port_returns) <= len(returns):
                     eval_returns = returns.iloc[-len(port_returns) :]
+            elif isinstance(port_returns, np.ndarray) and 0 < len(port_returns) <= len(
+                returns
+            ):
+                eval_returns = returns.iloc[-len(port_returns) :]
+        else:
+            logger.warning(
+                "calculate_rebalance_delta() called without an out-of-sample Population; "
+                "evaluating target_weights over full universe.returns is an in-sample projection."
+            )
 
         # Build weight vectors aligned to returns column order
         current_weight_vector = np.array(
-            [self._current_weights.get(col, 0.0) for col in returns.columns],
+            [self._current_weights.get(col, 0.0) for col in eval_returns.columns],
             dtype=float,
         )
         target_weight_vector = np.array(
-            [self._target_weights.get(col, 0.0) for col in returns.columns],
+            [self._target_weights.get(col, 0.0) for col in eval_returns.columns],
             dtype=float,
         )
 
-        # Construct skfolio Portfolio for both scenarios over the identical window
         hold_portfolio = Portfolio(
-            X=eval_returns.to_numpy(),
+            X=eval_returns,
             weights=current_weight_vector,
+            weight_drift=True,
         )
-        rebalance_portfolio = Portfolio(
-            X=eval_returns.to_numpy(),
-            weights=target_weight_vector,
+
+        # Use out-of-sample MultiPeriodPortfolio/Portfolio metrics when available on real skfolio objects
+        has_oos_metrics = (
+            selected_port is not None
+            and getattr(selected_port, "returns_df", None) is not None
+            and getattr(selected_port, "cvar", None) is not None
+            and getattr(selected_port, "sharpe_ratio", None) is not None
+            and getattr(selected_port, "max_drawdown", None) is not None
         )
+        if has_oos_metrics:
+            rebalance_metrics = {
+                "cvar": float(selected_port.cvar),
+                "sharpe": float(selected_port.sharpe_ratio),
+                "max_drawdown": float(selected_port.max_drawdown),
+            }
+        else:
+            rebalance_portfolio = Portfolio(
+                X=eval_returns,
+                weights=target_weight_vector,
+                weight_drift=True,
+            )
+            rebalance_metrics = {
+                "cvar": float(rebalance_portfolio.cvar),
+                "sharpe": float(rebalance_portfolio.sharpe_ratio),
+                "max_drawdown": float(rebalance_portfolio.max_drawdown),
+            }
 
         return {
             "hold": {
@@ -294,11 +356,7 @@ class PortfolioDeltaEngine:
                 "sharpe": float(hold_portfolio.sharpe_ratio),
                 "max_drawdown": float(hold_portfolio.max_drawdown),
             },
-            "rebalance": {
-                "cvar": float(rebalance_portfolio.cvar),
-                "sharpe": float(rebalance_portfolio.sharpe_ratio),
-                "max_drawdown": float(rebalance_portfolio.max_drawdown),
-            },
+            "rebalance": rebalance_metrics,
         }
 
     @staticmethod

@@ -30,19 +30,20 @@ class ConstraintSpec:
     groups : dict[str, list[str]], optional
         Mapping of asset ticker to list of group labels
         (e.g. ``{"AAPL": ["tech"]}``).
-    previous_weights : list[float] | None, optional
-        Previous weights for turnover constraints.
+    previous_weights : dict[str, float] | None, optional
+        Previous weights for turnover constraints, keyed by ticker.
     max_turnover : float | None, optional
         Maximum turnover limit.
-    management_fees : list[float] | None, optional
-        Management fees for each asset.
+    management_fees : dict[str, float] | None, optional
+        Daily-scaled management fees (annual fee divided by 252.0), keyed by
+        ticker so that skfolio can align them by column name.
     """
 
     linear_constraints: list[str] = field(default_factory=list)
     groups: dict[str, list[str]] = field(default_factory=dict)
-    previous_weights: list[float] | None = None
+    previous_weights: dict[str, float] | None = None
     max_turnover: float | None = None
-    management_fees: list[float] | None = None
+    management_fees: dict[str, float] | None = None
 
     def __iter__(self) -> Iterator[str]:
         return iter(self.linear_constraints)
@@ -55,19 +56,6 @@ class ConstraintSpec:
 
     def __contains__(self, item: object) -> bool:
         return item in self.linear_constraints
-
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, ConstraintSpec):
-            return (
-                self.linear_constraints == other.linear_constraints
-                and self.groups == other.groups
-                and self.previous_weights == other.previous_weights
-                and self.max_turnover == other.max_turnover
-                and self.management_fees == other.management_fees
-            )
-        if isinstance(other, list):
-            return self.linear_constraints == other
-        return False
 
 
 class ConstraintBuilder:
@@ -103,7 +91,7 @@ class ConstraintBuilder:
         self._valid_groups: set[str] = set(universe.metadata.values())
         self._constraints: list[str] = []
         self._max_turnover: float | None = None
-        self._previous_weights: list[float] | None = None
+        self._previous_weights: dict[str, float] | None = None
 
     def min_group(self, group_name: str, weight: float) -> ConstraintBuilder:
         """Add a minimum weight constraint for a specific group.
@@ -237,9 +225,9 @@ class ConstraintBuilder:
             raise ValueError(f"Missing current weights for tickers: {missing_tickers}")
 
         self._max_turnover = limit
-        self._previous_weights = [
-            current_weights[ticker] for ticker in self._universe.tickers
-        ]
+        self._previous_weights = {
+            ticker: float(current_weights[ticker]) for ticker in self._universe.tickers
+        }
 
         return self
 
@@ -278,15 +266,22 @@ class ConstraintBuilder:
             if ticker not in groups:
                 groups[ticker] = [val] if isinstance(val, str) else list(val)
 
-        management_fees = None
+        management_fees: dict[str, float] | None = None
         fees = getattr(self._universe, "fees", None)
         if isinstance(fees, dict):
-            management_fees = [float(fees.get(ticker, 0.0)) for ticker in tickers]
+            # Convert annual decimal TER to daily frequency matching universe.returns
+            management_fees = {
+                ticker: float(fees.get(ticker, 0.0)) / 252.0 for ticker in tickers
+            }
 
         return ConstraintSpec(
             linear_constraints=list(self._constraints),
             groups=groups,
-            previous_weights=self._previous_weights,
+            previous_weights=(
+                dict(self._previous_weights)
+                if self._previous_weights is not None
+                else None
+            ),
             max_turnover=self._max_turnover,
             management_fees=management_fees,
         )

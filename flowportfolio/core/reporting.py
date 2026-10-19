@@ -42,6 +42,25 @@ class Reporter:
             raise TypeError("population must be a skfolio.Population instance.")
         self._population = population
 
+    @staticmethod
+    def _unroll_portfolios(portfolios) -> Population:
+        """Unroll MultiPeriodPortfolios into constituent single-period Portfolios with inherited tags."""
+        unrolled = []
+        for p in portfolios:
+            parent_tag = getattr(p, "tag", None)
+            children = getattr(p, "portfolios", None)
+            if isinstance(children, list) and len(children) > 0:
+                for child in children:
+                    if getattr(child, "tag", None) is None and parent_tag is not None:
+                        try:
+                            child.tag = parent_tag
+                        except AttributeError:
+                            pass
+                    unrolled.append(child)
+            else:
+                unrolled.append(p)
+        return Population(unrolled)
+
     def generate_tearsheet(self, baseline_tag: str = "Baseline") -> None:
         """Generate and display the standardised tearsheet plots.
 
@@ -100,21 +119,23 @@ class Reporter:
             Population, with message:
             "Tag '{tag}' matched no portfolios in the population."
         """
-        stress_pop = Population([p for p in self._population if p.tag == stress_tag])
-        if not stress_pop:
+        stress_raw = [
+            p for p in self._population if getattr(p, "tag", None) == stress_tag
+        ]
+        if not stress_raw:
             raise ValueError(
                 f"Tag '{stress_tag}' matched no portfolios in the population."
             )
 
-        baseline_pop = Population(
-            [p for p in self._population if p.tag == baseline_tag]
-        )
-        if not baseline_pop:
+        baseline_raw = [
+            p for p in self._population if getattr(p, "tag", None) == baseline_tag
+        ]
+        if not baseline_raw:
             raise ValueError(
                 f"Tag '{baseline_tag}' matched no portfolios in the population."
             )
 
-        combined = Population([*stress_pop, *baseline_pop])
+        combined = self._unroll_portfolios([*stress_raw, *baseline_raw])
 
         fig1 = combined.boxplot_measure(
             measure=RiskMeasure.CVAR,
@@ -159,21 +180,13 @@ class Reporter:
         if not tag_list:
             raise ValueError("Population contains no tagged portfolios.")
 
-        # baseline_tag is inserted even if absent from the population in original code
-        # The prompt says: "only query tags present in the underlying Population"
         valid_population_tags = {
             p.tag for p in self._population if getattr(p, "tag", None) is not None
         }
         if baseline_tag not in tag_list and baseline_tag in valid_population_tags:
             tag_list.insert(0, baseline_tag)
 
-        unrolled = []
-        for p in self._population:
-            if hasattr(p, "portfolios"):
-                unrolled.extend(p.portfolios)
-            else:
-                unrolled.append(p)
-        unrolled_population = Population(unrolled)
+        unrolled_population = self._unroll_portfolios(self._population)
 
         fig1 = unrolled_population.boxplot_measure(
             measure=RatioMeasure.CVAR_RATIO,
@@ -187,7 +200,7 @@ class Reporter:
 
         best_tag = self._best_tag_by_median_cvar(tag_list)
 
-        best_portfolios = Population(
+        best_portfolios = self._unroll_portfolios(
             [p for p in self._population if getattr(p, "tag", None) == best_tag]
         )
         fig3 = best_portfolios.plot_composition()
@@ -270,41 +283,49 @@ class Reporter:
 
         best_portfolio = max(best_portfolios, key=_get_cvar_ratio)
 
-        weights = getattr(best_portfolio, "weights", None)
-        assets = getattr(best_portfolio, "assets", None)
-        if weights is None and hasattr(best_portfolio, "portfolios"):
+        # Resolve the terminal single-period portfolio of a MultiPeriodPortfolio
+        target_port = best_portfolio
+        if hasattr(best_portfolio, "portfolios"):
             portfolios = getattr(best_portfolio, "portfolios", None)
             if isinstance(portfolios, list) and len(portfolios) > 0:
-                terminal_portfolio = portfolios[-1]
-                weights = getattr(terminal_portfolio, "weights", None)
-                assets = getattr(terminal_portfolio, "assets", None)
+                target_port = portfolios[-1]
 
-        if weights is None or len(weights) == 0:
-            top_holdings = "N/A (No weights available)"
+        def _is_valid_weight(w: object) -> bool:
+            if w is None:
+                return False
+            try:
+                return not np.isnan(float(w))  # type: ignore[arg-type]
+            except (ValueError, TypeError):
+                return False
+
+        weights_dict = getattr(target_port, "weights_dict", None)
+        if isinstance(weights_dict, dict) and len(weights_dict) > 0:
+            asset_weights = [
+                (str(asset), float(w))
+                for asset, w in weights_dict.items()
+                if _is_valid_weight(w)
+            ]
         else:
+            weights = getattr(target_port, "weights", None)
+            assets = getattr(
+                target_port, "assets_names", getattr(target_port, "assets", None)
+            )
+            if weights is None or len(weights) == 0:
+                return best_tag, "N/A (No weights available)"
             if assets is None or len(assets) != len(weights):
                 assets = [f"Asset_{i}" for i in range(len(weights))]
-
-            def _is_valid_weight(w: object) -> bool:
-                if w is None:
-                    return False
-                try:
-                    return not np.isnan(float(w))  # type: ignore[arg-type]
-                except (ValueError, TypeError):
-                    return False
-
             asset_weights = [
-                (aw[0], float(aw[1]))
+                (str(aw[0]), float(aw[1]))
                 for aw in zip(assets, weights)
                 if _is_valid_weight(aw[1])
             ]
+
+        if not asset_weights:
+            top_holdings = "N/A (All weights zero or NaN)"
+        else:
             asset_weights.sort(key=lambda x: abs(x[1]), reverse=True)
             top_5 = asset_weights[:5]
-
-            if not top_5:
-                top_holdings = "N/A (All weights zero or NaN)"
-            else:
-                top_holdings = ", ".join(f"{asset!s} ({w:.2%})" for asset, w in top_5)
+            top_holdings = ", ".join(f"{asset!s} ({w:.2%})" for asset, w in top_5)
 
         return best_tag, top_holdings
 
@@ -384,13 +405,14 @@ class Reporter:
     def _best_tag_by_median_cvar(self, tag_list: list[str]) -> str:
         import collections
 
+        unrolled_pop = self._unroll_portfolios(self._population)
         tag_to_cvar = collections.defaultdict(list)
-        for p in self._population:
+        for p in unrolled_pop:
             tag = getattr(p, "tag", None)
             if tag is not None and tag in tag_list:
                 cvar_ratio = getattr(p, "cvar_ratio", None)
                 if cvar_ratio is not None and not np.isnan(cvar_ratio):
-                    tag_to_cvar[tag].append(cvar_ratio)
+                    tag_to_cvar[tag].append(float(cvar_ratio))
 
         valid_tags = list(tag_to_cvar.keys())
         if not valid_tags:

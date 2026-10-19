@@ -8,12 +8,16 @@ computation via ``skfolio``'s canonical preprocessing pipeline.
 
 from __future__ import annotations
 
+import logging
+
 import pandas as pd
 from skfolio.preprocessing import prices_to_returns
 
 from flowportfolio.core.data import DataProviderProtocol, YFinanceProvider
 from flowportfolio.core.protocols import UniverseProtocol  # noqa: F401
 from flowportfolio.core.validation import validate_fee
+
+logger = logging.getLogger(__name__)
 
 
 class DataFetchError(Exception):
@@ -197,6 +201,10 @@ class Universe:
         afterwards to remove those NaNs and align all assets to a common
         start date.
 
+        Intermediate cross-exchange holiday gaps (``NaN`` prices occurring
+        after an asset's inception) are forward-filled before returns are
+        computed; leading pre-inception ``NaN`` values are left untouched.
+
         Parameters
         ----------
         start : str, optional
@@ -256,8 +264,9 @@ class Universe:
         if missing_tickers:
             raise ValueError(f"Download did not return data for: {missing_tickers}")
 
-        # Reorder columns to match the original tickers ordering.
-        prices = prices[self._tickers]
+        # Reorder columns to match the original tickers ordering and forward-fill
+        # intermediate cross-exchange holiday gaps (leading pre-inception NaNs remain NaN).
+        prices = prices[self._tickers].ffill()
 
         # Store raw prices. These are preserved across anchor_history calls
         # so that state can be fully reset by re-calling fetch_data().
@@ -295,15 +304,29 @@ class Universe:
         if self._returns is None:
             raise ValueError("Returns are not available. Call fetch_data() first.")
 
-        first_valid_indices = []
+        first_valid_map: dict[str, pd.Timestamp] = {}
         for col in self._returns.columns:
             fvi = self._returns[col].first_valid_index()
             if fvi is None:
                 raise ValueError(f"Asset '{col}' has no valid return observations.")
-            first_valid_indices.append(fvi)
+            first_valid_map[col] = fvi
 
-        latest_start = max(first_valid_indices)
+        bottleneck_ticker = max(first_valid_map, key=lambda k: first_valid_map[k])
+        latest_start = first_valid_map[bottleneck_ticker]
+        total_rows = len(self._returns)
         anchored = self._returns.loc[latest_start:]
+        dropped_rows = total_rows - len(anchored)
+
+        if total_rows > 0 and (dropped_rows / total_rows) > 0.20:
+            logger.warning(
+                "anchor_history() dropped %d of %d rows (%.1f%% of history) due to "
+                "bottleneck ticker '%s' (first valid observation: %s).",
+                dropped_rows,
+                total_rows,
+                (dropped_rows / total_rows) * 100.0,
+                bottleneck_ticker,
+                latest_start,
+            )
 
         # A second pass catches the edge case where two assets' histories
         # are fully disjoint: one asset's entire history predates the

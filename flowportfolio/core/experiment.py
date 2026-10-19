@@ -56,11 +56,9 @@ class PortfolioExperimentEngine:
         universe: UniverseProtocol,
         n_jobs: int = -1,
     ) -> None:
-        try:
-            valid = isinstance(universe, UniverseProtocol)
-        except Exception:  # noqa: BLE001
-            valid = True
-        if not valid:
+        from flowportfolio.core.protocols import is_universe_protocol
+
+        if not is_universe_protocol(universe):
             raise TypeError("universe must implement UniverseProtocol.")
         self._universe = universe
         self._n_jobs = n_jobs
@@ -274,10 +272,25 @@ class PortfolioExperimentEngine:
 
         # 3. Process each strategy
         collected = []
+        equal_weights = {col: 1.0 / len(returns.columns) for col in returns.columns}
         for name, config in self._strategies.items():
+            est_clone = clone(config["estimator"])
+            target_opt = (
+                est_clone.steps[-1][1]
+                if hasattr(est_clone, "steps") and est_clone.steps
+                else est_clone
+            )
+            # Prevent present-day physical weights from contaminating historical fold 0
+            # while keeping turnover constraints active across sequential walk-forward folds.
+            if (
+                getattr(target_opt, "max_turnover", None) is not None
+                and getattr(target_opt, "previous_weights", None) is not None
+            ):
+                target_opt.previous_weights = dict(equal_weights)
+
             # a. Hyperparameter search
             search = GridSearchCV(
-                estimator=config["estimator"],
+                estimator=est_clone,
                 param_grid=config["grid"],
                 cv=inner_cv,
                 scoring=make_scorer(RatioMeasure.CVAR_RATIO),
@@ -335,8 +348,13 @@ class PortfolioExperimentEngine:
         Raises
         ------
         ValueError
-            If cv_type is not one of the three permitted string values, or if
-            returns is shorter than burn_in_size.
+            If cv_type is not one of the three permitted string values, if
+            returns is shorter than burn_in_size, or if a registered strategy
+            is a multi-step Pipeline (pre-selection steps are unsupported by
+            online learning).
+        TypeError
+            If a registered strategy uses a batch prior that does not
+            implement ``partial_fit``.
         RuntimeError
             If no strategies have been registered via add_strategy().
         """
@@ -372,11 +390,47 @@ class PortfolioExperimentEngine:
 
         cv = self._resolve_cv_splitter(cv_type, **resolved_cv_kwargs)
 
+        online_predict_keys = {
+            "test_size",
+            "freq",
+            "freq_offset",
+            "previous",
+            "purged_size",
+            "params",
+        }
+        predict_kwargs = {
+            k: v for k, v in cv_kwargs.items() if k in online_predict_keys
+        }
+
         collected = []
         for name, config in self._strategies.items():
+            est = clone(config["estimator"])
+            grid = dict(config["grid"])
+
+            if hasattr(est, "steps"):
+                if len(est.steps) > 1:
+                    raise ValueError(
+                        f"Strategy '{name}' contains pipeline pre-selection steps, which "
+                        "are not supported by skfolio online_predict/OnlineGridSearch."
+                    )
+                est = est.steps[-1][1]
+                grid = {
+                    (k.split("__", 1)[1] if k.startswith("optimizer__") else k): v
+                    for k, v in grid.items()
+                }
+
+            prior_est = getattr(est, "prior_estimator", None)
+            if prior_est is not None and not hasattr(prior_est, "partial_fit"):
+                raise TypeError(
+                    f"Strategy '{name}' uses batch prior '{type(prior_est).__name__}', "
+                    "which does not implement partial_fit(). Use an online prior "
+                    "(e.g., EmpiricalPrior(mu_estimator=EWMu(), covariance_estimator=EWCovariance())) "
+                    "or use run_robustness_test() for batch cross-validation."
+                )
+
             search = OnlineGridSearch(
-                estimator=config["estimator"],
-                param_grid=config["grid"],
+                estimator=est,
+                param_grid=grid,
                 cv=cv,
                 scoring=make_scorer(RatioMeasure.CVAR_RATIO),
                 refit=True,
@@ -390,6 +444,7 @@ class PortfolioExperimentEngine:
                 returns,
                 warmup_size=burn_in_size,
                 portfolio_params={"tag": name},
+                **predict_kwargs,
             )
 
             if type(portfolio).__name__ == "Population" or isinstance(portfolio, list):
