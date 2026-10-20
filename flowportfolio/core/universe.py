@@ -119,6 +119,9 @@ class Universe:
         # Daily returns derived from _prices via prices_to_returns.
         # anchor_history() slices this in place.
         self._returns: pd.DataFrame | None = None
+        # Last genuine (un-forward-filled) price date per ticker, recorded by
+        # fetch_data() and consumed by anchor_history().
+        self._raw_last_valid: dict[str, pd.Timestamp | None] = {}
 
     # ------------------------------------------------------------------
     # Public properties
@@ -188,6 +191,7 @@ class Universe:
         start: str | None = None,
         end: str | None = None,
         data_provider: DataProviderProtocol | None = None,
+        max_ffill_days: int | None = 5,
     ) -> None:
         """Download adjusted close prices and compute daily returns.
 
@@ -202,7 +206,8 @@ class Universe:
         start date.
 
         Intermediate cross-exchange holiday gaps (``NaN`` prices occurring
-        after an asset's inception) are forward-filled before returns are
+        after an asset's inception) are forward-filled, up to
+        ``max_ffill_days`` consecutive observations, before returns are
         computed; leading pre-inception ``NaN`` values are left untouched.
 
         Parameters
@@ -215,6 +220,10 @@ class Universe:
             If ``None``, retrieves data up to and including the current date.
         data_provider : DataProviderProtocol, optional
             The data provider to fetch data. Defaults to YFinanceProvider.
+        max_ffill_days : int or None, default 5
+            Maximum number of consecutive missing price observations that are
+            forward-filled across holidays or halts. ``None`` forward-fills
+            without a limit; ``0`` disables forward-filling.
 
         Raises
         ------
@@ -223,9 +232,17 @@ class Universe:
         ValueError
             If no data is returned, if the downloaded data is missing the
             ``"Close"`` price level, if any requested ticker is absent from
-            the downloaded data, or if the resulting returns DataFrame is
-            empty.
+            the downloaded data, if the resulting returns DataFrame is
+            empty, or if ``max_ffill_days`` is not a non-negative integer or
+            ``None``.
         """
+        if max_ffill_days is not None and (
+            not isinstance(max_ffill_days, int)
+            or isinstance(max_ffill_days, bool)
+            or max_ffill_days < 0
+        ):
+            raise ValueError("max_ffill_days must be a non-negative integer or None.")
+
         if data_provider is None:
             data_provider = YFinanceProvider()
 
@@ -264,9 +281,23 @@ class Universe:
         if missing_tickers:
             raise ValueError(f"Download did not return data for: {missing_tickers}")
 
-        # Reorder columns to match the original tickers ordering and forward-fill
-        # intermediate cross-exchange holiday gaps (leading pre-inception NaNs remain NaN).
-        prices = prices[self._tickers].ffill()
+        # Reorder columns to match the original tickers ordering. Record each
+        # ticker's last genuine price date before any forward-filling so that
+        # anchor_history() can detect histories that ended before the common start.
+        raw_prices = prices[self._tickers]
+        self._raw_last_valid = {
+            col: raw_prices[col].last_valid_index() for col in self._tickers
+        }
+
+        # Forward-fill intermediate cross-exchange holiday gaps. The fill is
+        # bounded by ``max_ffill_days`` so that delisted or halted assets do not
+        # accumulate fabricated 0.0 returns. Leading pre-inception NaNs remain NaN.
+        if max_ffill_days is None:
+            prices = raw_prices.ffill()
+        elif max_ffill_days > 0:
+            prices = raw_prices.ffill(limit=max_ffill_days)
+        else:
+            prices = raw_prices.copy()
 
         # Store raw prices. These are preserved across anchor_history calls
         # so that state can be fully reset by re-calling fetch_data().
@@ -297,9 +328,11 @@ class Universe:
         ------
         ValueError
             If ``fetch_data()`` has not been called yet, if any asset has
-            no valid return observations whatsoever, or if any asset has
-            no valid returns after the alignment cut — indicating fully
-            disjoint trading histories.
+            no valid return observations whatsoever, if any asset has no
+            valid returns after the alignment cut (fully disjoint trading
+            histories), or if any asset contains ``NaN`` returns after the
+            alignment cut (a delisting or trading halt exceeding
+            ``max_ffill_days``).
         """
         if self._returns is None:
             raise ValueError("Returns are not available. Call fetch_data() first.")
@@ -328,14 +361,27 @@ class Universe:
                 latest_start,
             )
 
-        # A second pass catches the edge case where two assets' histories
-        # are fully disjoint: one asset's entire history predates the
-        # other's, leaving it entirely NaN after slicing.
+        # Disjoint / delisted-asset guards. ``_raw_last_valid`` records each
+        # ticker's last genuine (un-forward-filled) price date so that bounded
+        # forward-filling cannot mask an asset whose history ended before the
+        # common start date.
         for col in anchored.columns:
+            raw_last = self._raw_last_valid.get(col)
+            if raw_last is not None and raw_last < latest_start:
+                raise ValueError(
+                    f"Asset '{col}' has no valid returns after alignment. "
+                    "Trading histories may be fully disjoint."
+                )
             if anchored[col].first_valid_index() is None:
                 raise ValueError(
                     f"Asset '{col}' has no valid returns after alignment. "
                     "Trading histories may be fully disjoint."
+                )
+            if anchored[col].isna().any():
+                raise ValueError(
+                    f"Asset '{col}' contains NaN return observations after "
+                    f"{latest_start} (possible delisting or trading halt exceeding "
+                    "max_ffill_days)."
                 )
 
         self._returns = anchored

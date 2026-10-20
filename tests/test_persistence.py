@@ -280,3 +280,27 @@ def test_load_snapshot_os_error(manager, tmp_path, monkeypatch):
         RuntimeError, match=re.escape(f"Failed to read snapshot from {filepath!s}")
     ):
         manager.load_snapshot(str(filepath))
+
+
+def test_persistence_sanitizes_inf_and_loads_custom_labels(
+    manager, dummy_population, tmp_path
+):
+    """Verify sanitisation of Inf and loading of snapshots with custom labels."""
+    sanitized = manager._sanitize_nans(
+        {"sharpe": float("inf"), "cvar": float("-inf"), "np_val": np.float64(np.nan)}
+    )
+    assert sanitized["sharpe"] is None
+    assert sanitized["cvar"] is None
+    assert sanitized["np_val"] is None
+
+    custom_path = manager.export_gitops_artifact(
+        dummy_population, str(tmp_path), label="custom_audit_run"
+    )
+    assert Path(custom_path).exists()
+
+    with pytest.raises(ValueError, match="No rebalance_*.json snapshots found"):
+        manager.calculate_trajectory_history(str(tmp_path), include_custom_labels=False)
+
+    df = manager.calculate_trajectory_history(str(tmp_path), include_custom_labels=True)
+    assert len(df) == 2
+    assert "A" in df.columns

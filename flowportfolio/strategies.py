@@ -86,6 +86,10 @@ class StrategyBuilder:
     @constraints.setter
     def constraints(self, value: list[str] | ConstraintSpec | None) -> None:
         self._apply_constraints(value)
+        # Re-wire from the clean template so that earlier constraints do not
+        # accumulate on an already-injected optimizer.
+        if getattr(self, "_raw_optimizer", None) is not None:
+            self._optimizer = self._wire_from_raw(include_prior=False)
 
     def __init__(
         self,
@@ -100,6 +104,8 @@ class StrategyBuilder:
         self.prior = prior
         self._pre_selection: list = []
         self._optimizer = None
+        self._raw_optimizer = None
+        self._raw_fallbacks: list = []
         self._fallback = None
         self._fallbacks: list = []
 
@@ -178,6 +184,28 @@ class StrategyBuilder:
         if hasattr(opt, "fallback") and opt.fallback is not None:
             self._inject_into_estimator(opt.fallback, include_prior=include_prior)
 
+    def _wire_from_raw(self, include_prior: bool):
+        """Clone the clean optimizer template, wire fallbacks and inject config.
+
+        Parameters
+        ----------
+        include_prior : bool
+            Whether to inject a clone of ``self.prior`` into each estimator.
+
+        Returns
+        -------
+        skfolio optimizer
+            A freshly cloned and fully configured optimizer chain.
+        """
+        wired = _safe_clone(self._raw_optimizer)
+        current = wired
+        for fb in self._raw_fallbacks:
+            cloned_fb = _safe_clone(fb)
+            current.fallback = cloned_fb
+            current = cloned_fb
+        self._inject_into_estimator(wired, include_prior=include_prior)
+        return wired
+
     def set_optimizer(
         self,
         optimizer,
@@ -221,20 +249,23 @@ class StrategyBuilder:
         if fallbacks is not None:
             fbs.extend(fallbacks)
 
-        self._optimizer = _safe_clone(optimizer)
-        self._fallbacks = [_safe_clone(f) for f in fbs]
+        raw_optimizer = _safe_clone(optimizer)
+        raw_fallbacks = [_safe_clone(f) for f in fbs]
 
-        self._inject_into_estimator(self._optimizer, include_prior=False)
-
-        current = self._optimizer
-        for fb in self._fallbacks:
+        current = raw_optimizer
+        for fb in raw_fallbacks:
             if current is None or not hasattr(current, "fallback"):
                 raise TypeError(
                     "The provided optimizer does not support fallback semantics."
                 )
-            self._inject_into_estimator(fb, include_prior=False)
-            current.fallback = fb
             current = fb
+
+        # Keep clean templates; the wired working copy is rebuilt from them
+        # whenever the constraints are reassigned or the pipeline is built.
+        self._raw_optimizer = raw_optimizer
+        self._raw_fallbacks = raw_fallbacks
+        self._fallbacks = list(raw_fallbacks)
+        self._optimizer = self._wire_from_raw(include_prior=False)
 
         return self
 
@@ -260,6 +291,8 @@ class StrategyBuilder:
         """
         self._pre_selection = []
         self._optimizer = None
+        self._raw_optimizer = None
+        self._raw_fallbacks = []
         self._fallback = None
         self._fallbacks = []
         if clear_base_config:
@@ -291,11 +324,15 @@ class StrategyBuilder:
 
         steps = []
         for i, transformer in enumerate(self._pre_selection):
-            steps.append((f"pre_{i}", _safe_clone(transformer)))
+            cloned_tr = _safe_clone(transformer)
+            if hasattr(cloned_tr, "set_output"):
+                try:
+                    cloned_tr.set_output(transform="pandas")
+                except Exception:  # noqa: BLE001
+                    pass
+            steps.append((f"pre_{i}", cloned_tr))
 
-        cloned_optimizer = _safe_clone(self._optimizer)
-
-        self._inject_into_estimator(cloned_optimizer)
+        cloned_optimizer = self._wire_from_raw(include_prior=True)
 
         steps.append(("optimizer", cloned_optimizer))
 
@@ -393,8 +430,17 @@ class StrategyBuilder:
                 linkage_method=LinkageMethod(clusterer)
             )
 
-        return NestedClustersOptimization(
-            inner_estimator=cloned_inner,
-            outer_estimator=cloned_outer,
-            clustering_estimator=clustering_estimator,
-        )
+        nco_kwargs: dict[str, object] = {
+            "inner_estimator": cloned_inner,
+            "outer_estimator": cloned_outer,
+            "clustering_estimator": clustering_estimator,
+        }
+        if self._management_fees is not None:
+            # Fees are never injected into the outer estimator (it operates on
+            # cluster-level series); they are applied when evaluating the
+            # resulting out-of-sample Portfolio.
+            nco_kwargs["portfolio_params"] = {
+                "management_fees": dict(self._management_fees)
+            }
+
+        return NestedClustersOptimization(**nco_kwargs)

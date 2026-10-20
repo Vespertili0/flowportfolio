@@ -124,7 +124,7 @@ def test_max_turnover_output(stub_universe: Universe) -> None:
     result = builder.max_turnover(limit=0.1, current_weights=current_weights).build()
 
     assert result.max_turnover == 0.1
-    assert result.previous_weights == [0.4, 0.4, 0.2]
+    assert result.previous_weights == {"A": 0.4, "B": 0.4, "C": 0.2}
 
 
 def test_max_turnover_clamping(stub_universe: Universe) -> None:
@@ -134,7 +134,7 @@ def test_max_turnover_clamping(stub_universe: Universe) -> None:
     result = builder.max_turnover(limit=0.1, current_weights=current_weights).build()
 
     assert result.max_turnover == 0.1
-    assert result.previous_weights == [0.95, 0.0, 0.05]
+    assert result.previous_weights == {"A": 0.95, "B": 0.0, "C": 0.05}
 
 
 def test_max_turnover_invalid_limit(stub_universe: Universe) -> None:
@@ -282,3 +282,21 @@ def test_constraint_spec_equality_all_fields() -> None:
     assert s1 != s2
     assert s1 == s3
     assert s1 == ["A >= 0.5"]
+
+
+def test_constraint_spec_equals_list_and_validates_turnover_weights() -> None:
+    """Verify ConstraintSpec list equality and negative/invalid weight rejection in turnover."""
+    from flowportfolio.core.universe import Universe
+
+    spec = ConstraintSpec(linear_constraints=["core >= 0.4"])
+    assert spec == ["core >= 0.4"]
+
+    u = MagicMock(spec=Universe)
+    u.tickers = ["SPY", "TLT"]
+    u.metadata = {"SPY": "core", "TLT": "satellite"}
+    u.fees = {"SPY": 0.0003, "TLT": 0.0015}
+    u.returns = pd.DataFrame()
+    builder = ConstraintBuilder(u)
+
+    with pytest.raises(ValueError, match="Weight must be between 0.0 and 1.0"):
+        builder.max_turnover(0.2, {"SPY": -0.5, "TLT": 1.5})

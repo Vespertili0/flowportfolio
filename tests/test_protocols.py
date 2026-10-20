@@ -96,3 +96,24 @@ def test_validate_weight_and_fee_nan() -> None:
 
     with pytest.raises(ValueError, match="between 0.0 and 1.0"):
         validate_fee(float("nan"))
+
+
+def test_is_universe_protocol_fees_dict_check() -> None:
+    """Verify is_universe_protocol requires fees to be a dictionary."""
+    from flowportfolio.core.protocols import is_universe_protocol
+
+    class ValidObj:
+        tickers = ["A"]
+        metadata = {"A": "core"}
+        fees = {"A": 0.001}
+        returns = pd.DataFrame()
+
+    assert is_universe_protocol(ValidObj()) is True
+
+    class NonDictFees:
+        tickers = ["A"]
+        metadata = {"A": "core"}
+        fees = [0.001]
+        returns = pd.DataFrame()
+
+    assert is_universe_protocol(NonDictFees()) is False

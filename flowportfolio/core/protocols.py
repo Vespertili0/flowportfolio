@@ -68,6 +68,8 @@ def is_universe_protocol(obj: object) -> bool:
     )
     if not has_returns:
         return False
-    return isinstance(getattr(obj, "tickers", None), list) and isinstance(
-        getattr(obj, "metadata", None), dict
+    return (
+        isinstance(getattr(obj, "tickers", None), list)
+        and isinstance(getattr(obj, "metadata", None), dict)
+        and isinstance(getattr(obj, "fees", None), dict)
     )

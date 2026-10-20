@@ -12,6 +12,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 from flowportfolio.core.protocols import UniverseProtocol
+from flowportfolio.core.validation import validate_weight
 
 
 @dataclass(frozen=True)
@@ -56,6 +57,19 @@ class ConstraintSpec:
 
     def __contains__(self, item: object) -> bool:
         return item in self.linear_constraints
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, ConstraintSpec):
+            return (
+                self.linear_constraints == other.linear_constraints
+                and self.groups == other.groups
+                and self.previous_weights == other.previous_weights
+                and self.max_turnover == other.max_turnover
+                and self.management_fees == other.management_fees
+            )
+        if isinstance(other, list):
+            return self.linear_constraints == other
+        return NotImplemented
 
 
 class ConstraintBuilder:
@@ -118,8 +132,7 @@ class ConstraintBuilder:
             raise ValueError(f"Invalid group name: '{group_name}'")
         if group_name not in self._valid_groups:
             raise ValueError(f"Group '{group_name}' not found in universe metadata.")
-        if not (0.0 <= weight <= 1.0):
-            raise ValueError(f"Weight must be between 0.0 and 1.0, got {weight}")
+        validate_weight(weight)
         self._constraints.append(f"{group_name} >= {weight:.6g}")
         return self
 
@@ -148,8 +161,7 @@ class ConstraintBuilder:
             raise ValueError(f"Invalid group name: '{group_name}'")
         if group_name not in self._valid_groups:
             raise ValueError(f"Group '{group_name}' not found in universe metadata.")
-        if not (0.0 <= weight <= 1.0):
-            raise ValueError(f"Weight must be between 0.0 and 1.0, got {weight}")
+        validate_weight(weight)
         self._constraints.append(f"{group_name} <= {weight:.6g}")
         return self
 
@@ -182,8 +194,7 @@ class ConstraintBuilder:
             if group not in self._valid_groups:
                 raise ValueError(f"Group '{group}' not found in universe metadata.")
 
-        if not (0.0 <= weight <= 1.0):
-            raise ValueError(f"Weight must be between 0.0 and 1.0, got {weight}")
+        validate_weight(weight)
 
         combined_str = " + ".join(group_names)
         self._constraints.append(f"{combined_str} <= {weight:.6g}")
@@ -217,12 +228,19 @@ class ConstraintBuilder:
             If the limit is not strictly between 0.0 and 1.0, or if any ticker
             in the universe is missing from current_weights.
         """
-        if not (0.0 < limit <= 1.0):
+        if (
+            not isinstance(limit, (int, float))
+            or isinstance(limit, bool)
+            or not (0.0 < float(limit) <= 1.0)
+        ):
             raise ValueError("Turnover limit must be between 0.0 (exclusive) and 1.0.")
 
         missing_tickers = set(self._universe.tickers) - set(current_weights.keys())
         if missing_tickers:
             raise ValueError(f"Missing current weights for tickers: {missing_tickers}")
+
+        for ticker in self._universe.tickers:
+            validate_weight(current_weights[ticker])
 
         self._max_turnover = limit
         self._previous_weights = {

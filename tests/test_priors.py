@@ -21,6 +21,9 @@ def stub_universe() -> Universe:
     # A simple mock object mimicking Universe
     u = MagicMock(spec=Universe)
     u.tickers = ["AAPL", "MSFT"]
+    u.metadata = {"AAPL": "tech", "MSFT": "tech"}
+    u.fees = {"AAPL": 0.001, "MSFT": 0.001}
+    u.returns = MagicMock()
     return u
 
 
@@ -87,13 +90,13 @@ def test_build_black_litterman_prior_success(mock_bl, stub_universe):
     mock_bl.return_value = mock_instance
 
     synthesiser = PriorSynthesiser(universe=stub_universe)
-    synthesiser.add_market_view("AAPL >= 0.05", confidence=0.8)
+    synthesiser.add_market_view("AAPL == 0.05", confidence=0.8)
 
     prior = synthesiser.build_black_litterman_prior(tau=0.05)
 
     assert prior is mock_instance
     mock_bl.assert_called_once_with(
-        views=["AAPL >= 0.0001984126984126984"],
+        views=["AAPL == 0.0001984126984126984"],
         tau=0.05,
         view_confidences=[0.8],
         groups=None,
@@ -122,6 +125,33 @@ def test_build_synthetic_prior_raises_value_error(stub_universe):
 def test_add_market_view_ticker_with_digits():
     u = MagicMock(spec=Universe)
     u.tickers = ["SP500", "TLT20"]
+    u.metadata = {"SP500": "equity", "TLT20": "bonds"}
+    u.fees = {"SP500": 0.0003, "TLT20": 0.0015}
+    u.returns = MagicMock()
     synthesiser = PriorSynthesiser(universe=u)
     synthesiser.add_market_view("SP500 >= 0.05", confidence=0.8)
     assert synthesiser._views[0]["view"].startswith("SP500 >=")
+
+
+def test_relative_view_without_spaces_and_bl_inequality_rejection():
+    u = MagicMock(spec=Universe)
+    u.tickers = ["SPY", "TLT"]
+    u.metadata = {"SPY": "equity", "TLT": "bonds"}
+    u.fees = {"SPY": 0.0003, "TLT": 0.0015}
+    u.returns = MagicMock()
+
+    synth = PriorSynthesiser(universe=u)
+    synth.add_market_view("SPY-TLT == 0.02", 0.8)
+    assert len(synth._views) == 1
+
+    synth_bl = PriorSynthesiser(universe=u)
+    synth_bl.add_market_view("SPY >= 0.05", 0.8)
+    with pytest.raises(ValueError, match="BlackLitterman only supports linear equality views"):
+        synth_bl.build_black_litterman_prior()
+
+    synth_ep = PriorSynthesiser(universe=u)
+    synth_ep.add_market_view("SPY >= TLT", 1.0)
+    with patch("flowportfolio.priors.EntropyPooling") as mock_ep:
+        mock_ep.return_value = MagicMock()
+        prior = synth_ep.build_entropy_prior()
+        assert prior is not None

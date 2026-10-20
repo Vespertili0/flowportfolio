@@ -522,3 +522,28 @@ def test_to_markdown_artifact_multi_period_portfolio() -> None:
     report = reporter.to_markdown_artifact()
     assert "AAPL (60.00%)" in report
     assert "MSFT (40.00%)" in report
+
+
+def test_reporter_consistent_trajectory_cvar_and_no_tag_mutation() -> None:
+    """Verify _best_tag_by_median_cvar granularity and immutability of child tags during unrolling."""
+    df = pd.DataFrame(np.random.randn(20, 2) / 100, columns=["SPY", "TLT"])
+    child1 = Portfolio(X=df.iloc[:10], weights=np.array([0.5, 0.5]), name="c1")
+    child2 = Portfolio(X=df.iloc[10:], weights=np.array([0.6, 0.4]), name="c2")
+    assert getattr(child1, "tag", None) is None
+    assert getattr(child2, "tag", None) is None
+
+    mp = MultiPeriodPortfolio(portfolios=[child1, child2], tag="StratA")
+    pop = Population([mp])
+
+    reporter = Reporter(pop)
+    unrolled = reporter._unroll_portfolios(pop)
+
+    # Verify original child portfolios were not mutated
+    assert getattr(child1, "tag", None) is None
+    assert getattr(child2, "tag", None) is None
+    # Verify unrolled clones inherited tag
+    assert unrolled[0].tag == "StratA"
+    assert unrolled[1].tag == "StratA"
+
+    best_tag = reporter._best_tag_by_median_cvar(["StratA"])
+    assert best_tag == "StratA"

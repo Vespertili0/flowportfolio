@@ -99,7 +99,7 @@ def test_build_pipeline_ordering_and_prior_injection():
 
 
 def test_build_nco_clustering_dispatch_and_no_mutation():
-    builder = StrategyBuilder(constraints=["A >= 0.1"])
+    builder = StrategyBuilder()
 
     inner = MeanRisk()
     outer = MeanRisk()
@@ -107,29 +107,26 @@ def test_build_nco_clustering_dispatch_and_no_mutation():
     nco = builder.build_nco(inner, outer, clusterer="kmeans")
     assert isinstance(nco, NestedClustersOptimization)
 
-    # Check injection
-
     # Check invalid clusterer
     with pytest.raises(ValueError, match="clusterer must be one of"):
         builder.build_nco(inner, outer, clusterer="invalid")
 
 
 def test_build_nco_does_not_mutate_estimators():
-    builder = StrategyBuilder(constraints=["constraint1"])
+    prior = EmpiricalPrior()
+    builder = StrategyBuilder(prior=prior)
 
     inner = MeanRisk()
     outer = HierarchicalRiskParity()
 
     builder.build_nco(inner, outer)
 
-    # Original inner should not have constraints
+    # Original inner should not have prior injected
     assert (
-        not hasattr(inner, "linear_constraints")
-        or inner.linear_constraints is None
-        or inner.linear_constraints != ["constraint1"]
+        not hasattr(inner, "prior_estimator")
+        or inner.prior_estimator is None
+        or inner.prior_estimator is not prior
     )
-
-    # Original inner shouldn't
 
 
 def test_build_nco_raises_type_error_if_none():
@@ -260,7 +257,28 @@ def test_build_nco_binds_groups_and_merges_constraints():
         groups={"A": ["core"], "B": ["satellite"]},
     )
     builder = StrategyBuilder(constraints=spec)
-    inner = MeanRisk(linear_constraints=["inner_exist <= 0.1"])
+    inner = MeanRisk()
     outer = MeanRisk()
 
-    builder.build_nco(inner, outer)
+    with pytest.raises(
+        ValueError,
+        match="Cross-asset linear constraints and turnover limits cannot be enforced",
+    ):
+        builder.build_nco(inner, outer)
+
+
+def test_constraints_reassignment_replaces_not_accumulates():
+    builder = StrategyBuilder(constraints=["old_constraint >= 0.1"])
+    builder.set_optimizer(MeanRisk())
+    builder.constraints = ["core <= 0.5"]
+
+    pipeline = builder.build_pipeline()
+    pipeline_opt = pipeline.steps[-1][1]
+    assert pipeline_opt.linear_constraints == ["core <= 0.5"]
+
+    # Verify build_nco populates portfolio_params["management_fees"] when fees present
+    fee_spec = ConstraintSpec(management_fees={"A": 0.0001, "B": 0.0002})
+    fee_builder = StrategyBuilder(constraints=fee_spec)
+    nco = fee_builder.build_nco(MeanRisk(), MeanRisk())
+    assert nco.portfolio_params is not None
+    assert nco.portfolio_params.get("management_fees") == {"A": 0.0001, "B": 0.0002}

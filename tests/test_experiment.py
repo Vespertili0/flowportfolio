@@ -34,6 +34,38 @@ class DummyEstimator(BaseEstimator):
         return X
 
 
+class EWMu:
+    def partial_fit(self, X, y=None):
+        return self
+
+
+class EWCovariance:
+    def partial_fit(self, X, y=None):
+        return self
+
+
+class DummyOnlineEstimator(BaseEstimator):
+    """Estimator satisfying online estimation contract."""
+
+    def __init__(self, mu=None, cov=None):
+        self.mu_estimator = mu if mu is not None else EWMu()
+        self.covariance_estimator = cov if cov is not None else EWCovariance()
+        prior = MagicMock()
+        prior.partial_fit = MagicMock(return_value=prior)
+        prior.mu_estimator = self.mu_estimator
+        prior.covariance_estimator = self.covariance_estimator
+        self.prior_estimator = prior
+
+    def fit(self, X, y=None):
+        return self
+
+    def partial_fit(self, X, y=None):
+        return self
+
+    def predict(self, X):
+        return X
+
+
 @pytest.fixture
 def stub_universe() -> Universe:
     """Provide a minimal Universe stub with synthetic returns."""
@@ -323,7 +355,7 @@ def test_run_online_evaluation_burn_in(
     mock_online_search.return_value = search_instance
 
     engine = PortfolioExperimentEngine(stub_universe)
-    engine.add_strategy("OnlineStrat", DummyEstimator(), {})
+    engine.add_strategy("OnlineStrat", DummyOnlineEstimator(), {})
 
     engine.run_online_evaluation(burn_in_size=4)
 
@@ -337,3 +369,49 @@ def test_run_online_evaluation_burn_in(
     predict_kwargs = mock_online_predict.call_args[1]
     assert predict_kwargs["warmup_size"] == 4
     assert predict_kwargs["portfolio_params"] == {"tag": "OnlineStrat"}
+
+
+@patch("flowportfolio.core.experiment.Population")
+@patch("flowportfolio.core.experiment.online_predict")
+@patch("flowportfolio.core.experiment.OnlineGridSearch")
+@patch("flowportfolio.core.experiment.cross_val_predict")
+@patch("flowportfolio.core.experiment.GridSearchCV")
+def test_online_evaluation_with_online_kwargs_and_explicit_train_size(
+    mock_gscv: MagicMock,
+    mock_cv_predict: MagicMock,
+    mock_online_search: MagicMock,
+    mock_online_predict: MagicMock,
+    mock_pop: MagicMock,
+    stub_universe: Universe,
+) -> None:
+    df = pd.DataFrame(
+        {"A": [0.01] * 300, "B": [-0.01] * 300},
+        index=pd.date_range("2026-01-01", periods=300),
+    )
+    stub_universe._returns = df
+
+    search_instance = MagicMock()
+    mock_online_search.return_value = search_instance
+
+    engine = PortfolioExperimentEngine(stub_universe)
+    est = DummyOnlineEstimator(mu=EWMu(), cov=EWCovariance())
+    engine.add_strategy("OnlineStrat", est, {})
+
+    # Verify no TypeError or zero-split ValueError occurs with online predict kwargs
+    engine.run_online_evaluation(
+        warmup_size=100, train_size=100, test_size=20, previous=False
+    )
+
+    # Verify engine.latest_weights is populated after run_robustness_test()
+    mock_p = MagicMock()
+    mock_p.weights_dict = {"A": 0.6, "B": 0.4}
+    mock_cv_predict.return_value = [mock_p]
+
+    robustness_search = MagicMock()
+    robustness_search.weights_ = [0.5, 0.5]
+    robustness_search.feature_names_in_ = ["A", "B"]
+    mock_gscv.return_value = robustness_search
+
+    engine.run_robustness_test(cv_type="walk_forward", train_size=252, test_size=63)
+    assert "OnlineStrat" in engine.latest_weights
+    assert engine.latest_weights["OnlineStrat"] == {"A": 0.5, "B": 0.5}

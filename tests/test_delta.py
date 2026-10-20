@@ -184,7 +184,10 @@ def test_calculate_rebalance_delta(mock_portfolio, stub_universe):
 
     mock_pop = MagicMock(spec=Population)
     mock_pop.__len__.return_value = 1
-    mock_pop.__getitem__.return_value = MagicMock()
+    mock_item = MagicMock()
+    mock_item.returns_df = None
+    mock_item.tag = None
+    mock_pop.__getitem__.return_value = mock_item
 
     res = engine.calculate_rebalance_delta(mock_pop)
 
@@ -193,3 +196,34 @@ def test_calculate_rebalance_delta(mock_portfolio, stub_universe):
     assert res["hold"]["cvar"] == 0.05
     assert res["rebalance"]["sharpe"] == 2.0
     assert mock_portfolio.call_count == 2
+
+
+def test_delta_rejects_short_weights_and_applies_fees_to_hold():
+    u = MagicMock(spec=Universe)
+    u.tickers = ["SPY", "TLT"]
+    u.metadata = {"SPY": "equity", "TLT": "bonds"}
+    u.fees = {"SPY": 0.0003, "TLT": 0.0015}
+    u.returns = pd.DataFrame(
+        {"SPY": [0.01, -0.01, 0.02], "TLT": [-0.005, 0.01, 0.0]}
+    )
+
+    with pytest.raises(ValueError, match="Weight must be between 0.0 and 1.0"):
+        PortfolioDeltaEngine(u, {"SPY": 1.2, "TLT": -0.2}, {"SPY": 0.5, "TLT": 0.5})
+
+    engine = PortfolioDeltaEngine(
+        u, {"SPY": 0.6, "TLT": 0.4}, {"SPY": 0.5, "TLT": 0.5}
+    )
+    with patch("flowportfolio.delta.Portfolio") as mock_port:
+        mock_p = MagicMock()
+        mock_p.cvar = 0.02
+        mock_p.sharpe_ratio = 1.0
+        mock_p.max_drawdown = 0.05
+        mock_port.return_value = mock_p
+
+        engine.calculate_rebalance_delta()
+        # Verify hold portfolio was called with management_fees matching fees / 252.0
+        assert mock_port.call_count >= 1
+        _, first_kwargs = mock_port.call_args_list[0]
+        assert "management_fees" in first_kwargs
+        expected_fees = np.array([0.0003 / 252.0, 0.0015 / 252.0])
+        np.testing.assert_allclose(first_kwargs["management_fees"], expected_fees)

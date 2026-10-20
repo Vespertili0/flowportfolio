@@ -7,6 +7,19 @@ from sklearn.model_selection import GridSearchCV
 from sklearn.pipeline import Pipeline
 
 
+def set_previous_weights_chain(opt: Any, weights: Any) -> None:
+    """Propagate previous_weights across an optimizer and its entire fallback chain."""
+    current = opt
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if hasattr(current, "previous_weights"):
+            current.previous_weights = (
+                dict(weights) if isinstance(weights, dict) else weights
+            )
+        current = getattr(current, "fallback", None)
+
+
 class SkfolioGridSearchCV(BaseOptimization, GridSearchCV):
     """A wrapper for GridSearchCV that conforms to skfolio's BaseOptimization API.
 
@@ -57,9 +70,13 @@ class SkfolioGridSearchCV(BaseOptimization, GridSearchCV):
     @property
     def needs_previous_weights(self) -> bool:
         """Whether the wrapped optimiser requires sequential previous weights."""
-        target = self._get_target_optimizer(self.estimator)
-        if bool(getattr(target, "needs_previous_weights", False)):
-            return True
+        current = self._get_target_optimizer(self.estimator)
+        visited: set[int] = set()
+        while current is not None and id(current) not in visited:
+            visited.add(id(current))
+            if bool(getattr(current, "needs_previous_weights", False)):
+                return True
+            current = getattr(current, "fallback", None)
         if self.portfolio_params is not None and self.portfolio_params.get(
             "weight_drift", False
         ):
@@ -67,15 +84,28 @@ class SkfolioGridSearchCV(BaseOptimization, GridSearchCV):
         return False
 
     def fit(self, X: Any, y: Any = None, **fit_params: Any) -> "SkfolioGridSearchCV":
-        if self.previous_weights is not None and self.estimator is not None:
-            target = self._get_target_optimizer(self.estimator)
-            if hasattr(target, "previous_weights"):
-                target.previous_weights = self.previous_weights
-                if hasattr(target, "fallback") and target.fallback is not None:
-                    if hasattr(target.fallback, "previous_weights"):
-                        target.fallback.previous_weights = self.previous_weights
+        target = (
+            self._get_target_optimizer(self.estimator)
+            if self.estimator is not None
+            else None
+        )
+        if self.previous_weights is not None and target is not None:
+            # Use neutral 1/N weights during inner CV splits so outer boundary weights
+            # from the end of X do not leak backward into earlier inner folds.
+            if hasattr(X, "columns") and len(X.columns) > 0:
+                neutral_weights = {col: 1.0 / len(X.columns) for col in X.columns}
+                set_previous_weights_chain(target, neutral_weights)
+            else:
+                set_previous_weights_chain(target, self.previous_weights)
 
         GridSearchCV.fit(self, X, y, **fit_params)
+
+        if self.previous_weights is not None and target is not None:
+            set_previous_weights_chain(target, self.previous_weights)
+            if self.refit and hasattr(self, "best_estimator_"):
+                best_target = self._get_target_optimizer(self.best_estimator_)
+                set_previous_weights_chain(best_target, self.previous_weights)
+                self.best_estimator_.fit(X, y, **fit_params)
 
         inner = self._get_target_optimizer(self.best_estimator_)
         self.weights_ = getattr(inner, "weights_", None)

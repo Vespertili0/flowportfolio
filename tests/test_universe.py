@@ -338,3 +338,34 @@ def test_universe_anchor_history_all_nan_column(mock_download) -> None:
     univ = Universe(TICKERS, METADATA, FEES)
     with pytest.raises(ValueError):
         univ.fetch_data()
+
+
+@patch("yfinance.download")
+def test_anchor_history_rejects_disjoint_and_delisted_assets(mock_download) -> None:
+    """Verify disjoint trading histories and halts exceeding max_ffill_days raise ValueError."""
+    # 1. Disjoint histories: A trades days 1-50 (NaN 51-100), B trades days 60-100 (NaN 1-59)
+    prices_a = [100.0 + i for i in range(50)] + [np.nan] * 50
+    prices_b = [np.nan] * 59 + [200.0 + i for i in range(41)]
+
+    mock_download.return_value = _make_multiindex_prices(
+        ["SPY", "IVV"],
+        {"SPY": prices_a, "IVV": prices_b},
+        start="2026-01-01",
+    )
+    univ = Universe(["SPY", "IVV"], {"SPY": "core", "IVV": "core"}, {"SPY": 0.0, "IVV": 0.0})
+    univ.fetch_data(max_ffill_days=5)
+    with pytest.raises(ValueError, match="no valid returns after alignment"):
+        univ.anchor_history()
+
+    # 2. Halt exceeding max_ffill_days: 10-day halt in the middle
+    halt_spy = [100.0] * 20 + [np.nan] * 10 + [105.0] * 20
+    halt_ivv = [200.0] * 50
+    mock_download.return_value = _make_multiindex_prices(
+        ["SPY", "IVV"],
+        {"SPY": halt_spy, "IVV": halt_ivv},
+        start="2026-01-01",
+    )
+    univ2 = Universe(["SPY", "IVV"], {"SPY": "core", "IVV": "core"}, {"SPY": 0.0, "IVV": 0.0})
+    univ2.fetch_data(max_ffill_days=5)
+    with pytest.raises(ValueError, match="contains NaN return observations after"):
+        univ2.anchor_history()

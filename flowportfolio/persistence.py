@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 import logging
 import math
+import numbers
 import os
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 from skfolio import Population
 
@@ -28,10 +30,12 @@ class PersistenceManager:
     def _sanitize_nans(self, data):
         if isinstance(data, dict):
             return {k: self._sanitize_nans(v) for k, v in data.items()}
-        elif isinstance(data, list):
+        if isinstance(data, list):
             return [self._sanitize_nans(i) for i in data]
-        elif isinstance(data, float) and math.isnan(data):
-            return None
+        if isinstance(data, (int, float, numbers.Real)) and not isinstance(data, bool):
+            if not math.isfinite(float(data)):
+                return None
+            return float(data) if not isinstance(data, int) else data
         return data
 
     def save_snapshot(self, population: Population, filepath: str) -> None:
@@ -65,8 +69,9 @@ class PersistenceManager:
 
         portfolios_data = []
         for port in population:
-            weights = None
-            if hasattr(port, "portfolios") and port.portfolios:
+            latest_w = getattr(port, "latest_weights_dict", None)
+            weights = latest_w if isinstance(latest_w, dict) else None
+            if weights is None and hasattr(port, "portfolios") and port.portfolios:
                 terminal_port = port.portfolios[-1]
                 weights = getattr(terminal_port, "weights_dict", None)
             if weights is None:
@@ -92,7 +97,7 @@ class PersistenceManager:
         fd, tmp_name = tempfile.mkstemp(dir=path.parent, text=True)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=4)
+                json.dump(data, f, indent=4, allow_nan=False)
             os.replace(tmp_name, path)
         except OSError as e:
             if os.path.exists(tmp_name):
@@ -170,12 +175,14 @@ class PersistenceManager:
         self.save_snapshot(population, str(export_path))
         return str(export_path.resolve())
 
-    def calculate_trajectory_history(self, snapshot_dir: str) -> pd.DataFrame:
+    def calculate_trajectory_history(
+        self, snapshot_dir: str, include_custom_labels: bool = False
+    ) -> pd.DataFrame:
         """Build a time-series DataFrame of weight recommendations from snapshots.
 
         Scans all .json files in snapshot_dir matching the rebalance_*.json
-        pattern, parses each file, and extracts the timestamp and per-portfolio
-        weights.
+        pattern (or *.json if include_custom_labels=True), parses each file, and
+        extracts the timestamp and per-portfolio weights.
 
         Returns:
             pd.DataFrame: With timestamp (DatetimeIndex), portfolio_name, tag,
@@ -195,7 +202,8 @@ class PersistenceManager:
         if not dir_path.exists() or not dir_path.is_dir():
             raise FileNotFoundError(f"Snapshot directory not found: {snapshot_dir}")
 
-        json_files = list(dir_path.glob("rebalance_*.json"))
+        pattern = "*.json" if include_custom_labels else "rebalance_*.json"
+        json_files = list(dir_path.glob(pattern))
         if not json_files:
             raise ValueError(f"No rebalance_*.json snapshots found in: {snapshot_dir}")
 

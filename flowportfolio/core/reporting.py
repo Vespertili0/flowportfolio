@@ -7,6 +7,7 @@ plotting capabilities.
 
 from __future__ import annotations
 
+import copy
 import logging
 from datetime import UTC, datetime
 
@@ -51,12 +52,13 @@ class Reporter:
             children = getattr(p, "portfolios", None)
             if isinstance(children, list) and len(children) > 0:
                 for child in children:
-                    if getattr(child, "tag", None) is None and parent_tag is not None:
+                    child_copy = copy.copy(child)
+                    if getattr(child_copy, "tag", None) is None and parent_tag is not None:
                         try:
-                            child.tag = parent_tag
+                            child_copy.tag = parent_tag
                         except AttributeError:
                             pass
-                    unrolled.append(child)
+                    unrolled.append(child_copy)
             else:
                 unrolled.append(p)
         return Population(unrolled)
@@ -298,7 +300,12 @@ class Reporter:
             except (ValueError, TypeError):
                 return False
 
-        weights_dict = getattr(target_port, "weights_dict", None)
+        latest_weights_dict = getattr(best_portfolio, "latest_weights_dict", None)
+        if isinstance(latest_weights_dict, dict) and len(latest_weights_dict) > 0:
+            weights_dict = latest_weights_dict
+        else:
+            weights_dict = getattr(target_port, "weights_dict", None)
+
         if isinstance(weights_dict, dict) and len(weights_dict) > 0:
             asset_weights = [
                 (str(asset), float(w))
@@ -307,9 +314,10 @@ class Reporter:
             ]
         else:
             weights = getattr(target_port, "weights", None)
-            assets = getattr(
-                target_port, "assets_names", getattr(target_port, "assets", None)
-            )
+            assets_candidate = getattr(target_port, "assets_names", None)
+            if not isinstance(assets_candidate, (list, tuple, np.ndarray, pd.Index)):
+                assets_candidate = getattr(target_port, "assets", None)
+            assets = assets_candidate
             if weights is None or len(weights) == 0:
                 return best_tag, "N/A (No weights available)"
             if assets is None or len(assets) != len(weights):
@@ -405,14 +413,21 @@ class Reporter:
     def _best_tag_by_median_cvar(self, tag_list: list[str]) -> str:
         import collections
 
-        unrolled_pop = self._unroll_portfolios(self._population)
-        tag_to_cvar = collections.defaultdict(list)
-        for p in unrolled_pop:
-            tag = getattr(p, "tag", None)
-            if tag is not None and tag in tag_list:
-                cvar_ratio = getattr(p, "cvar_ratio", None)
-                if cvar_ratio is not None and not np.isnan(cvar_ratio):
-                    tag_to_cvar[tag].append(float(cvar_ratio))
+        def _collect_cvar_by_tag(iterable) -> dict[str, list[float]]:
+            mapping: dict[str, list[float]] = collections.defaultdict(list)
+            for p in iterable:
+                tag = getattr(p, "tag", None)
+                if tag is not None and tag in tag_list:
+                    cvar_ratio = getattr(p, "cvar_ratio", None)
+                    if cvar_ratio is not None and not np.isnan(float(cvar_ratio)):
+                        mapping[tag].append(float(cvar_ratio))
+            return mapping
+
+        tag_to_cvar = _collect_cvar_by_tag(self._population)
+        if not tag_to_cvar:
+            tag_to_cvar = _collect_cvar_by_tag(
+                self._unroll_portfolios(self._population)
+            )
 
         valid_tags = list(tag_to_cvar.keys())
         if not valid_tags:

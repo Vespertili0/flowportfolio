@@ -21,6 +21,7 @@ from skfolio import Population
 from skfolio.portfolio import Portfolio
 
 from flowportfolio.core.protocols import UniverseProtocol, is_universe_protocol
+from flowportfolio.core.validation import validate_weight
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +95,11 @@ class PortfolioDeltaEngine:
             raise ValueError(
                 "target_weights values must be finite numbers (no NaN or Inf)."
             )
+
+        for v in current_weights.values():
+            validate_weight(v)
+        for v in target_weights.values():
+            validate_weight(v)
 
         # --- sum-to-one validation ---
         current_sum = sum(current_weights.values())
@@ -272,6 +278,7 @@ class PortfolioDeltaEngine:
         returns: pd.DataFrame = self._universe.returns
         eval_returns = returns
         selected_port = None
+        matched = []
 
         if population is not None and len(population) > 0:
             if strategy_tag is not None:
@@ -282,9 +289,10 @@ class PortfolioDeltaEngine:
                     raise ValueError(
                         f"No portfolio with tag '{strategy_tag}' found in population."
                     )
-                selected_port = matched[0]
             else:
-                selected_port = population[0]
+                matched = [population[0]]
+
+            selected_port = matched[0]
 
             port_returns = getattr(selected_port, "returns_df", None)
             if port_returns is None:
@@ -308,6 +316,12 @@ class PortfolioDeltaEngine:
                 "evaluating target_weights over full universe.returns is an in-sample projection."
             )
 
+        fees_map = getattr(self._universe, "fees", None) or {}
+        daily_fees_vector = np.array(
+            [float(fees_map.get(col, 0.0)) / 252.0 for col in eval_returns.columns],
+            dtype=float,
+        )
+
         # Build weight vectors aligned to returns column order
         current_weight_vector = np.array(
             [self._current_weights.get(col, 0.0) for col in eval_returns.columns],
@@ -322,27 +336,32 @@ class PortfolioDeltaEngine:
             X=eval_returns,
             weights=current_weight_vector,
             weight_drift=True,
+            management_fees=daily_fees_vector,
         )
 
         # Use out-of-sample MultiPeriodPortfolio/Portfolio metrics when available on real skfolio objects
         has_oos_metrics = (
-            selected_port is not None
-            and getattr(selected_port, "returns_df", None) is not None
-            and getattr(selected_port, "cvar", None) is not None
-            and getattr(selected_port, "sharpe_ratio", None) is not None
-            and getattr(selected_port, "max_drawdown", None) is not None
+            bool(matched)
+            and all(
+                getattr(p, "returns_df", None) is not None
+                and getattr(p, "cvar", None) is not None
+                and getattr(p, "sharpe_ratio", None) is not None
+                and getattr(p, "max_drawdown", None) is not None
+                for p in matched
+            )
         )
         if has_oos_metrics:
             rebalance_metrics = {
-                "cvar": float(selected_port.cvar),
-                "sharpe": float(selected_port.sharpe_ratio),
-                "max_drawdown": float(selected_port.max_drawdown),
+                "cvar": float(np.median([float(p.cvar) for p in matched])),
+                "sharpe": float(np.median([float(p.sharpe_ratio) for p in matched])),
+                "max_drawdown": float(np.median([float(p.max_drawdown) for p in matched])),
             }
         else:
             rebalance_portfolio = Portfolio(
                 X=eval_returns,
                 weights=target_weight_vector,
                 weight_drift=True,
+                management_fees=daily_fees_vector,
             )
             rebalance_metrics = {
                 "cvar": float(rebalance_portfolio.cvar),
