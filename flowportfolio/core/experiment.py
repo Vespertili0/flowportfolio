@@ -297,9 +297,12 @@ class PortfolioExperimentEngine:
             else:
                 # CombinatorialPurgedCV and MultipleRandomizedCV are multi-path splitters
                 # incompatible with GridSearchCV. Restrict inner tuning to standard single-test-fold WalkForward.
-                inner_train, inner_test = self._derive_inner_walk_forward_sizes(
-                    outer_train, 0
-                )
+                if outer_train <= 2:
+                    inner_train, inner_test = 1, 1
+                else:
+                    inner_train, inner_test = self._derive_inner_walk_forward_sizes(
+                        outer_train, 0
+                    )
                 inner_cv = self._resolve_cv_splitter(
                     "walk_forward", train_size=inner_train, test_size=inner_test
                 )
@@ -346,7 +349,7 @@ class PortfolioExperimentEngine:
 
             # c. Live terminal refit on trailing outer_train observations
             try:
-                live_search = clone(search)
+                live_search = search
                 live_window = returns.iloc[-min(outer_train, len(returns)) :]
                 # Anchor live refit turnover to final OOS portfolio weights if present
                 last_oos_weights = None
@@ -391,7 +394,7 @@ class PortfolioExperimentEngine:
                             p_obj.latest_weights_dict = dict(live_w)
                         except AttributeError:
                             pass
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.warning(
                     "Live terminal refit failed for strategy '%s'", name, exc_info=True
                 )
@@ -401,7 +404,12 @@ class PortfolioExperimentEngine:
             else:
                 collected.append(portfolio)
 
-        return Population(collected)
+        pop = Population(collected)
+        try:
+            pop.latest_weights_by_tag = self.latest_weights
+        except AttributeError:
+            pass
+        return pop
 
     @staticmethod
     def _validate_online_estimator(name: str, est: BaseEstimator) -> None:
@@ -455,8 +463,8 @@ class PortfolioExperimentEngine:
             If None, defaults to the train_size or warmup_size specified in
             cv_kwargs, or 252.
         **cv_kwargs
-            Additional keyword arguments forwarded to the chosen CV splitter
-            constructor or online prediction parameters.
+            Additional keyword arguments forwarded to online hyperparameter
+            search or online prediction parameters.
 
         Returns
         -------
@@ -480,11 +488,17 @@ class PortfolioExperimentEngine:
         if not self._strategies:
             raise RuntimeError("No strategies registered. Call add_strategy() first.")
 
+        if cv_type not in {"walk_forward", "combinatorial", "randomised"}:
+            raise ValueError(
+                f"Unknown cv_type: '{cv_type}'. Must be one of "
+                "'walk_forward', 'combinatorial', or 'randomised'."
+            )
+
         returns = self._universe.returns
 
         if burn_in_size is None:
-            burn_in_size = cv_kwargs.get(
-                "warmup_size", cv_kwargs.get("train_size", 252)
+            burn_in_size = int(
+                cv_kwargs.get("warmup_size", cv_kwargs.get("train_size", 252))
             )
 
         if burn_in_size >= len(returns):
@@ -495,28 +509,31 @@ class PortfolioExperimentEngine:
 
         burn_in_returns = returns.iloc[:burn_in_size]
 
-        resolved_cv_kwargs = {
-            k: v
-            for k, v in cv_kwargs.items()
-            if k not in {"warmup_size", "previous", "params"}
-        }
-        if cv_type == "walk_forward":
-            purged = resolved_cv_kwargs.get("purged_size", 0)
-            if (
-                "train_size" not in resolved_cv_kwargs
-                or "test_size" not in resolved_cv_kwargs
-                or int(resolved_cv_kwargs["train_size"])
-                + int(resolved_cv_kwargs["test_size"])
-                + int(purged)
-                > burn_in_size
-            ):
-                inner_train, inner_test = self._derive_inner_walk_forward_sizes(
-                    burn_in_size, purged
-                )
-                resolved_cv_kwargs["train_size"] = inner_train
-                resolved_cv_kwargs["test_size"] = inner_test
+        purged = int(cv_kwargs.get("purged_size", 0))
+        if (
+            "train_size" in cv_kwargs
+            and "test_size" in cv_kwargs
+            and int(cv_kwargs["train_size"]) + int(cv_kwargs["test_size"]) + purged
+            <= burn_in_size
+        ):
+            inner_warmup = int(cv_kwargs["train_size"])
+            inner_test = int(cv_kwargs["test_size"])
+        elif burn_in_size - max(0, purged) <= 2:
+            inner_warmup, inner_test = 1, 1
+        else:
+            inner_warmup, inner_test = self._derive_inner_walk_forward_sizes(
+                burn_in_size, purged
+            )
 
-        cv = self._resolve_cv_splitter(cv_type, **resolved_cv_kwargs)
+        online_search_keys = {
+            "freq",
+            "freq_offset",
+            "previous",
+            "reduce_test",
+        }
+        search_extra_kwargs = {
+            k: v for k, v in cv_kwargs.items() if k in online_search_keys
+        }
 
         online_predict_keys = {
             "test_size",
@@ -524,6 +541,7 @@ class PortfolioExperimentEngine:
             "freq_offset",
             "previous",
             "purged_size",
+            "reduce_test",
             "params",
         }
         predict_kwargs = {
@@ -559,10 +577,13 @@ class PortfolioExperimentEngine:
             search = OnlineGridSearch(
                 estimator=est,
                 param_grid=grid,
-                cv=cv,
-                scoring=make_scorer(RatioMeasure.CVAR_RATIO),
+                scoring=RatioMeasure.CVAR_RATIO,
+                warmup_size=inner_warmup,
+                test_size=inner_test,
+                purged_size=purged,
                 refit=True,
                 n_jobs=1,
+                **search_extra_kwargs,
             )
             search.fit(burn_in_returns)
             best_model = search.best_estimator_
@@ -575,9 +596,32 @@ class PortfolioExperimentEngine:
                 **predict_kwargs,
             )
 
+            ports_list = (
+                list(portfolio)
+                if type(portfolio).__name__ == "Population"
+                or isinstance(portfolio, list)
+                else [portfolio]
+            )
+            if ports_list:
+                last_p = ports_list[-1]
+                term_w = (
+                    getattr(last_p.portfolios[-1], "weights_dict", None)
+                    if hasattr(last_p, "portfolios") and last_p.portfolios
+                    else getattr(last_p, "weights_dict", None)
+                )
+                if isinstance(term_w, dict) and term_w:
+                    self._latest_weights[name] = {
+                        str(k): float(v) for k, v in term_w.items()
+                    }
+
             if type(portfolio).__name__ == "Population" or isinstance(portfolio, list):
                 collected.extend(portfolio)
             else:
                 collected.append(portfolio)
 
-        return Population(collected)
+        pop = Population(collected)
+        try:
+            pop.latest_weights_by_tag = self.latest_weights
+        except AttributeError:
+            pass
+        return pop

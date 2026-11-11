@@ -80,7 +80,8 @@ def test_build_entropy_prior_success(mock_entropy_pooling, stub_universe):
     # Assert
     assert prior is mock_instance
     mock_entropy_pooling.assert_called_once_with(
-        mean_views=["AAPL >= 0.0001984126984126984"], groups=None
+        mean_views=["AAPL >= 0.0001984126984126984"],
+        groups={"AAPL": ["tech"], "MSFT": ["tech"]},
     )
 
 
@@ -99,7 +100,7 @@ def test_build_black_litterman_prior_success(mock_bl, stub_universe):
         views=["AAPL == 0.0001984126984126984"],
         tau=0.05,
         view_confidences=[0.8],
-        groups=None,
+        groups={"AAPL": ["tech"], "MSFT": ["tech"]},
         risk_free_rate=0.0,
     )
 
@@ -146,7 +147,9 @@ def test_relative_view_without_spaces_and_bl_inequality_rejection():
 
     synth_bl = PriorSynthesiser(universe=u)
     synth_bl.add_market_view("SPY >= 0.05", 0.8)
-    with pytest.raises(ValueError, match="BlackLitterman only supports linear equality views"):
+    with pytest.raises(
+        ValueError, match="BlackLitterman only supports linear equality views"
+    ):
         synth_bl.build_black_litterman_prior()
 
     synth_ep = PriorSynthesiser(universe=u)
@@ -155,3 +158,21 @@ def test_relative_view_without_spaces_and_bl_inequality_rejection():
         mock_ep.return_value = MagicMock()
         prior = synth_ep.build_entropy_prior()
         assert prior is not None
+
+
+def test_relative_view_with_rhs_spread_and_no_bl_double_division(stub_universe):
+    """Verify RHS relative + spread views scale only the spread and BL avoids 1/N^2."""
+    synth = PriorSynthesiser(universe=stub_universe)
+    synth.add_market_view("AAPL == MSFT + 0.0252", confidence=0.8)
+    assert synth._views[0]["view"] == f"AAPL == MSFT + {0.0252 / 252.0}"
+    assert synth._views[0]["is_ranking"] is False
+
+    synth_grp = PriorSynthesiser(universe=stub_universe)
+    synth_grp.add_market_view("tech == 0.0504", confidence=0.9, average_groups=True)
+    # EntropyPooling gets 0.5 * tech, whereas BlackLitterman gets unscaled 'tech'
+    # because BlackLitterman already sets sum_to_one=True in equations_to_matrix.
+    ep = synth_grp.build_entropy_prior()
+    bl = synth_grp.build_black_litterman_prior()
+    assert ep.mean_views == [f"0.5 * tech == {0.0504 / 252.0}"]
+    assert bl.views == [f"tech == {0.0504 / 252.0}"]
+

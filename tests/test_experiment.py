@@ -48,6 +48,8 @@ class DummyOnlineEstimator(BaseEstimator):
     """Estimator satisfying online estimation contract."""
 
     def __init__(self, mu=None, cov=None):
+        self.mu = mu
+        self.cov = cov
         self.mu_estimator = mu if mu is not None else EWMu()
         self.covariance_estimator = cov if cov is not None else EWCovariance()
         prior = MagicMock()

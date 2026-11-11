@@ -59,6 +59,7 @@ class SkfolioGridSearchCV(BaseOptimization, GridSearchCV):
             **kwargs,
         )
         BaseOptimization.__init__(self, portfolio_params=portfolio_params)
+        self.portfolio_params: dict[str, Any] | None = portfolio_params
         self.previous_weights = previous_weights
 
     def _get_target_optimizer(self, est: Any) -> Any:
@@ -77,11 +78,59 @@ class SkfolioGridSearchCV(BaseOptimization, GridSearchCV):
             if bool(getattr(current, "needs_previous_weights", False)):
                 return True
             current = getattr(current, "fallback", None)
-        if self.portfolio_params is not None and self.portfolio_params.get(
-            "weight_drift", False
-        ):
-            return True
-        return False
+        return bool(
+            self.portfolio_params is not None
+            and self.portfolio_params.get("weight_drift", False)
+        )
+
+    @staticmethod
+    def _expand_weights_to_input(
+        X: Any, best_estimator: Any, inner: Any, raw_weights: Any
+    ) -> tuple[Any, Any]:
+        """Expand reduced pre-selection weights back to the full input feature space of X."""
+        if raw_weights is None:
+            return None, getattr(inner, "feature_names_in_", None)
+
+        w_arr = np.asarray(raw_weights, dtype=float)
+        n_in = X.shape[1] if hasattr(X, "shape") and len(X.shape) > 1 else None
+        full_names = (
+            np.asarray(X.columns, dtype=object)
+            if hasattr(X, "columns")
+            else getattr(best_estimator, "feature_names_in_", None)
+        )
+
+        if n_in is None or w_arr.shape[-1] == n_in:
+            return w_arr, (
+                full_names
+                if full_names is not None
+                else getattr(inner, "feature_names_in_", None)
+            )
+
+        inner_names = getattr(inner, "feature_names_in_", None)
+        if full_names is not None and inner_names is not None:
+            name_to_idx = {str(col): idx for idx, col in enumerate(full_names)}
+            out_shape = (*w_arr.shape[:-1], n_in)
+            expanded = np.zeros(out_shape, dtype=float)
+            for sub_idx, name in enumerate(inner_names):
+                target_idx = name_to_idx.get(str(name))
+                if target_idx is not None:
+                    expanded[..., target_idx] = w_arr[..., sub_idx]
+            return expanded, full_names
+
+        if isinstance(best_estimator, Pipeline):
+            mask = np.arange(n_in)
+            for _, step in best_estimator.steps[:-1]:
+                if hasattr(step, "get_support"):
+                    support = np.asarray(step.get_support(), dtype=bool)
+                    if len(support) == len(mask):
+                        mask = mask[support]
+            if len(mask) == w_arr.shape[-1]:
+                out_shape = (*w_arr.shape[:-1], n_in)
+                expanded = np.zeros(out_shape, dtype=float)
+                expanded[..., mask] = w_arr
+                return expanded, full_names
+
+        return w_arr, getattr(inner, "feature_names_in_", None)
 
     def fit(self, X: Any, y: Any = None, **fit_params: Any) -> "SkfolioGridSearchCV":
         target = (
@@ -90,27 +139,33 @@ class SkfolioGridSearchCV(BaseOptimization, GridSearchCV):
             else None
         )
         if self.previous_weights is not None and target is not None:
-            # Use neutral 1/N weights during inner CV splits so outer boundary weights
-            # from the end of X do not leak backward into earlier inner folds.
-            if hasattr(X, "columns") and len(X.columns) > 0:
-                neutral_weights = {col: 1.0 / len(X.columns) for col in X.columns}
-                set_previous_weights_chain(target, neutral_weights)
-            else:
-                set_previous_weights_chain(target, self.previous_weights)
+            set_previous_weights_chain(target, self.previous_weights)
 
         GridSearchCV.fit(self, X, y, **fit_params)
 
-        if self.previous_weights is not None and target is not None:
-            set_previous_weights_chain(target, self.previous_weights)
-            if self.refit and hasattr(self, "best_estimator_"):
-                best_target = self._get_target_optimizer(self.best_estimator_)
-                set_previous_weights_chain(best_target, self.previous_weights)
-                self.best_estimator_.fit(X, y, **fit_params)
-
         inner = self._get_target_optimizer(self.best_estimator_)
-        self.weights_ = getattr(inner, "weights_", None)
-        if hasattr(inner, "feature_names_in_"):
-            self.feature_names_in_ = inner.feature_names_in_
+        raw_weights = getattr(inner, "weights_", None)
+        expanded_weights, resolved_names = self._expand_weights_to_input(
+            X, self.best_estimator_, inner, raw_weights
+        )
+        self.weights_ = expanded_weights
+
+        if resolved_names is not None:
+            self.feature_names_in_ = np.asarray(resolved_names, dtype=object)
+        elif hasattr(self, "feature_names_in_"):
+            delattr(self, "feature_names_in_")
+
+        for attr in ("management_fees", "transaction_costs", "risk_free_rate"):
+            if hasattr(inner, attr):
+                setattr(self, attr, getattr(inner, attr))
+
+        inner_ptf_params = getattr(inner, "portfolio_params", None)
+        if isinstance(inner_ptf_params, dict):
+            merged_ptf_params = dict(inner_ptf_params)
+            if isinstance(self.portfolio_params, dict):
+                merged_ptf_params.update(self.portfolio_params)
+            self.portfolio_params = merged_ptf_params
+
         if hasattr(inner, "fallback_chain_"):
             self.fallback_chain_ = inner.fallback_chain_
         if hasattr(inner, "error_"):

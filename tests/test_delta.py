@@ -227,3 +227,31 @@ def test_delta_rejects_short_weights_and_applies_fees_to_hold():
         assert "management_fees" in first_kwargs
         expected_fees = np.array([0.0003 / 252.0, 0.0015 / 252.0])
         np.testing.assert_allclose(first_kwargs["management_fees"], expected_fees)
+
+
+def test_calculate_rebalance_delta_multipath_window_alignment():
+    idx = pd.date_range("2024-01-01", periods=30)
+    rng = np.random.default_rng(7)
+    returns = pd.DataFrame(
+        rng.normal(0.0005, 0.01, (30, 2)), columns=["SPY", "TLT"], index=idx
+    )
+    u = Universe(["SPY", "TLT"], {"SPY": "equity", "TLT": "bonds"}, {"SPY": 0.001, "TLT": 0.002})
+    u._returns = returns
+
+    from skfolio import Portfolio
+
+    p1 = Portfolio(X=returns.iloc[:15], weights=[0.5, 0.5], tag="CPCV")
+    p2 = Portfolio(X=returns.iloc[15:], weights=[0.5, 0.5], tag="CPCV")
+    pop = Population([p1, p2])
+
+    engine = PortfolioDeltaEngine(u, {"SPY": 0.7, "TLT": 0.3}, {"SPY": 0.5, "TLT": 0.5})
+    res = engine.calculate_rebalance_delta(pop, strategy_tag="CPCV")
+
+    fees_vec = np.array([0.001 / 252.0, 0.002 / 252.0])
+    h1 = Portfolio(X=returns.iloc[:15], weights=[0.7, 0.3], weight_drift=True, management_fees=fees_vec)
+    h2 = Portfolio(X=returns.iloc[15:], weights=[0.7, 0.3], weight_drift=True, management_fees=fees_vec)
+
+    assert np.isclose(res["hold"]["cvar"], np.median([h1.cvar, h2.cvar]))
+    assert np.isclose(res["hold"]["sharpe"], np.median([h1.sharpe_ratio, h2.sharpe_ratio]))
+    assert np.isclose(res["rebalance"]["cvar"], np.median([p1.cvar, p2.cvar]))
+

@@ -129,6 +129,121 @@ class PriorSynthesiser:
 
         return pattern.sub(_replace, expr)
 
+    @staticmethod
+    def _parse_and_scale_side(
+        side_str: str,
+        valid_identifiers: set[str],
+        raw_view: str,
+    ) -> tuple[str, bool, bool]:
+        """Parse one side of a view equation and scale standalone annualized constants by 1/252.
+
+        Supports linear combinations of identifiers (with optional numeric
+        coefficients, either ``coef * IDENT`` or ``IDENT * coef``) and
+        standalone numeric constants. Only standalone numeric constants
+        (representing annualized expected returns or spreads) are divided by
+        252.0; dimensionless factor loadings multiplying identifiers are
+        preserved untouched.
+
+        Returns
+        -------
+        tuple[str, bool, bool]
+            ``(scaled_expression, has_identifier, has_scalar_constant)``
+        """
+        s = side_str.strip()
+        if not s:
+            raise ValueError(
+                f"View '{raw_view}' has an empty expression on one side of the operator."
+            )
+
+        # Pure scalar fast path (preserves exact formatting for simple RHS like "0.05")
+        try:
+            scalar_val = float(s)
+        except ValueError:
+            scalar_val = None
+
+        if scalar_val is not None:
+            if not math.isfinite(scalar_val):
+                raise ValueError(
+                    f"Right-hand side of view '{raw_view}' must be a finite number, got '{s}'."
+                )
+            return f"{scalar_val / 252.0}", False, True
+
+        id_alternation = "|".join(
+            re.escape(i) for i in sorted(valid_identifiers, key=len, reverse=True)
+        )
+        num_pat = r"(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
+        term_re = re.compile(
+            rf"\s*(?P<sign>[+-])?\s*(?:"
+            rf"(?:(?P<coef1>{num_pat})\s*\*\s*)?(?P<id1>{id_alternation})"
+            rf"|(?P<id2>{id_alternation})\s*\*\s*(?P<coef2>{num_pat})"
+            rf"|(?P<const>{num_pat})"
+            rf")\s*"
+        )
+
+        pos = 0
+        out_terms: list[str] = []
+        has_id = False
+        has_const = False
+        first_term = True
+
+        while pos < len(s):
+            m = term_re.match(s, pos)
+            if not m:
+                raise ValueError(
+                    f"Right-hand side of view '{raw_view}' must be a scalar numeric "
+                    f"return or a valid linear view expression, got '{side_str}'."
+                )
+            sign = m.group("sign")
+            if not first_term and sign is None:
+                raise ValueError(
+                    f"Right-hand side of view '{raw_view}' must be a scalar numeric "
+                    f"return or a valid linear view expression, got '{side_str}'."
+                )
+
+            ident = m.group("id1") or m.group("id2")
+            coef_str = m.group("coef1") or m.group("coef2")
+            const_str = m.group("const")
+
+            if ident is not None:
+                has_id = True
+                if coef_str is not None:
+                    coef_val = float(coef_str)
+                    if not math.isfinite(coef_val):
+                        raise ValueError(
+                            f"Non-finite coefficient '{coef_str}' in view '{raw_view}'."
+                        )
+                    core = (
+                        f"{coef_str} * {ident}"
+                        if m.group("id1") is not None
+                        else f"{ident} * {coef_str}"
+                    )
+                else:
+                    core = ident
+            else:
+                has_const = True
+                assert const_str is not None
+                const_val = float(const_str)
+                if not math.isfinite(const_val):
+                    raise ValueError(
+                        f"Right-hand side of view '{raw_view}' must be a finite number, got '{const_str}'."
+                    )
+                core = f"{const_val / 252.0}"
+
+            if first_term:
+                if sign == "-":
+                    out_terms.append(f"-{core}")
+                elif sign == "+":
+                    out_terms.append(f"+{core}")
+                else:
+                    out_terms.append(core)
+                first_term = False
+            else:
+                out_terms.append(f"{sign} {core}")
+
+            pos = m.end()
+
+        return " ".join(out_terms), has_id, has_const
+
     def add_market_view(
         self, view_str: str, confidence: float, *, average_groups: bool = False
     ) -> PriorSynthesiser:
@@ -139,19 +254,21 @@ class PriorSynthesiser:
         view_str : str
             A view expression referencing asset tickers or metadata group names
             present in the universe. Example: "SPY >= 0.05" (SPY expected to
-            return >=5% annualised). A scalar right-hand side is converted to a
-            daily return (divided by 252.0); left-hand-side coefficients are
-            left untouched. A right-hand side that is a pure linear expression
-            of identifiers (e.g. "SPY >= TLT") is treated as a ranking view,
-            which is only supported by Entropy Pooling.
+            return >=5% annualised). Standalone scalar return constants are
+            converted to daily returns (divided by 252.0); factor coefficients
+            multiplying identifiers are left untouched. Relative views with or
+            without scalar spreads (e.g. "SPY >= TLT" or "SPY >= TLT + 0.02")
+            are supported.
         confidence : float
             Confidence in this view, between 0.0 (no confidence) and 1.0
             (certainty). Maps to view confidences in Black-Litterman; Entropy
             Pooling enforces views as hard constraints.
         average_groups : bool, default False
             If True, each group identifier with more than one member is scaled
-            by ``1 / N`` so that the view constrains the group's average return
-            rather than the sum of its members' returns (skfolio's default).
+            by ``1 / N`` in Entropy Pooling so that the view constrains the
+            group's average return rather than the sum of its members' returns.
+            (Black-Litterman always averages group members via ``sum_to_one=True``
+            in ``skfolio`` and is not double-scaled.)
 
         Returns
         -------
@@ -166,9 +283,8 @@ class PriorSynthesiser:
             If view_str references an identifier that is neither a ticker in
             universe.tickers nor a group in universe.metadata.
         ValueError
-            If view_str has no valid comparison operator or its right-hand
-            side is neither a scalar numeric return nor a pure ranking
-            expression.
+            If view_str has no valid comparison operator or contains invalid
+            syntax.
         """
         if (
             not isinstance(confidence, (int, float))
@@ -214,46 +330,38 @@ class PriorSynthesiser:
                 f"View '{view_str}' must contain exactly one comparison operator."
             )
 
-        # Determine whether the right-hand side is a scalar return or a ranking.
-        try:
-            rhs_annual: float | None = float(rhs)
-        except ValueError:
-            rhs_annual = None
-
-        if rhs_annual is not None:
-            if not math.isfinite(rhs_annual):
-                raise ValueError(
-                    f"Right-hand side of view '{view_str}' must be a finite number, got '{rhs}'."
-                )
-            # Scale only the annualised RHS constant to a daily return (divide by 252)
-            scaled_rhs = f"{rhs_annual / 252.0}"
-            is_ranking = False
-        else:
-            id_alternation = "|".join(
-                re.escape(i) for i in sorted(valid_identifiers, key=len, reverse=True)
+        scaled_lhs, lhs_has_id, _ = self._parse_and_scale_side(
+            lhs, valid_identifiers, view_str
+        )
+        scaled_rhs, rhs_has_id, rhs_has_const = self._parse_and_scale_side(
+            rhs, valid_identifiers, view_str
+        )
+        if not (lhs_has_id or rhs_has_id):
+            raise ValueError(
+                f"View '{view_str}' does not reference any valid tickers or groups."
             )
-            term = (
-                r"(?:\d+(?:\.\d*)?(?:[eE][+-]?\d+)?\s*\*\s*)?(?:" + id_alternation + r")"
-            )
-            ranking_pattern = rf"^[+-]?\s*{term}(?:\s*[+-]\s*{term})*$"
-            if not re.match(ranking_pattern, rhs):
-                raise ValueError(
-                    f"Right-hand side of view '{view_str}' must be a scalar numeric "
-                    f"return or a pure ranking expression, got '{rhs}'."
-                )
-            scaled_rhs = rhs
-            is_ranking = True
 
+        # A pure ranking view has identifiers on the RHS and no scalar constant
+        is_ranking = rhs_has_id and not rhs_has_const
+
+        base_view = f"{scaled_lhs} {op} {scaled_rhs}"
         if average_groups:
-            lhs = self._average_group_identifiers(lhs, valid_tickers, raw_metadata)
-            if is_ranking:
-                scaled_rhs = self._average_group_identifiers(
-                    scaled_rhs, valid_tickers, raw_metadata
-                )
+            ep_lhs = self._average_group_identifiers(
+                scaled_lhs, valid_tickers, raw_metadata
+            )
+            ep_rhs = (
+                self._average_group_identifiers(scaled_rhs, valid_tickers, raw_metadata)
+                if rhs_has_id
+                else scaled_rhs
+            )
+            ep_view = f"{ep_lhs} {op} {ep_rhs}"
+        else:
+            ep_view = base_view
 
         self._views.append(
             {
-                "view": f"{lhs} {op} {scaled_rhs}",
+                "view": ep_view,
+                "bl_view": base_view,
                 "operator": op,
                 "confidence": float(confidence),
                 "is_ranking": is_ranking,
@@ -342,7 +450,7 @@ class PriorSynthesiser:
         Parameters
         ----------
         tau : float, default 0.05
-            Degree of uncertainty given to the analyst views.
+            Degree of uncertainty given to the analyst views. Must be > 0.
         prior_estimator : BasePrior or None, optional
             Prior distribution estimator. If None, skfolio default is used.
         risk_free_rate : float, default 0.0
@@ -357,10 +465,30 @@ class PriorSynthesiser:
         ------
         RuntimeError
             If no market views have been registered via add_market_view().
+        ValueError
+            If tau <= 0, risk_free_rate is non-finite, or any registered view
+            is an inequality or pure ranking view.
         """
         if not self._views:
             raise RuntimeError(
                 "No market views registered. Call add_market_view() before building a Black-Litterman prior."
+            )
+
+        if (
+            not isinstance(tau, (int, float))
+            or isinstance(tau, bool)
+            or not math.isfinite(float(tau))
+            or float(tau) <= 0.0
+        ):
+            raise ValueError(f"tau must be a positive finite number, got {tau}.")
+
+        if (
+            not isinstance(risk_free_rate, (int, float))
+            or isinstance(risk_free_rate, bool)
+            or not math.isfinite(float(risk_free_rate))
+        ):
+            raise ValueError(
+                f"risk_free_rate must be a finite number, got {risk_free_rate}."
             )
 
         for v in self._views:
@@ -376,7 +504,9 @@ class PriorSynthesiser:
                     f"0.0; got 0.0 for view '{v['raw_view']}'."
                 )
 
-        views = [v["view"] for v in self._views]
+        # BlackLitterman already sets sum_to_one=True in equations_to_matrix,
+        # so use bl_view (unscaled by _average_group_identifiers) to avoid 1/N^2 scaling.
+        views = [v.get("bl_view", v["view"]) for v in self._views]
         confidences = [v["confidence"] for v in self._views]
 
         raw_metadata = (
@@ -393,10 +523,10 @@ class PriorSynthesiser:
 
         kwargs: dict[str, object] = {
             "views": views,
-            "tau": tau,
+            "tau": float(tau),
             "view_confidences": confidences,
             "groups": groups_arg,
-            "risk_free_rate": risk_free_rate / 252.0,
+            "risk_free_rate": float(risk_free_rate) / 252.0,
         }
         if prior_estimator is not None:
             kwargs["prior_estimator"] = prior_estimator

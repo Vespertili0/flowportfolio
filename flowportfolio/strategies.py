@@ -172,10 +172,7 @@ class StrategyBuilder:
             opt.previous_weights = dict(self._previous_weights)
         if hasattr(opt, "max_turnover") and self._max_turnover is not None:
             opt.max_turnover = self._max_turnover
-        if (
-            hasattr(opt, "management_fees")
-            and getattr(self, "_management_fees", None) is not None
-        ):
+        if hasattr(opt, "management_fees") and self._management_fees is not None:
             opt.management_fees = dict(self._management_fees)
 
         if include_prior and self.prior is not None and hasattr(opt, "prior_estimator"):
@@ -326,10 +323,10 @@ class StrategyBuilder:
         for i, transformer in enumerate(self._pre_selection):
             cloned_tr = _safe_clone(transformer)
             if hasattr(cloned_tr, "set_output"):
-                try:
+                from contextlib import suppress
+
+                with suppress(Exception):
                     cloned_tr.set_output(transform="pandas")
-                except Exception:  # noqa: BLE001
-                    pass
             steps.append((f"pre_{i}", cloned_tr))
 
         cloned_optimizer = self._wire_from_raw(include_prior=True)
@@ -422,7 +419,16 @@ class StrategyBuilder:
         if clusterer == "kmeans":
             from sklearn.cluster import KMeans
 
-            clustering_estimator = KMeans(random_state=random_state)
+            class _AdaptiveKMeans(KMeans):
+                """KMeans wrapper that adapts n_clusters when the universe has < 8 assets."""
+
+                def fit(self, X, y=None, sample_weight=None):
+                    n_samples = X.shape[0] if hasattr(X, "shape") else len(X)
+                    if n_samples < self.n_clusters:
+                        self.n_clusters = max(1, min(self.n_clusters, max(2, n_samples - 1)) if n_samples > 2 else n_samples)
+                    return super().fit(X, y=y, sample_weight=sample_weight)
+
+            clustering_estimator = _AdaptiveKMeans(random_state=random_state)
         else:
             from skfolio.cluster import HierarchicalClustering, LinkageMethod
 

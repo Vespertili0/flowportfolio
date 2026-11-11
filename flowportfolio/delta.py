@@ -280,6 +280,25 @@ class PortfolioDeltaEngine:
         selected_port = None
         matched = []
 
+        def _align_returns_for_portfolio(port_obj: object) -> pd.DataFrame:
+            port_returns = getattr(port_obj, "returns_df", None)
+            if port_returns is None:
+                port_returns = getattr(port_obj, "returns", None)
+
+            if isinstance(port_returns, (pd.Series, pd.DataFrame)):
+                if (
+                    hasattr(port_returns, "index")
+                    and port_returns.index.isin(returns.index).any()
+                ):
+                    return returns.loc[returns.index.isin(port_returns.index)]
+                elif len(port_returns) <= len(returns):
+                    return returns.iloc[-len(port_returns) :]
+            elif isinstance(port_returns, np.ndarray) and 0 < len(port_returns) <= len(
+                returns
+            ):
+                return returns.iloc[-len(port_returns) :]
+            return returns
+
         if population is not None and len(population) > 0:
             if strategy_tag is not None:
                 matched = [
@@ -293,23 +312,7 @@ class PortfolioDeltaEngine:
                 matched = [population[0]]
 
             selected_port = matched[0]
-
-            port_returns = getattr(selected_port, "returns_df", None)
-            if port_returns is None:
-                port_returns = getattr(selected_port, "returns", None)
-
-            if isinstance(port_returns, (pd.Series, pd.DataFrame)):
-                if (
-                    hasattr(port_returns, "index")
-                    and port_returns.index.isin(returns.index).any()
-                ):
-                    eval_returns = returns.loc[returns.index.isin(port_returns.index)]
-                elif len(port_returns) <= len(returns):
-                    eval_returns = returns.iloc[-len(port_returns) :]
-            elif isinstance(port_returns, np.ndarray) and 0 < len(port_returns) <= len(
-                returns
-            ):
-                eval_returns = returns.iloc[-len(port_returns) :]
+            eval_returns = _align_returns_for_portfolio(selected_port)
         else:
             logger.warning(
                 "calculate_rebalance_delta() called without an out-of-sample Population; "
@@ -332,13 +335,6 @@ class PortfolioDeltaEngine:
             dtype=float,
         )
 
-        hold_portfolio = Portfolio(
-            X=eval_returns,
-            weights=current_weight_vector,
-            weight_drift=True,
-            management_fees=daily_fees_vector,
-        )
-
         # Use out-of-sample MultiPeriodPortfolio/Portfolio metrics when available on real skfolio objects
         has_oos_metrics = (
             bool(matched)
@@ -350,6 +346,40 @@ class PortfolioDeltaEngine:
                 for p in matched
             )
         )
+
+        if has_oos_metrics and len(matched) > 1:
+            hold_cvars = []
+            hold_sharpes = []
+            hold_mdds = []
+            for p in matched:
+                path_returns = _align_returns_for_portfolio(p)
+                hp = Portfolio(
+                    X=path_returns,
+                    weights=current_weight_vector,
+                    weight_drift=True,
+                    management_fees=daily_fees_vector,
+                )
+                hold_cvars.append(float(hp.cvar))
+                hold_sharpes.append(float(hp.sharpe_ratio))
+                hold_mdds.append(float(hp.max_drawdown))
+            hold_metrics = {
+                "cvar": float(np.median(hold_cvars)),
+                "sharpe": float(np.median(hold_sharpes)),
+                "max_drawdown": float(np.median(hold_mdds)),
+            }
+        else:
+            hold_portfolio = Portfolio(
+                X=eval_returns,
+                weights=current_weight_vector,
+                weight_drift=True,
+                management_fees=daily_fees_vector,
+            )
+            hold_metrics = {
+                "cvar": float(hold_portfolio.cvar),
+                "sharpe": float(hold_portfolio.sharpe_ratio),
+                "max_drawdown": float(hold_portfolio.max_drawdown),
+            }
+
         if has_oos_metrics:
             rebalance_metrics = {
                 "cvar": float(np.median([float(p.cvar) for p in matched])),
@@ -370,11 +400,7 @@ class PortfolioDeltaEngine:
             }
 
         return {
-            "hold": {
-                "cvar": float(hold_portfolio.cvar),
-                "sharpe": float(hold_portfolio.sharpe_ratio),
-                "max_drawdown": float(hold_portfolio.max_drawdown),
-            },
+            "hold": hold_metrics,
             "rebalance": rebalance_metrics,
         }
 

@@ -300,7 +300,16 @@ class Reporter:
             except (ValueError, TypeError):
                 return False
 
-        latest_weights_dict = getattr(best_portfolio, "latest_weights_dict", None)
+        pop_latest_map = getattr(self._population, "latest_weights_by_tag", None)
+        latest_weights_dict = (
+            pop_latest_map.get(best_tag)
+            if isinstance(pop_latest_map, dict)
+            else None
+        )
+        if not (isinstance(latest_weights_dict, dict) and len(latest_weights_dict) > 0):
+            latest_weights_dict = getattr(best_portfolio, "latest_weights_dict", None)
+
+        weights_dict: object
         if isinstance(latest_weights_dict, dict) and len(latest_weights_dict) > 0:
             weights_dict = latest_weights_dict
         else:

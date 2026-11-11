@@ -16,7 +16,7 @@ dependencies = [
     "pandas>=3.0.3",
     "plotly>=5.0.0",
     "scikit-learn>=1.9.0",
-    "skfolio>=0.20.1,<1.0.0",
+    "skfolio>=1.12.8,<2.0.0",
     "tabulate>=0.9.0",
     "yfinance>=1.5.1",
 ]
@@ -28,6 +28,7 @@ Issues = "https://github.com/Vespertili0/flowportfolio/issues"
 
 [project.optional-dependencies]
 dev = [
+    "hypothesis",
     "mypy",
     "pre-commit",
     "pytest",
@@ -36,6 +37,7 @@ dev = [
 ]
 [dependency-groups]
 dev = [
+    "hypothesis>=6.100.0",
     "mypy>=1.15.0",
     "pre-commit>=4.1.0",
     "pytest>=8.3.4",

@@ -298,7 +298,7 @@ def test_persistence_sanitizes_inf_and_loads_custom_labels(
     )
     assert Path(custom_path).exists()
 
-    with pytest.raises(ValueError, match="No rebalance_*.json snapshots found"):
+    with pytest.raises(ValueError, match=r"No rebalance_\*\.json snapshots found"):
         manager.calculate_trajectory_history(str(tmp_path), include_custom_labels=False)
 
     df = manager.calculate_trajectory_history(str(tmp_path), include_custom_labels=True)

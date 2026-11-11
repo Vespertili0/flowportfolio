@@ -9,7 +9,6 @@ import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 from skfolio import Population
 
@@ -67,9 +66,16 @@ class PersistenceManager:
         except OSError as e:
             raise OSError(f"Cannot create directory {path.parent}") from e
 
+        pop_latest_map = getattr(population, "latest_weights_by_tag", None)
         portfolios_data = []
         for port in population:
-            latest_w = getattr(port, "latest_weights_dict", None)
+            latest_w = (
+                pop_latest_map.get(getattr(port, "tag", None))
+                if isinstance(pop_latest_map, dict)
+                else None
+            )
+            if not isinstance(latest_w, dict):
+                latest_w = getattr(port, "latest_weights_dict", None)
             weights = latest_w if isinstance(latest_w, dict) else None
             if weights is None and hasattr(port, "portfolios") and port.portfolios:
                 terminal_port = port.portfolios[-1]

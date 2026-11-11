@@ -103,17 +103,19 @@ def test_is_universe_protocol_fees_dict_check() -> None:
     from flowportfolio.core.protocols import is_universe_protocol
 
     class ValidObj:
-        tickers = ["A"]
-        metadata = {"A": "core"}
-        fees = {"A": 0.001}
-        returns = pd.DataFrame()
+        def __init__(self) -> None:
+            self.tickers = ["A"]
+            self.metadata = {"A": "core"}
+            self.fees = {"A": 0.001}
+            self.returns = pd.DataFrame()
 
     assert is_universe_protocol(ValidObj()) is True
 
     class NonDictFees:
-        tickers = ["A"]
-        metadata = {"A": "core"}
-        fees = [0.001]
-        returns = pd.DataFrame()
+        def __init__(self) -> None:
+            self.tickers = ["A"]
+            self.metadata = {"A": "core"}
+            self.fees = [0.001]
+            self.returns = pd.DataFrame()
 
     assert is_universe_protocol(NonDictFees()) is False

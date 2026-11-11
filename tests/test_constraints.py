@@ -4,6 +4,8 @@ This module verifies the generation of skfolio-compatible linear constraints
 using the fluent builder pattern in :class:`flowportfolio.core.constraints.ConstraintBuilder`.
 """
 
+from unittest.mock import MagicMock
+
 import pytest
 
 from flowportfolio.core.constraints import ConstraintBuilder, ConstraintSpec
@@ -295,7 +297,6 @@ def test_constraint_spec_equals_list_and_validates_turnover_weights() -> None:
     u.tickers = ["SPY", "TLT"]
     u.metadata = {"SPY": "core", "TLT": "satellite"}
     u.fees = {"SPY": 0.0003, "TLT": 0.0015}
-    u.returns = pd.DataFrame()
     builder = ConstraintBuilder(u)
 
     with pytest.raises(ValueError, match="Weight must be between 0.0 and 1.0"):
