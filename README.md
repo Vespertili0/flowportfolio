@@ -128,7 +128,7 @@ Build leak-proof `sklearn` pipelines with pre-selection filters and fallback opt
 
 ```python
 from flowportfolio import StrategyBuilder
-from skfolio.preprocessing import DropCorrelated
+from skfolio.pre_selection import DropCorrelated
 from skfolio.optimization import MeanRisk, HierarchicalRiskParity
 
 builder = StrategyBuilder(constraints=constraints)
@@ -169,8 +169,8 @@ delta_summary = delta_engine.calculate_rebalance_delta(population)
 friction = delta_engine.calculate_net_friction(
     portfolio_value=100000.0,
     brokerage_flat=9.95,
-    brokerage_bps=0.001,
-    slippage_bps=0.0005,
+    brokerage_bps=10.0,
+    slippage_bps=5.0,
 )
 ```
 

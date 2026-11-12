@@ -301,3 +301,55 @@ def test_constraint_spec_equals_list_and_validates_turnover_weights() -> None:
 
     with pytest.raises(ValueError, match="Weight must be between 0.0 and 1.0"):
         builder.max_turnover(0.2, {"SPY": -0.5, "TLT": 1.5})
+
+
+def test_max_turnover_validates_sum_to_one(stub_universe: Universe) -> None:
+    """Verify max_turnover rejects weights not summing to 1.0 and normalizes valid weights."""
+    builder = ConstraintBuilder(stub_universe)
+    # stub_universe has tickers ['A', 'B', 'C']
+    bad_weights = {"A": 0.1, "B": 0.1, "C": 0.1}
+    with pytest.raises(
+        ValueError, match="current_weights must sum to 1.0 \\(within 1e-2 tolerance\\)"
+    ):
+        builder.max_turnover(0.05, bad_weights)
+
+    good_weights = {"A": 0.501, "B": 0.299, "C": 0.200}
+    builder.max_turnover(0.05, good_weights)
+    spec = builder.build()
+    assert spec.max_turnover == 0.05
+    assert spec.previous_weights is not None
+    assert abs(sum(spec.previous_weights.values()) - 1.0) < 1e-6
+
+
+def test_transaction_costs_configuration_and_reset(stub_universe: Universe) -> None:
+    """Verify ConstraintBuilder.transaction_costs accepts float/dict and resets."""
+    builder = ConstraintBuilder(stub_universe)
+
+    # Float cost
+    builder.transaction_costs(0.001)
+    spec = builder.build()
+    assert spec.transaction_costs == 0.001
+
+    # Dict cost
+    builder.transaction_costs({"A": 0.001, "B": 0.002, "C": 0.0015})
+    spec = builder.build()
+    assert spec.transaction_costs == {"A": 0.001, "B": 0.002, "C": 0.0015}
+
+    # Reset
+    builder.reset()
+    assert builder.build().transaction_costs is None
+
+    # Invalid costs
+    with pytest.raises(
+        ValueError, match="Transaction costs must be a non-negative finite number"
+    ):
+        builder.transaction_costs(-0.01)
+    with pytest.raises(
+        ValueError,
+        match="Transaction cost for ticker 'A' must be non-negative and finite",
+    ):
+        builder.transaction_costs({"A": -0.01, "B": 0.01, "C": 0.01})
+    with pytest.raises(
+        TypeError, match="Transaction costs must be a float or a dictionary"
+    ):
+        builder.transaction_costs("invalid")  # type: ignore[arg-type]

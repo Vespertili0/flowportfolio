@@ -417,3 +417,58 @@ def test_online_evaluation_with_online_kwargs_and_explicit_train_size(
     engine.run_robustness_test(cv_type="walk_forward", train_size=252, test_size=63)
     assert "OnlineStrat" in engine.latest_weights
     assert engine.latest_weights["OnlineStrat"] == {"A": 0.5, "B": 0.5}
+
+
+def test_walk_forward_with_calendar_freq_resolves_row_count(
+    stub_universe: Universe,
+) -> None:
+    """Verify _resolve_outer_train_size extracts row count when freq is supplied."""
+    # 500 business days
+    dates = pd.date_range("2024-01-01", periods=500, freq="B")
+    df = pd.DataFrame({"A": [0.01] * 500, "B": [-0.01] * 500}, index=dates)
+    stub_universe._returns = df
+
+    engine = PortfolioExperimentEngine(stub_universe)
+    wf = WalkForward(train_size=12, test_size=3, freq="ME")
+    outer_train = engine._resolve_outer_train_size(
+        "walk_forward",
+        wf,
+        {"train_size": 12, "test_size": 3, "freq": "ME"},
+        len(df),
+        df,
+    )
+    # 12 months is ~250 trading days, not 12 rows!
+    assert outer_train > 50
+
+
+def test_skfolio_grid_search_cv_inner_folds_causality() -> None:
+    """Verify SkfolioGridSearchCV uses equal weights during inner CV and refits with previous_weights."""
+    import numpy as np
+    from skfolio.optimization import MeanRisk
+
+    from flowportfolio.core.optimisation import SkfolioGridSearchCV
+
+    df = pd.DataFrame(
+        np.random.randn(100, 3) * 0.01,
+        columns=["A", "B", "C"],
+        index=pd.date_range("2026-01-01", periods=100),
+    )
+    opt = MeanRisk()
+    opt.max_turnover = 0.05
+    user_pw = {"A": 0.8, "B": 0.1, "C": 0.1}
+
+    gscv = SkfolioGridSearchCV(
+        estimator=opt,
+        param_grid={"l1_coef": [0.0]},
+        cv=2,
+    )
+    gscv.previous_weights = user_pw
+    gscv.fit(df)
+
+    # best_estimator_ should be refitted with user_pw and satisfy max_turnover
+    inner = gscv._get_target_optimizer(gscv.best_estimator_)
+    assert inner.previous_weights == user_pw
+    assert gscv.weights_ is not None
+    # Turnover from user_pw: sum(|w - w_prev|) / 2 <= 0.05
+    turnover = np.sum(np.abs(gscv.weights_ - np.array([0.8, 0.1, 0.1]))) / 2.0
+    assert turnover <= 0.05 + 1e-4

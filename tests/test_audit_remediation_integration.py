@@ -107,7 +107,7 @@ def test_prior_relative_and_group_views() -> None:
     synth.add_market_view("core >= 0.06", confidence=0.5)
 
     assert synth._views[0]["view"] == "1.0 * SPY - 0.5 * TLT >= 0.00015873015873015873"
-    assert synth._views[1]["view"] == f"core >= {0.06 / 252.0}"
+    assert synth._views[1]["view"] == f"0.5 * core >= {0.06 / 252.0}"
 
     # skfolio's BlackLitterman supports equality views only, so the fitted check
     # uses equalities carrying the same relative and group structure.

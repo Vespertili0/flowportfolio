@@ -7,7 +7,11 @@ import math
 import re
 
 from skfolio.distribution import VineCopula
-from skfolio.moments import DenoiseCovariance, ShrunkMu
+from skfolio.moments import (
+    LedoitWolf,
+    ShrunkMu,
+    ShrunkMuMethods,
+)
 from skfolio.prior import (
     BasePrior,
     BlackLitterman,
@@ -134,6 +138,7 @@ class PriorSynthesiser:
         side_str: str,
         valid_identifiers: set[str],
         raw_view: str,
+        side_label: str = "Right-hand side",
     ) -> tuple[str, bool, bool]:
         """Parse one side of a view equation and scale standalone annualized constants by 1/252.
 
@@ -164,7 +169,7 @@ class PriorSynthesiser:
         if scalar_val is not None:
             if not math.isfinite(scalar_val):
                 raise ValueError(
-                    f"Right-hand side of view '{raw_view}' must be a finite number, got '{s}'."
+                    f"{side_label} of view '{raw_view}' must be a finite number, got '{s}'."
                 )
             return f"{scalar_val / 252.0}", False, True
 
@@ -174,8 +179,9 @@ class PriorSynthesiser:
         num_pat = r"(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
         term_re = re.compile(
             rf"\s*(?P<sign>[+-])?\s*(?:"
-            rf"(?:(?P<coef1>{num_pat})\s*\*\s*)?(?P<id1>{id_alternation})"
+            rf"(?P<coef1>{num_pat})\s*\*\s*(?P<id1>{id_alternation})"
             rf"|(?P<id2>{id_alternation})\s*\*\s*(?P<coef2>{num_pat})"
+            rf"|(?P<id3>{id_alternation})"
             rf"|(?P<const>{num_pat})"
             rf")\s*"
         )
@@ -190,17 +196,17 @@ class PriorSynthesiser:
             m = term_re.match(s, pos)
             if not m:
                 raise ValueError(
-                    f"Right-hand side of view '{raw_view}' must be a scalar numeric "
+                    f"{side_label} of view '{raw_view}' must be a scalar numeric "
                     f"return or a valid linear view expression, got '{side_str}'."
                 )
             sign = m.group("sign")
             if not first_term and sign is None:
                 raise ValueError(
-                    f"Right-hand side of view '{raw_view}' must be a scalar numeric "
+                    f"{side_label} of view '{raw_view}' must be a scalar numeric "
                     f"return or a valid linear view expression, got '{side_str}'."
                 )
 
-            ident = m.group("id1") or m.group("id2")
+            ident = m.group("id1") or m.group("id2") or m.group("id3")
             coef_str = m.group("coef1") or m.group("coef2")
             const_str = m.group("const")
 
@@ -212,11 +218,7 @@ class PriorSynthesiser:
                         raise ValueError(
                             f"Non-finite coefficient '{coef_str}' in view '{raw_view}'."
                         )
-                    core = (
-                        f"{coef_str} * {ident}"
-                        if m.group("id1") is not None
-                        else f"{ident} * {coef_str}"
-                    )
+                    core = f"{coef_str} * {ident}"
                 else:
                     core = ident
             else:
@@ -225,7 +227,7 @@ class PriorSynthesiser:
                 const_val = float(const_str)
                 if not math.isfinite(const_val):
                     raise ValueError(
-                        f"Right-hand side of view '{raw_view}' must be a finite number, got '{const_str}'."
+                        f"{side_label} of view '{raw_view}' must be a finite number, got '{const_str}'."
                     )
                 core = f"{const_val / 252.0}"
 
@@ -245,7 +247,7 @@ class PriorSynthesiser:
         return " ".join(out_terms), has_id, has_const
 
     def add_market_view(
-        self, view_str: str, confidence: float, *, average_groups: bool = False
+        self, view_str: str, confidence: float, *, average_groups: bool = True
     ) -> PriorSynthesiser:
         """Register a forward-looking market view for use in prior estimation.
 
@@ -263,7 +265,7 @@ class PriorSynthesiser:
             Confidence in this view, between 0.0 (no confidence) and 1.0
             (certainty). Maps to view confidences in Black-Litterman; Entropy
             Pooling enforces views as hard constraints.
-        average_groups : bool, default False
+        average_groups : bool, default True
             If True, each group identifier with more than one member is scaled
             by ``1 / N`` in Entropy Pooling so that the view constrains the
             group's average return rather than the sum of its members' returns.
@@ -331,18 +333,18 @@ class PriorSynthesiser:
             )
 
         scaled_lhs, lhs_has_id, _ = self._parse_and_scale_side(
-            lhs, valid_identifiers, view_str
+            lhs, valid_identifiers, view_str, side_label="Left-hand side"
         )
         scaled_rhs, rhs_has_id, rhs_has_const = self._parse_and_scale_side(
-            rhs, valid_identifiers, view_str
+            rhs, valid_identifiers, view_str, side_label="Right-hand side"
         )
         if not (lhs_has_id or rhs_has_id):
             raise ValueError(
                 f"View '{view_str}' does not reference any valid tickers or groups."
             )
 
-        # A pure ranking view has identifiers on the RHS and no scalar constant
-        is_ranking = rhs_has_id and not rhs_has_const
+        # A pure ranking view has identifiers on the RHS, no scalar constant, and is an inequality
+        is_ranking = rhs_has_id and not rhs_has_const and op != "=="
 
         base_view = f"{scaled_lhs} {op} {scaled_rhs}"
         if average_groups:
@@ -383,18 +385,18 @@ class PriorSynthesiser:
         Parameters
         ----------
         covariance_estimator : skfolio covariance estimator, optional
-            Defaults to DenoiseCovariance().
+            Defaults to LedoitWolf().
         mu_estimator : skfolio mu estimator, optional
-            Defaults to ShrunkMu().
+            Defaults to ShrunkMu(method=ShrunkMuMethods.BAYES_STEIN).
 
         Returns
         -------
         skfolio.prior.EmpiricalPrior
         """
         if covariance_estimator is None:
-            covariance_estimator = DenoiseCovariance()
+            covariance_estimator = LedoitWolf()
         if mu_estimator is None:
-            mu_estimator = ShrunkMu()
+            mu_estimator = ShrunkMu(method=ShrunkMuMethods.BAYES_STEIN)
 
         return EmpiricalPrior(
             covariance_estimator=covariance_estimator, mu_estimator=mu_estimator
@@ -494,8 +496,8 @@ class PriorSynthesiser:
         for v in self._views:
             if v["operator"] in (">=", "<=") or v.get("is_ranking", False):
                 raise ValueError(
-                    "BlackLitterman only supports linear equality views ('==') "
-                    f"with scalar returns; got '{v['raw_view']}'. Use "
+                    "BlackLitterman only supports linear equality views ('=='); "
+                    f"got '{v['raw_view']}'. Use "
                     "build_entropy_prior() for inequality or ranking views."
                 )
             if v["confidence"] == 0.0:

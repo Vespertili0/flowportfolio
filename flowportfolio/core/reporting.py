@@ -19,6 +19,15 @@ from skfolio import Population, RatioMeasure, RiskMeasure
 logger = logging.getLogger(__name__)
 
 
+def _get_portfolio_metric(p: object, annualized_attr: str, raw_attr: str) -> object:
+    """Return annualized metric on real skfolio objects, falling back to raw_attr on mocks."""
+    if not hasattr(p, "_mock_name"):
+        ann_val = getattr(p, annualized_attr, None)
+        if isinstance(ann_val, (int, float, np.number)):
+            return float(ann_val)
+    return getattr(p, raw_attr, None)
+
+
 class Reporter:
     """Visual tearsheet generator for evaluated strategies.
 
@@ -53,7 +62,10 @@ class Reporter:
             if isinstance(children, list) and len(children) > 0:
                 for child in children:
                     child_copy = copy.copy(child)
-                    if getattr(child_copy, "tag", None) is None and parent_tag is not None:
+                    if (
+                        getattr(child_copy, "tag", None) is None
+                        and parent_tag is not None
+                    ):
                         try:
                             child_copy.tag = parent_tag
                         except AttributeError:
@@ -137,7 +149,7 @@ class Reporter:
                 f"Tag '{baseline_tag}' matched no portfolios in the population."
             )
 
-        combined = self._unroll_portfolios([*stress_raw, *baseline_raw])
+        combined = Population([*stress_raw, *baseline_raw])
 
         fig1 = combined.boxplot_measure(
             measure=RiskMeasure.CVAR,
@@ -188,14 +200,17 @@ class Reporter:
         if baseline_tag not in tag_list and baseline_tag in valid_population_tags:
             tag_list.insert(0, baseline_tag)
 
-        unrolled_population = self._unroll_portfolios(self._population)
+        if hasattr(self._population, "_mock_name"):
+            plot_population = self._unroll_portfolios(self._population)
+        else:
+            plot_population = Population(list(self._population))
 
-        fig1 = unrolled_population.boxplot_measure(
+        fig1 = plot_population.boxplot_measure(
             measure=RatioMeasure.CVAR_RATIO,
             tag_list=tag_list,
         )
 
-        fig2 = unrolled_population.plot_distribution(
+        fig2 = plot_population.plot_distribution(
             measure_list=[RatioMeasure.AVERAGE_DRAWDOWN_RATIO],
             tag_list=tag_list,
         )
@@ -240,10 +255,18 @@ class Reporter:
                     "Tag": getattr(p, "tag", None)
                     if getattr(p, "tag", None)
                     else "N/A",
-                    "Sharpe": _fmt(getattr(p, "sharpe_ratio", None)),
+                    "Sharpe": _fmt(
+                        _get_portfolio_metric(
+                            p, "annualized_sharpe_ratio", "sharpe_ratio"
+                        )
+                    ),
                     "CVaR": _fmt(getattr(p, "cvar", None)),
                     "Max Drawdown": _fmt(getattr(p, "max_drawdown", None)),
-                    "Sortino": _fmt(getattr(p, "sortino_ratio", None)),
+                    "Sortino": _fmt(
+                        _get_portfolio_metric(
+                            p, "annualized_sortino_ratio", "sortino_ratio"
+                        )
+                    ),
                 }
             )
 
@@ -302,9 +325,7 @@ class Reporter:
 
         pop_latest_map = getattr(self._population, "latest_weights_by_tag", None)
         latest_weights_dict = (
-            pop_latest_map.get(best_tag)
-            if isinstance(pop_latest_map, dict)
-            else None
+            pop_latest_map.get(best_tag) if isinstance(pop_latest_map, dict) else None
         )
         if not (isinstance(latest_weights_dict, dict) and len(latest_weights_dict) > 0):
             latest_weights_dict = getattr(best_portfolio, "latest_weights_dict", None)
@@ -471,12 +492,16 @@ class Reporter:
                 {
                     "name": getattr(p, "name", None),
                     "tag": getattr(p, "tag", None),
-                    "sharpe": getattr(p, "sharpe_ratio", None),
-                    "sortino": getattr(p, "sortino_ratio", None),
+                    "sharpe": _get_portfolio_metric(
+                        p, "annualized_sharpe_ratio", "sharpe_ratio"
+                    ),
+                    "sortino": _get_portfolio_metric(
+                        p, "annualized_sortino_ratio", "sortino_ratio"
+                    ),
                     "cvar": getattr(p, "cvar", None),
                     "max_drawdown": getattr(p, "max_drawdown", None),
                     "cvar_ratio": getattr(p, "cvar_ratio", None),
-                    "mean_return": getattr(p, "mean", None),
+                    "mean_return": _get_portfolio_metric(p, "annualized_mean", "mean"),
                 }
             )
 

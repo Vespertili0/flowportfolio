@@ -7,6 +7,7 @@ multiple investment strategies using ``skfolio``.
 
 from __future__ import annotations
 
+import copy
 import logging
 from typing import Any, TypedDict
 
@@ -191,6 +192,13 @@ class PortfolioExperimentEngine:
     ) -> int:
         """Determine the (minimum) number of observations in an outer training fold."""
         if cv_type == "walk_forward":
+            if outer_kwargs.get("freq") is not None and hasattr(outer_cv, "split"):
+                try:
+                    splits = list(outer_cv.split(returns))
+                    if splits:
+                        return max(1, min(len(train_idx) for train_idx, _ in splits))
+                except Exception:  # noqa: BLE001, S110
+                    pass
             return int(outer_kwargs.get("train_size", 252))
 
         if cv_type == "combinatorial":
@@ -248,6 +256,8 @@ class PortfolioExperimentEngine:
             If ``cv_type`` is not one of the supported strings, or if
             ``universe.returns`` is unavailable.
         """
+        self._latest_weights = {}
+
         # 1. Resolve CV protocols
         resolved_outer_kwargs = dict(cv_kwargs)
         if cv_type == "walk_forward":
@@ -290,6 +300,9 @@ class PortfolioExperimentEngine:
                 )
                 resolved_inner_kwargs["train_size"] = inner_train
                 resolved_inner_kwargs["test_size"] = inner_test
+                if cv_kwargs.get("freq") is not None:
+                    # inner_train and inner_test are observation row counts, not calendar periods
+                    resolved_inner_kwargs.pop("freq", None)
 
                 inner_cv = self._resolve_cv_splitter(
                     "walk_forward", **resolved_inner_kwargs
@@ -320,6 +333,9 @@ class PortfolioExperimentEngine:
                 if hasattr(est_clone, "steps") and est_clone.steps
                 else est_clone
             )
+            user_previous_weights = copy.deepcopy(
+                getattr(target_opt, "previous_weights", None)
+            )
             # Prevent present-day physical weights from contaminating historical fold 0
             # while keeping turnover constraints active across sequential walk-forward folds.
             if (
@@ -327,6 +343,18 @@ class PortfolioExperimentEngine:
                 and getattr(target_opt, "previous_weights", None) is not None
             ):
                 set_previous_weights_chain(target_opt, equal_weights)
+
+            if (
+                cv_type in ("combinatorial", "randomised")
+                and getattr(target_opt, "max_turnover", None) is not None
+            ):
+                logger.warning(
+                    "Strategy '%s' configured with max_turnover under non-sequential cv_type='%s'. "
+                    "Historical cross-validation evaluates turnover against equal baseline weights; "
+                    "live terminal refit enforces max_turnover against current physical weights.",
+                    name,
+                    cv_type,
+                )
 
             # a. Hyperparameter search
             search = GridSearchCV(
@@ -351,7 +379,7 @@ class PortfolioExperimentEngine:
             try:
                 live_search = search
                 live_window = returns.iloc[-min(outer_train, len(returns)) :]
-                # Anchor live refit turnover to final OOS portfolio weights if present
+                # Anchor live refit turnover to user's physical weights if present, else final OOS weights
                 last_oos_weights = None
                 ports_list = (
                     list(portfolio)
@@ -367,11 +395,12 @@ class PortfolioExperimentEngine:
                         )
                     else:
                         last_oos_weights = getattr(last_p, "weights_dict", None)
-                if (
-                    last_oos_weights
-                    and getattr(target_opt, "max_turnover", None) is not None
-                ):
-                    set_previous_weights_chain(live_search, last_oos_weights)
+
+                if getattr(target_opt, "max_turnover", None) is not None:
+                    if user_previous_weights is not None:
+                        set_previous_weights_chain(live_search, user_previous_weights)
+                    elif last_oos_weights:
+                        set_previous_weights_chain(live_search, last_oos_weights)
 
                 live_search.fit(live_window)
                 if getattr(live_search, "weights_", None) is not None:
@@ -485,6 +514,8 @@ class PortfolioExperimentEngine:
         RuntimeError
             If no strategies have been registered via add_strategy().
         """
+        self._latest_weights = {}
+
         if not self._strategies:
             raise RuntimeError("No strategies registered. Call add_strategy() first.")
 
@@ -492,6 +523,12 @@ class PortfolioExperimentEngine:
             raise ValueError(
                 f"Unknown cv_type: '{cv_type}'. Must be one of "
                 "'walk_forward', 'combinatorial', or 'randomised'."
+            )
+
+        if cv_type != "walk_forward":
+            logger.warning(
+                "run_online_evaluation only supports sequential walk-forward evaluation; ignoring cv_type='%s'.",
+                cv_type,
             )
 
         returns = self._universe.returns
@@ -568,6 +605,10 @@ class PortfolioExperimentEngine:
 
             self._validate_online_estimator(name, est)
 
+            user_previous_weights = copy.deepcopy(
+                getattr(est, "previous_weights", None)
+            )
+
             if (
                 getattr(est, "max_turnover", None) is not None
                 and getattr(est, "previous_weights", None) is not None
@@ -602,6 +643,7 @@ class PortfolioExperimentEngine:
                 or isinstance(portfolio, list)
                 else [portfolio]
             )
+            term_w = None
             if ports_list:
                 last_p = ports_list[-1]
                 term_w = (
@@ -609,10 +651,44 @@ class PortfolioExperimentEngine:
                     if hasattr(last_p, "portfolios") and last_p.portfolios
                     else getattr(last_p, "weights_dict", None)
                 )
-                if isinstance(term_w, dict) and term_w:
-                    self._latest_weights[name] = {
-                        str(k): float(v) for k, v in term_w.items()
-                    }
+
+            if not hasattr(best_model, "_mock_name"):
+                try:
+                    live_model = clone(best_model)
+                    if (
+                        user_previous_weights is not None
+                        and getattr(live_model, "max_turnover", None) is not None
+                    ):
+                        set_previous_weights_chain(live_model, user_previous_weights)
+
+                    trailing_window = returns.iloc[-min(burn_in_size, len(returns)) :]
+                    if hasattr(live_model, "fit"):
+                        live_model.fit(trailing_window)
+                        if getattr(live_model, "weights_", None) is not None:
+                            feat_names = getattr(
+                                live_model, "feature_names_in_", trailing_window.columns
+                            )
+                            self._latest_weights[name] = {
+                                str(col): float(w)
+                                for col, w in zip(feat_names, live_model.weights_)
+                            }
+                        elif term_w is not None:
+                            self._latest_weights[name] = {
+                                str(k): float(v) for k, v in term_w.items()
+                            }
+                    elif term_w is not None:
+                        self._latest_weights[name] = {
+                            str(k): float(v) for k, v in term_w.items()
+                        }
+                except Exception:  # noqa: BLE001
+                    if term_w is not None:
+                        self._latest_weights[name] = {
+                            str(k): float(v) for k, v in term_w.items()
+                        }
+            elif term_w is not None:
+                self._latest_weights[name] = {
+                    str(k): float(v) for k, v in term_w.items()
+                }
 
             if type(portfolio).__name__ == "Population" or isinstance(portfolio, list):
                 collected.extend(portfolio)

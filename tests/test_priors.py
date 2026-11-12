@@ -176,3 +176,40 @@ def test_relative_view_with_rhs_spread_and_no_bl_double_division(stub_universe):
     assert ep.mean_views == [f"0.5 * tech == {0.0504 / 252.0}"]
     assert bl.views == [f"tech == {0.0504 / 252.0}"]
 
+
+def test_empirical_prior_bayes_stein_and_post_multiplied_views(stub_universe):
+    """Verify Bayes-Stein shrinkage, LedoitWolf covariance, post-multiplied view parsing, and relative equality in BL."""
+    import numpy as np
+    import pandas as pd
+    from skfolio.moments import LedoitWolf, ShrunkMu, ShrunkMuMethods
+
+    # 1. Defaults
+    synth = PriorSynthesiser(universe=stub_universe)
+    emp_prior = synth.build_empirical_prior()
+    assert isinstance(emp_prior.covariance_estimator, LedoitWolf)
+    assert isinstance(emp_prior.mu_estimator, ShrunkMu)
+    assert emp_prior.mu_estimator.method == ShrunkMuMethods.BAYES_STEIN
+
+    # Fit on synthetic 2-asset returns and ensure beta_ in (0, 1]
+    rng = np.random.default_rng(42)
+    rets = pd.DataFrame(rng.normal(0.0005, 0.01, (100, 2)), columns=["AAPL", "MSFT"])
+    emp_prior.fit(rets)
+    assert 0.0 < emp_prior.mu_estimator_.beta_ <= 1.0
+    assert 0.0 <= emp_prior.mu_estimator_.alpha_ < 1.0
+
+    # 2. Post-multiplied view expression parsing
+    synth.add_market_view("tech * 2.0 == 0.0504", confidence=0.8)
+    # Default average_groups=True: tech has 2 members, so 2.0 * tech / 2 -> 1 * tech
+    ep = synth.build_entropy_prior()
+    assert ep.mean_views == [f"1 * tech == {0.0504 / 252.0}"]
+
+    # 3. Relative equality in BlackLitterman (SPY == TLT)
+    u_rel = MagicMock(spec=Universe)
+    u_rel.tickers = ["AAPL", "MSFT"]
+    u_rel.metadata = {"AAPL": "tech", "MSFT": "tech"}
+    u_rel.fees = {"AAPL": 0.001, "MSFT": 0.001}
+    u_rel.returns = MagicMock()
+    synth_rel = PriorSynthesiser(universe=u_rel)
+    synth_rel.add_market_view("AAPL == MSFT", confidence=0.7)
+    bl = synth_rel.build_black_litterman_prior()
+    assert bl.views == ["AAPL == MSFT"]

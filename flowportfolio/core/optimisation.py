@@ -2,6 +2,7 @@ from collections.abc import Callable
 from typing import Any
 
 import numpy as np
+import pandas as pd
 from skfolio.optimization import BaseOptimization
 from sklearn.model_selection import GridSearchCV
 from sklearn.pipeline import Pipeline
@@ -139,9 +140,27 @@ class SkfolioGridSearchCV(BaseOptimization, GridSearchCV):
             else None
         )
         if self.previous_weights is not None and target is not None:
-            set_previous_weights_chain(target, self.previous_weights)
+            if (
+                isinstance(X, pd.DataFrame)
+                and len(X.columns) > 0
+                and getattr(self, "refit", True)
+            ):
+                eq_w = {col: 1.0 / len(X.columns) for col in X.columns}
+                set_previous_weights_chain(target, eq_w)
+            else:
+                set_previous_weights_chain(target, self.previous_weights)
 
         GridSearchCV.fit(self, X, y, **fit_params)
+
+        if (
+            self.previous_weights is not None
+            and getattr(self, "refit", True)
+            and hasattr(self, "best_estimator_")
+        ):
+            best_target = self._get_target_optimizer(self.best_estimator_)
+            if best_target is not None:
+                set_previous_weights_chain(best_target, self.previous_weights)
+                self.best_estimator_.fit(X, y, **fit_params)
 
         inner = self._get_target_optimizer(self.best_estimator_)
         raw_weights = getattr(inner, "weights_", None)

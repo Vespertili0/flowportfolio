@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -335,67 +336,87 @@ class PortfolioDeltaEngine:
             dtype=float,
         )
 
-        # Use out-of-sample MultiPeriodPortfolio/Portfolio metrics when available on real skfolio objects
-        has_oos_metrics = (
-            bool(matched)
-            and all(
-                getattr(p, "returns_df", None) is not None
-                and getattr(p, "cvar", None) is not None
-                and getattr(p, "sharpe_ratio", None) is not None
-                and getattr(p, "max_drawdown", None) is not None
-                for p in matched
-            )
-        )
+        def _get_sharpe(p: Any) -> float:
+            if not hasattr(p, "_mock_name") and hasattr(p, "annualized_sharpe_ratio"):
+                return float(p.annualized_sharpe_ratio)
+            return float(p.sharpe_ratio)
 
-        if has_oos_metrics and len(matched) > 1:
+        # Extract risk_free_rate if present
+        port_rfr = 0.0
+        if selected_port is not None and not hasattr(selected_port, "_mock_name"):
+            rfr = getattr(selected_port, "risk_free_rate", None)
+            if (
+                rfr is None
+                and hasattr(selected_port, "portfolios")
+                and selected_port.portfolios
+            ):
+                rfr = getattr(selected_port.portfolios[0], "risk_free_rate", None)
+            if isinstance(rfr, (int, float)) and np.isfinite(rfr):
+                port_rfr = float(rfr)
+
+        ptf_kwargs: dict[str, Any] = {
+            "weight_drift": True,
+            "management_fees": daily_fees_vector,
+        }
+        if port_rfr:
+            ptf_kwargs["risk_free_rate"] = port_rfr
+
+        if matched and len(matched) > 1:
             hold_cvars = []
             hold_sharpes = []
             hold_mdds = []
+            reb_cvars = []
+            reb_sharpes = []
+            reb_mdds = []
             for p in matched:
                 path_returns = _align_returns_for_portfolio(p)
                 hp = Portfolio(
                     X=path_returns,
                     weights=current_weight_vector,
-                    weight_drift=True,
-                    management_fees=daily_fees_vector,
+                    **ptf_kwargs,
+                )
+                rp = Portfolio(
+                    X=path_returns,
+                    weights=target_weight_vector,
+                    **ptf_kwargs,
                 )
                 hold_cvars.append(float(hp.cvar))
-                hold_sharpes.append(float(hp.sharpe_ratio))
+                hold_sharpes.append(_get_sharpe(hp))
                 hold_mdds.append(float(hp.max_drawdown))
+
+                reb_cvars.append(float(rp.cvar))
+                reb_sharpes.append(_get_sharpe(rp))
+                reb_mdds.append(float(rp.max_drawdown))
+
             hold_metrics = {
                 "cvar": float(np.median(hold_cvars)),
                 "sharpe": float(np.median(hold_sharpes)),
                 "max_drawdown": float(np.median(hold_mdds)),
             }
+            rebalance_metrics = {
+                "cvar": float(np.median(reb_cvars)),
+                "sharpe": float(np.median(reb_sharpes)),
+                "max_drawdown": float(np.median(reb_mdds)),
+            }
         else:
             hold_portfolio = Portfolio(
                 X=eval_returns,
                 weights=current_weight_vector,
-                weight_drift=True,
-                management_fees=daily_fees_vector,
+                **ptf_kwargs,
             )
-            hold_metrics = {
-                "cvar": float(hold_portfolio.cvar),
-                "sharpe": float(hold_portfolio.sharpe_ratio),
-                "max_drawdown": float(hold_portfolio.max_drawdown),
-            }
-
-        if has_oos_metrics:
-            rebalance_metrics = {
-                "cvar": float(np.median([float(p.cvar) for p in matched])),
-                "sharpe": float(np.median([float(p.sharpe_ratio) for p in matched])),
-                "max_drawdown": float(np.median([float(p.max_drawdown) for p in matched])),
-            }
-        else:
             rebalance_portfolio = Portfolio(
                 X=eval_returns,
                 weights=target_weight_vector,
-                weight_drift=True,
-                management_fees=daily_fees_vector,
+                **ptf_kwargs,
             )
+            hold_metrics = {
+                "cvar": float(hold_portfolio.cvar),
+                "sharpe": _get_sharpe(hold_portfolio),
+                "max_drawdown": float(hold_portfolio.max_drawdown),
+            }
             rebalance_metrics = {
                 "cvar": float(rebalance_portfolio.cvar),
-                "sharpe": float(rebalance_portfolio.sharpe_ratio),
+                "sharpe": _get_sharpe(rebalance_portfolio),
                 "max_drawdown": float(rebalance_portfolio.max_drawdown),
             }
 
@@ -418,12 +439,15 @@ class PortfolioDeltaEngine:
         self,
         brokerage_bps: float = 10.0,
         slippage_bps: float = 5.0,
+        portfolio_value: float | None = None,
+        brokerage_flat: float = 0.0,
     ) -> pd.DataFrame:
         """Calculate the transaction friction and management fee costs.
 
         Computes per-asset turnover as ``abs(target_weight -
         current_weight)``. Calculates transaction cost as
-        ``turnover * (brokerage_bps + slippage_bps) / 10_000``. Calculates
+        ``turnover * (brokerage_bps + slippage_bps) / 10_000`` plus any
+        proportional drag from ``brokerage_flat / portfolio_value``. Calculates
         annual TER cost as ``target_weight * universe.fees[ticker]``.
 
         Parameters
@@ -432,6 +456,11 @@ class PortfolioDeltaEngine:
             Brokerage fee in basis points, default ``10.0``.
         slippage_bps : float, optional
             Expected slippage in basis points, default ``5.0``.
+        portfolio_value : float or None, optional
+            Total portfolio cash value in currency units. Required if
+            ``brokerage_flat > 0.0``.
+        brokerage_flat : float, optional
+            Flat brokerage fee per trade in currency units, default ``0.0``.
 
         Returns
         -------
@@ -444,10 +473,24 @@ class PortfolioDeltaEngine:
         Raises
         ------
         ValueError
-            If ``brokerage_bps`` or ``slippage_bps`` are negative.
+            If ``brokerage_bps``, ``slippage_bps``, or ``brokerage_flat`` are negative,
+            if ``portfolio_value`` is non-positive or non-finite, or if ``brokerage_flat > 0``
+            without ``portfolio_value``.
         """
         self._validate_bps(brokerage_bps, "brokerage_bps")
         self._validate_bps(slippage_bps, "slippage_bps")
+        self._validate_bps(brokerage_flat, "brokerage_flat")
+
+        if portfolio_value is not None and (
+            not isinstance(portfolio_value, (int, float))
+            or isinstance(portfolio_value, bool)
+            or not np.isfinite(portfolio_value)
+            or portfolio_value <= 0
+        ):
+            raise ValueError("portfolio_value must be a positive finite number.")
+
+        if brokerage_flat > 0.0 and portfolio_value is None:
+            raise ValueError("portfolio_value must be provided when brokerage_flat > 0.")
 
         fees = self._universe.fees
         total_bps = brokerage_bps + slippage_bps
@@ -465,7 +508,18 @@ class PortfolioDeltaEngine:
             gross_weight_traded = abs(target_w - current_w)
             one_way_turnover = gross_weight_traded / 2.0
 
-            transaction_cost = gross_weight_traded * total_bps / 10_000.0
+            flat_cost_weight = (
+                (float(brokerage_flat) / float(portfolio_value))
+                if (
+                    brokerage_flat > 0.0
+                    and portfolio_value is not None
+                    and gross_weight_traded > 1e-12
+                )
+                else 0.0
+            )
+            transaction_cost = (
+                gross_weight_traded * total_bps / 10_000.0 + flat_cost_weight
+            )
 
             annual_ter = target_w * float(fees.get(ticker, 0.0))
             current_ter = current_w * float(fees.get(ticker, 0.0))

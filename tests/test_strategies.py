@@ -282,3 +282,115 @@ def test_constraints_reassignment_replaces_not_accumulates():
     nco = fee_builder.build_nco(MeanRisk(), MeanRisk())
     assert nco.portfolio_params is not None
     assert nco.portfolio_params.get("management_fees") == {"A": 0.0001, "B": 0.0002}
+
+
+def test_safe_pre_selection_preserves_constrained_group():
+    """Verify _SafePreSelectionTransformer preserves assets required by linear constraints."""
+    import numpy as np
+    from skfolio.pre_selection import DropCorrelated
+
+    from flowportfolio.core.constraints import ConstraintBuilder
+    from flowportfolio.core.universe import Universe
+    from tests.test_audit_remediation_integration import StubProvider, _synthetic_prices
+
+    u = Universe(
+        tickers=["SPY", "QQQ", "TLT", "GLD"],
+        metadata={
+            "SPY": "satellite",
+            "QQQ": "core",
+            "TLT": "defensive",
+            "GLD": "defensive",
+        },
+        fees={"SPY": 0.0009, "QQQ": 0.0020, "TLT": 0.0003, "GLD": 0.0040},
+    )
+    prices = _synthetic_prices(600)
+    # Ensure QQQ is almost identical to SPY so DropCorrelated would otherwise drop QQQ
+    prices["QQQ"] = prices["SPY"] * 1.001 + np.random.randn(600) * 0.0001
+    u.fetch_data(data_provider=StubProvider(prices))
+    u.anchor_history()
+
+    spec = (
+        ConstraintBuilder(u)
+        .min_group("core", 0.40)
+        .max_group("satellite", 0.30)
+        .build()
+    )
+    pipe = (
+        StrategyBuilder(constraints=spec)
+        .add_pre_selection(DropCorrelated(threshold=0.85))
+        .set_optimizer(MeanRisk())
+        .build_pipeline()
+    )
+
+    pipe.fit(u.returns)
+    opt = pipe.named_steps["optimizer"]
+    assert "QQQ" in opt.feature_names_in_
+    weights_dict = dict(zip(opt.feature_names_in_, opt.weights_))
+    assert weights_dict["QQQ"] >= 0.40 - 1e-5
+
+
+def test_adaptive_kmeans_and_pickle():
+    """Verify _AdaptiveKMeans adapts cluster count on small N and is picklable."""
+    import pickle
+
+    import numpy as np
+
+    from flowportfolio.strategies import _AdaptiveKMeans
+
+    ak = _AdaptiveKMeans(n_clusters=8, random_state=42)
+    # 8 assets, 100 features
+    X = np.random.randn(8, 100)
+    ak.fit(X)
+
+    unique_clusters = len(set(ak.labels_))
+    # Effective k should be min(8, 8//2) = 4
+    assert unique_clusters == 4
+    assert ak.n_clusters == 8  # unmutated
+
+    # Picklable
+    pickled = pickle.dumps(ak)
+    restored = pickle.loads(pickled)
+    assert np.array_equal(restored.labels_, ak.labels_)
+
+
+def test_fee_aware_nco_deducts_fees():
+    """Verify _FeeAwareNCO fits successfully and attributes fees to predicted portfolio."""
+    import numpy as np
+    import pandas as pd
+
+    from flowportfolio.strategies import _FeeAwareNCO
+
+    np.random.seed(42)
+    returns = pd.DataFrame(
+        np.random.randn(100, 4) * 0.01 + 0.0005, columns=["A", "B", "C", "D"]
+    )
+    fees = {"A": 0.001 / 252, "B": 0.002 / 252, "C": 0.001 / 252, "D": 0.003 / 252}
+
+    nco = _FeeAwareNCO(
+        inner_estimator=MeanRisk(),
+        outer_estimator=MeanRisk(),
+        portfolio_params={"management_fees": fees},
+    )
+    nco.fit(returns)
+    assert nco.weights_ is not None
+    assert abs(sum(nco.weights_) - 1.0) < 1e-5
+
+    port = nco.predict(returns)
+    assert hasattr(port, "management_fees")
+
+
+def test_warnings_on_unsupported_constraints_in_optimizer(caplog):
+    """Verify StrategyBuilder logs warnings when optimizer lacks linear_constraints or max_turnover."""
+    import logging
+
+    from skfolio.optimization import HierarchicalRiskParity
+
+    builder = StrategyBuilder(constraints=["core >= 0.5"])
+    builder._max_turnover = 0.05
+    builder._previous_weights = {"A": 0.5, "B": 0.5}
+
+    with caplog.at_level(logging.WARNING):
+        builder.set_optimizer(HierarchicalRiskParity())
+
+    assert "does not support linear_constraints" in caplog.text
+    assert "does not support max_turnover" in caplog.text

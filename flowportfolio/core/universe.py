@@ -281,10 +281,44 @@ class Universe:
         if missing_tickers:
             raise ValueError(f"Download did not return data for: {missing_tickers}")
 
-        # Reorder columns to match the original tickers ordering. Record each
-        # ticker's last genuine price date before any forward-filling so that
-        # anchor_history() can detect histories that ended before the common start.
+        # Reorder columns to match the original tickers ordering.
         raw_prices = prices[self._tickers]
+
+        # Mixed calendar detection: if both weekday-only and weekend-active
+        # tickers coexist, filter prices to weekdays (Monday-Friday) to prevent
+        # forward-fill variance dilution and 365-day fee overcharging on weekday assets.
+        if (
+            isinstance(raw_prices.index, pd.DatetimeIndex)
+            and len(self._tickers) > 1
+            and (raw_prices.index.dayofweek >= 5).any()
+        ):
+            weekend_mask = raw_prices.index.dayofweek >= 5
+            weekday_mask = ~weekend_mask
+
+            weekday_only_tickers = [
+                t
+                for t in self._tickers
+                if raw_prices.loc[weekday_mask, t].count() >= 1
+                and raw_prices.loc[weekend_mask, t].count() == 0
+            ]
+            weekend_active_tickers = [
+                t
+                for t in self._tickers
+                if raw_prices.loc[weekend_mask, t].count() >= 1
+            ]
+
+            if weekday_only_tickers and weekend_active_tickers:
+                logger.warning(
+                    "Detected mixed 5-day (weekday-only: %s) and 7-day (weekend-active: %s) "
+                    "trading calendars. Filtering prices to weekdays (Monday-Friday) to prevent "
+                    "forward-fill variance dilution and 365-day fee overcharging on weekday assets.",
+                    weekday_only_tickers,
+                    weekend_active_tickers,
+                )
+                raw_prices = raw_prices.loc[weekday_mask]
+
+        # Record each ticker's last genuine price date before any forward-filling so that
+        # anchor_history() can detect histories that ended before the common start.
         self._raw_last_valid = {
             col: raw_prices[col].last_valid_index() for col in self._tickers
         }

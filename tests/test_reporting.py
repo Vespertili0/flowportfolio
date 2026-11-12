@@ -547,3 +547,52 @@ def test_reporter_consistent_trajectory_cvar_and_no_tag_mutation() -> None:
 
     best_tag = reporter._best_tag_by_median_cvar(["StratA"])
     assert best_tag == "StratA"
+
+
+def test_reporter_annualized_metrics_and_uncensored_drawdown() -> None:
+    """Verify Reporter reports annualized metrics on real portfolios and evaluates full trajectory drawdown."""
+    from unittest.mock import patch
+
+    from skfolio import MultiPeriodPortfolio, Population, Portfolio
+
+    # 4 consecutive folds with negative returns
+    dates = pd.date_range("2026-01-01", periods=40, freq="B")
+    ret_df = pd.DataFrame({"A": [-0.01] * 40, "B": [-0.01] * 40}, index=dates)
+
+    p1 = Portfolio(X=ret_df.iloc[:10], weights=np.array([0.5, 0.5]), name="p1")
+    p2 = Portfolio(X=ret_df.iloc[10:20], weights=np.array([0.5, 0.5]), name="p2")
+    p3 = Portfolio(X=ret_df.iloc[20:30], weights=np.array([0.5, 0.5]), name="p3")
+    p4 = Portfolio(X=ret_df.iloc[30:], weights=np.array([0.5, 0.5]), name="p4")
+
+    mp = MultiPeriodPortfolio(portfolios=[p1, p2, p3, p4], name="MPP", tag="StratA")
+    pop = Population([mp])
+    reporter = Reporter(pop)
+
+    metrics_df = reporter.extract_metrics_dataframe()
+    # Check that annualized metrics match portfolio's annualized properties
+    assert np.isclose(metrics_df["sharpe"].iloc[0], mp.annualized_sharpe_ratio)
+    assert np.isclose(metrics_df["sortino"].iloc[0], mp.annualized_sortino_ratio)
+    assert np.isclose(metrics_df["mean_return"].iloc[0], mp.annualized_mean)
+
+    # Full trajectory drawdown should accumulate across all 4 folds (~33%),
+    # whereas individual 10-day fold drawdowns are only ~9.5%
+    total_dd = float(mp.max_drawdown)
+    child_max_dd = max(float(p.max_drawdown) for p in [p1, p2, p3, p4])
+    assert total_dd > child_max_dd
+
+    # Test plot_stress_impact preserves full multi-period trajectory
+    mp_baseline = MultiPeriodPortfolio(
+        portfolios=[p1, p2], name="BaseMPP", tag="Baseline"
+    )
+    stress_pop = Population([mp, mp_baseline])
+    stress_reporter = Reporter(stress_pop)
+
+    with (
+        patch.object(Population, "boxplot_measure") as mock_box,
+        patch.object(Population, "plot_distribution") as mock_dist,
+    ):
+        mock_box.return_value = MagicMock()
+        mock_dist.return_value = MagicMock()
+        stress_reporter.plot_stress_impact("StratA", "Baseline")
+        assert mock_dist.called
+        assert mock_box.called

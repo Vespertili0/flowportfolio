@@ -7,6 +7,7 @@ asset universe structure.
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -38,6 +39,9 @@ class ConstraintSpec:
     management_fees : dict[str, float] | None, optional
         Daily-scaled management fees (annual fee divided by 252.0), keyed by
         ticker so that skfolio can align them by column name.
+    transaction_costs : dict[str, float] | float | None, optional
+        Proportional transaction costs, either uniform (scalar float) or keyed
+        by ticker.
     """
 
     linear_constraints: list[str] = field(default_factory=list)
@@ -45,6 +49,7 @@ class ConstraintSpec:
     previous_weights: dict[str, float] | None = None
     max_turnover: float | None = None
     management_fees: dict[str, float] | None = None
+    transaction_costs: dict[str, float] | float | None = None
 
     def __iter__(self) -> Iterator[str]:
         return iter(self.linear_constraints)
@@ -66,6 +71,7 @@ class ConstraintSpec:
                 and self.previous_weights == other.previous_weights
                 and self.max_turnover == other.max_turnover
                 and self.management_fees == other.management_fees
+                and self.transaction_costs == other.transaction_costs
             )
         if isinstance(other, list):
             return self.linear_constraints == other
@@ -106,6 +112,7 @@ class ConstraintBuilder:
         self._constraints: list[str] = []
         self._max_turnover: float | None = None
         self._previous_weights: dict[str, float] | None = None
+        self._transaction_costs: dict[str, float] | float | None = None
 
     def min_group(self, group_name: str, weight: float) -> ConstraintBuilder:
         """Add a minimum weight constraint for a specific group.
@@ -186,7 +193,7 @@ class ConstraintBuilder:
         ------
         ValueError
             If any of the groups are not found in the universe metadata, weight is out of bounds,
-            or group names are invalid.
+            or group_names are invalid.
         """
         for group in group_names:
             if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", group):
@@ -198,6 +205,55 @@ class ConstraintBuilder:
 
         combined_str = " + ".join(group_names)
         self._constraints.append(f"{combined_str} <= {weight:.6g}")
+        return self
+
+    def transaction_costs(self, costs: dict[str, float] | float) -> ConstraintBuilder:
+        """Add per-asset or uniform proportional transaction costs.
+
+        Parameters
+        ----------
+        costs : dict[str, float] | float
+            Uniform transaction cost (as a non-negative float) or mapping of
+            ticker symbols to per-asset transaction costs.
+
+        Returns
+        -------
+        ConstraintBuilder
+            The builder instance for method chaining.
+
+        Raises
+        ------
+        TypeError
+            If costs is not a float or a dictionary of floats.
+        ValueError
+            If any cost is negative or non-finite.
+        """
+        if isinstance(costs, (int, float)) and not isinstance(costs, bool):
+            cost_val = float(costs)
+            if not math.isfinite(cost_val) or cost_val < 0.0:
+                raise ValueError(
+                    "Transaction costs must be a non-negative finite number."
+                )
+            self._transaction_costs = cost_val
+        elif isinstance(costs, dict):
+            cost_dict: dict[str, float] = {}
+            for ticker, c in costs.items():
+                if not isinstance(c, (int, float)) or isinstance(c, bool):
+                    raise TypeError(
+                        f"Transaction cost for ticker '{ticker}' must be a number."
+                    )
+                c_val = float(c)
+                if not math.isfinite(c_val) or c_val < 0.0:
+                    raise ValueError(
+                        f"Transaction cost for ticker '{ticker}' must be non-negative and finite."
+                    )
+                cost_dict[ticker] = c_val
+            self._transaction_costs = cost_dict
+        else:
+            raise TypeError(
+                "Transaction costs must be a float or a dictionary of floats."
+            )
+
         return self
 
     def max_turnover(
@@ -225,8 +281,9 @@ class ConstraintBuilder:
         Raises
         ------
         ValueError
-            If the limit is not strictly between 0.0 and 1.0, or if any ticker
-            in the universe is missing from current_weights.
+            If the limit is not strictly between 0.0 and 1.0, if any ticker
+            in the universe is missing from current_weights, or if current_weights
+            does not sum to 1.0 within 1e-2 tolerance.
         """
         if (
             not isinstance(limit, (int, float))
@@ -242,9 +299,16 @@ class ConstraintBuilder:
         for ticker in self._universe.tickers:
             validate_weight(current_weights[ticker])
 
-        self._max_turnover = limit
+        total_w = sum(float(current_weights[t]) for t in self._universe.tickers)
+        if abs(total_w - 1.0) > 1e-2:
+            raise ValueError(
+                f"current_weights must sum to 1.0 (within 1e-2 tolerance); got {total_w}."
+            )
+
+        self._max_turnover = float(limit)
         self._previous_weights = {
-            ticker: float(current_weights[ticker]) for ticker in self._universe.tickers
+            ticker: float(current_weights[ticker]) / total_w
+            for ticker in self._universe.tickers
         }
 
         return self
@@ -302,6 +366,11 @@ class ConstraintBuilder:
             ),
             max_turnover=self._max_turnover,
             management_fees=management_fees,
+            transaction_costs=(
+                dict(self._transaction_costs)
+                if isinstance(self._transaction_costs, dict)
+                else self._transaction_costs
+            ),
         )
 
     def reset(self) -> ConstraintBuilder:
@@ -320,4 +389,5 @@ class ConstraintBuilder:
         self._constraints = []
         self._max_turnover = None
         self._previous_weights = None
+        self._transaction_costs = None
         return self

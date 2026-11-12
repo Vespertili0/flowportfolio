@@ -1,18 +1,263 @@
 from __future__ import annotations
 
+import logging
+import re
+from typing import Any
+
+import numpy as np
+import pandas as pd
 from skfolio.optimization import NestedClustersOptimization
 from skfolio.prior import BasePrior
 from sklearn.base import BaseEstimator, TransformerMixin, clone
+from sklearn.cluster import KMeans
 from sklearn.pipeline import Pipeline
 
 from flowportfolio.core.constraints import ConstraintSpec
 
+logger = logging.getLogger(__name__)
 
-def _safe_clone(estimator):
+
+def _safe_clone(estimator: Any) -> Any:
     """Clone an estimator safely."""
     if estimator is None:
         return None
     return clone(estimator)
+
+
+class _SafePreSelectionTransformer(BaseEstimator, TransformerMixin):
+    """Wrapper around pre-selection transformers preventing infeasible constraint subsets."""
+
+    columns_keep_: np.ndarray | None
+    selected_columns_: list[str] | None
+    feature_names_in_: np.ndarray
+    n_features_in_: int
+
+    def __init__(
+        self,
+        transformer: TransformerMixin | BaseEstimator,
+        groups: dict[str, list[str]] | None = None,
+        linear_constraints: list[str] | None = None,
+        max_turnover: float | None = None,
+        previous_weights: dict[str, float] | None = None,
+    ) -> None:
+        self.transformer = transformer
+        self.groups = groups
+        self.linear_constraints = linear_constraints
+        self.max_turnover = max_turnover
+        self.previous_weights = previous_weights
+
+    def fit(
+        self, X: Any, y: Any = None, **fit_params: Any
+    ) -> _SafePreSelectionTransformer:
+        self.transformer_ = _safe_clone(self.transformer)
+        if hasattr(self.transformer_, "set_output"):
+            from contextlib import suppress
+
+            with suppress(Exception):
+                self.transformer_.set_output(transform="pandas")
+
+        if hasattr(self.transformer_, "fit_transform"):
+            res = self.transformer_.fit_transform(X, y=y, **fit_params)
+        else:
+            self.transformer_.fit(X, y=y, **fit_params)
+            res = self.transformer_.transform(X)
+
+        if isinstance(X, pd.DataFrame):
+            input_cols = list(X.columns)
+            self.feature_names_in_ = np.asarray(input_cols, dtype=object)
+            self.n_features_in_ = len(input_cols)
+
+            if isinstance(res, pd.DataFrame):
+                surviving = list(res.columns)
+            elif hasattr(self.transformer_, "get_support"):
+                supp = np.asarray(self.transformer_.get_support(), dtype=bool)
+                surviving = [col for col, keep in zip(input_cols, supp) if keep]
+            else:
+                surviving = list(input_cols)
+
+            # 1. Group Protection
+            if self.groups and self.linear_constraints:
+                all_known_groups = {g for grps in self.groups.values() for g in grps}
+                constrained_groups = set()
+                for g in all_known_groups:
+                    for lc in self.linear_constraints:
+                        if re.search(r"\b" + re.escape(g) + r"\b", lc):
+                            constrained_groups.add(g)
+                            break
+
+                for g in constrained_groups:
+                    group_members = [
+                        col
+                        for col in input_cols
+                        if col in self.groups and g in self.groups[col]
+                    ]
+                    if len(group_members) >= 1:
+                        surviving_group_members = [
+                            c for c in surviving if c in group_members
+                        ]
+                        if not surviving_group_members:
+                            restore_col = group_members[0]
+                            if restore_col not in surviving:
+                                surviving.append(restore_col)
+                                logger.warning(
+                                    "Pre-selection dropped all assets for constrained group '%s'; "
+                                    "restoring asset '%s' to maintain feasibility.",
+                                    g,
+                                    restore_col,
+                                )
+
+            # 2. Turnover Feasibility Protection
+            if self.max_turnover is not None and isinstance(
+                self.previous_weights, dict
+            ):
+                prev_weights = self.previous_weights
+                max_t = float(self.max_turnover)
+
+                def _calc_max_cap(cols: list[str]) -> float:
+                    total_cap: float = 0.0
+                    for c in cols:
+                        w_val = prev_weights.get(c, 0.0)
+                        val = 0.0 if w_val is None else float(w_val)
+                        total_cap += min(1.0, val + max_t)
+                    return total_cap
+
+                dropped = [c for c in input_cols if c not in surviving]
+                dropped.sort(
+                    key=lambda c: (
+                        0.0 if prev_weights.get(c) is None else float(prev_weights[c])
+                    ),
+                    reverse=True,
+                )
+
+                while _calc_max_cap(surviving) < 1.0 - 1e-9 and dropped:
+                    restore_col = dropped.pop(0)
+                    surviving.append(restore_col)
+                    logger.warning(
+                        "Pre-selection produced an infeasible subset under max_turnover=%.4g; "
+                        "restoring asset '%s'.",
+                        self.max_turnover,
+                        restore_col,
+                    )
+
+            self.selected_columns_ = [c for c in input_cols if c in surviving]
+            self.columns_keep_ = np.asarray(self.selected_columns_, dtype=object)
+        else:
+            if hasattr(self.transformer_, "feature_names_in_"):
+                self.feature_names_in_ = self.transformer_.feature_names_in_
+                self.n_features_in_ = len(self.feature_names_in_)
+            elif hasattr(X, "shape") and len(X.shape) > 1:
+                self.n_features_in_ = X.shape[1]
+            if hasattr(self.transformer_, "get_support"):
+                supp = self.transformer_.get_support()
+                self.columns_keep_ = (
+                    np.where(supp)[0]
+                    if not isinstance(supp, np.ndarray) or supp.dtype != int
+                    else supp
+                )
+            else:
+                self.columns_keep_ = None
+            self.selected_columns_ = None
+
+        return self
+
+    def transform(self, X: Any) -> Any:
+        if isinstance(X, pd.DataFrame) and self.selected_columns_ is not None:
+            return X[self.selected_columns_]
+        if hasattr(self, "selected_columns_") and self.selected_columns_ is not None:
+            mask = self.get_support(indices=False)
+            return X[:, mask]
+        return self.transformer_.transform(X)
+
+    def fit_transform(self, X: Any, y: Any = None, **fit_params: Any) -> Any:
+        return self.fit(X, y=y, **fit_params).transform(X)
+
+    def get_support(self, indices: bool = False) -> np.ndarray:
+        if hasattr(self, "feature_names_in_") and self.selected_columns_ is not None:
+            if indices:
+                return np.array(
+                    [
+                        i
+                        for i, c in enumerate(self.feature_names_in_)
+                        if c in self.selected_columns_
+                    ],
+                    dtype=int,
+                )
+            return np.array(
+                [c in self.selected_columns_ for c in self.feature_names_in_],
+                dtype=bool,
+            )
+        if hasattr(self, "transformer_") and hasattr(self.transformer_, "get_support"):
+            return self.transformer_.get_support(indices=indices)
+        raise RuntimeError("Estimator has not been fitted.")
+
+
+class _AdaptiveKMeans(KMeans):
+    """KMeans wrapper that dynamically adapts cluster count without mutating hyperparameter."""
+
+    def fit(self, X: Any, y: Any = None, sample_weight: Any = None) -> _AdaptiveKMeans:
+        n_samples = X.shape[0] if hasattr(X, "shape") else len(X)
+        effective_k = (
+            max(2, min(int(self.n_clusters), n_samples // 2))
+            if n_samples >= 4
+            else max(1, n_samples - 1)
+        )
+        internal = KMeans(
+            n_clusters=effective_k,
+            init=self.init,
+            n_init=self.n_init,
+            max_iter=self.max_iter,
+            tol=self.tol,
+            verbose=self.verbose,
+            random_state=self.random_state,
+            copy_x=self.copy_x,
+            algorithm=self.algorithm,
+        )
+        internal.fit(X, y=y, sample_weight=sample_weight)
+        for attr in (
+            "cluster_centers_",
+            "labels_",
+            "inertia_",
+            "n_iter_",
+            "_n_threads",
+            "n_features_in_",
+            "feature_names_in_",
+        ):
+            if hasattr(internal, attr):
+                setattr(self, attr, getattr(internal, attr))
+        return self
+
+
+class _FeeAwareNCO(NestedClustersOptimization):
+    """NestedClustersOptimization subclass ensuring symmetric fee deduction across clusters."""
+
+    def fit(self, X: Any, y: Any = None, **fit_params: Any) -> _FeeAwareNCO:
+        fees_map = None
+        if (
+            isinstance(self.portfolio_params, dict)
+            and "management_fees" in self.portfolio_params
+            and isinstance(self.portfolio_params["management_fees"], dict)
+        ):
+            fees_map = self.portfolio_params["management_fees"]
+
+        if fees_map is not None and isinstance(X, pd.DataFrame):
+            X_net = X.copy()
+            for col in X_net.columns:
+                fee = float(fees_map.get(str(col), 0.0))
+                if fee != 0.0:
+                    X_net[col] = X_net[col] - fee
+
+            orig_inner = getattr(self, "inner_estimator", None)
+            cloned_inner = _safe_clone(orig_inner)
+            if cloned_inner is not None and hasattr(cloned_inner, "management_fees"):
+                cloned_inner.management_fees = None
+            self.inner_estimator = cloned_inner
+            try:
+                super().fit(X_net, y=y, **fit_params)
+            finally:
+                self.inner_estimator = orig_inner
+            return self
+
+        return super().fit(X, y=y, **fit_params)
 
 
 class StrategyBuilder:
@@ -42,6 +287,7 @@ class StrategyBuilder:
     _constraints: list[str] | ConstraintSpec
     _linear_constraints: list[str]
     _groups: dict[str, list[str]]
+    _transaction_costs: dict[str, float] | float | None
 
     def _apply_constraints(self, value: list[str] | ConstraintSpec | None) -> None:
         if value is None:
@@ -51,6 +297,7 @@ class StrategyBuilder:
             self._previous_weights = None
             self._max_turnover = None
             self._management_fees = None
+            self._transaction_costs = None
         elif isinstance(value, ConstraintSpec):
             self._constraints = value
             self._linear_constraints = list(value.linear_constraints)
@@ -66,6 +313,11 @@ class StrategyBuilder:
                 if value.management_fees is not None
                 else None
             )
+            self._transaction_costs = (
+                dict(value.transaction_costs)
+                if isinstance(value.transaction_costs, dict)
+                else value.transaction_costs
+            )
         elif isinstance(value, list):
             if not all(isinstance(c, str) for c in value):
                 raise TypeError("All constraints must be strings.")
@@ -75,6 +327,7 @@ class StrategyBuilder:
             self._previous_weights = None
             self._max_turnover = None
             self._management_fees = None
+            self._transaction_costs = None
         else:
             raise TypeError("constraints must be a list or ConstraintSpec.")
 
@@ -177,6 +430,27 @@ class StrategyBuilder:
 
         if include_prior and self.prior is not None and hasattr(opt, "prior_estimator"):
             opt.prior_estimator = clone(self.prior)
+
+        if hasattr(opt, "transaction_costs") and self._transaction_costs is not None:
+            opt.transaction_costs = (
+                dict(self._transaction_costs)
+                if isinstance(self._transaction_costs, dict)
+                else self._transaction_costs
+            )
+
+        if self._linear_constraints and not hasattr(opt, "linear_constraints"):
+            logger.warning(
+                "Estimator '%s' does not support linear_constraints; "
+                "group/linear constraints will be ignored by this estimator.",
+                type(opt).__name__,
+            )
+
+        if self._max_turnover is not None and not hasattr(opt, "max_turnover"):
+            logger.warning(
+                "Estimator '%s' does not support max_turnover; "
+                "turnover constraints will be ignored by this estimator.",
+                type(opt).__name__,
+            )
 
         if hasattr(opt, "fallback") and opt.fallback is not None:
             self._inject_into_estimator(opt.fallback, include_prior=include_prior)
@@ -319,15 +593,28 @@ class StrategyBuilder:
                 "No optimizer set. Call set_optimizer() before build_pipeline()."
             )
 
+        has_constraints = bool(
+            self._linear_constraints or self._max_turnover is not None
+        )
         steps = []
         for i, transformer in enumerate(self._pre_selection):
             cloned_tr = _safe_clone(transformer)
-            if hasattr(cloned_tr, "set_output"):
-                from contextlib import suppress
+            if has_constraints:
+                tr_step = _SafePreSelectionTransformer(
+                    transformer=cloned_tr,
+                    groups=self._groups,
+                    linear_constraints=self._linear_constraints,
+                    max_turnover=self._max_turnover,
+                    previous_weights=self._previous_weights,
+                )
+            else:
+                tr_step = cloned_tr
+                if hasattr(tr_step, "set_output"):
+                    from contextlib import suppress
 
-                with suppress(Exception):
-                    cloned_tr.set_output(transform="pandas")
-            steps.append((f"pre_{i}", cloned_tr))
+                    with suppress(Exception):
+                        tr_step.set_output(transform="pandas")
+            steps.append((f"pre_{i}", tr_step))
 
         cloned_optimizer = self._wire_from_raw(include_prior=True)
 
@@ -417,17 +704,6 @@ class StrategyBuilder:
             cloned_inner.prior_estimator = clone(self.prior)
 
         if clusterer == "kmeans":
-            from sklearn.cluster import KMeans
-
-            class _AdaptiveKMeans(KMeans):
-                """KMeans wrapper that adapts n_clusters when the universe has < 8 assets."""
-
-                def fit(self, X, y=None, sample_weight=None):
-                    n_samples = X.shape[0] if hasattr(X, "shape") else len(X)
-                    if n_samples < self.n_clusters:
-                        self.n_clusters = max(1, min(self.n_clusters, max(2, n_samples - 1)) if n_samples > 2 else n_samples)
-                    return super().fit(X, y=y, sample_weight=sample_weight)
-
             clustering_estimator = _AdaptiveKMeans(random_state=random_state)
         else:
             from skfolio.cluster import HierarchicalClustering, LinkageMethod
@@ -449,4 +725,4 @@ class StrategyBuilder:
                 "management_fees": dict(self._management_fees)
             }
 
-        return NestedClustersOptimization(**nco_kwargs)
+        return _FeeAwareNCO(**nco_kwargs)

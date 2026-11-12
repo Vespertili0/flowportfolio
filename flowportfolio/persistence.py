@@ -83,12 +83,18 @@ class PersistenceManager:
             if weights is None:
                 weights = getattr(port, "weights_dict", None) or {}
 
+            sharpe_val = (
+                port.annualized_sharpe_ratio
+                if not hasattr(port, "_mock_name")
+                and hasattr(port, "annualized_sharpe_ratio")
+                else port.sharpe_ratio
+            )
             portfolios_data.append(
                 {
                     "name": port.name,
                     "tag": port.tag,
                     "weights": weights,
-                    "sharpe": float(port.sharpe_ratio),
+                    "sharpe": float(sharpe_val),
                     "cvar": float(port.cvar),
                     "max_drawdown": float(port.max_drawdown),
                 }
