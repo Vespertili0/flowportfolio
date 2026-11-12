@@ -472,3 +472,33 @@ def test_skfolio_grid_search_cv_inner_folds_causality() -> None:
     # Turnover from user_pw: sum(|w - w_prev|) / 2 <= 0.05
     turnover = np.sum(np.abs(gscv.weights_ - np.array([0.8, 0.1, 0.1]))) / 2.0
     assert turnover <= 0.05 + 1e-4
+
+
+def test_run_robustness_test_preserves_user_weights_with_preselection_and_freq() -> None:
+    """Verify live terminal refit satisfies max_turnover against user current_weights and supports freq='ME'."""
+    from skfolio.optimization import MeanRisk
+    from skfolio.pre_selection import DropCorrelated
+
+    from flowportfolio import ConstraintBuilder, StrategyBuilder
+    from tests.test_audit_remediation_integration import _fetched_universe
+
+    u = _fetched_universe(400)
+    cw = {"SPY": 0.70, "TLT": 0.10, "GLD": 0.10, "QQQ": 0.10}
+    spec = ConstraintBuilder(u).max_turnover(0.05, cw).build()
+    pipe = (
+        StrategyBuilder(constraints=spec)
+        .add_pre_selection(DropCorrelated(threshold=0.85))
+        .set_optimizer(MeanRisk())
+        .build_pipeline()
+    )
+
+    engine = PortfolioExperimentEngine(u, n_jobs=1)
+    engine.add_strategy("TurnoverPreSel", pipe, {"optimizer__l1_coef": [0.0]})
+    engine.run_robustness_test(
+        cv_type="walk_forward", train_size=6, test_size=2, freq="ME"
+    )
+    lw = engine.latest_weights["TurnoverPreSel"]
+    for k, w_val in cw.items():
+        assert abs(lw[k] - w_val) <= 0.05 + 1e-5
+
+

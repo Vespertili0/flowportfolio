@@ -342,7 +342,7 @@ class PortfolioExperimentEngine:
                 getattr(target_opt, "max_turnover", None) is not None
                 and getattr(target_opt, "previous_weights", None) is not None
             ):
-                set_previous_weights_chain(target_opt, equal_weights)
+                set_previous_weights_chain(est_clone, equal_weights)
 
             if (
                 cv_type in ("combinatorial", "randomised")

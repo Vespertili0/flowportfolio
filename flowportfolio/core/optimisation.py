@@ -9,7 +9,18 @@ from sklearn.pipeline import Pipeline
 
 
 def set_previous_weights_chain(opt: Any, weights: Any) -> None:
-    """Propagate previous_weights across an optimizer and its entire fallback chain."""
+    """Propagate previous_weights across a Pipeline, optimizer, and its entire fallback chain."""
+    if isinstance(opt, Pipeline):
+        for _, step in opt.steps:
+            set_previous_weights_chain(step, weights)
+        return
+
+    if not hasattr(opt, "_mock_name"):
+        if hasattr(opt, "estimator") and opt.estimator is not None:
+            set_previous_weights_chain(opt.estimator, weights)
+        if hasattr(opt, "best_estimator_") and opt.best_estimator_ is not None:
+            set_previous_weights_chain(opt.best_estimator_, weights)
+
     current = opt
     visited: set[int] = set()
     while current is not None and id(current) not in visited:
@@ -146,9 +157,9 @@ class SkfolioGridSearchCV(BaseOptimization, GridSearchCV):
                 and getattr(self, "refit", True)
             ):
                 eq_w = {col: 1.0 / len(X.columns) for col in X.columns}
-                set_previous_weights_chain(target, eq_w)
+                set_previous_weights_chain(self.estimator, eq_w)
             else:
-                set_previous_weights_chain(target, self.previous_weights)
+                set_previous_weights_chain(self.estimator, self.previous_weights)
 
         GridSearchCV.fit(self, X, y, **fit_params)
 
@@ -157,10 +168,8 @@ class SkfolioGridSearchCV(BaseOptimization, GridSearchCV):
             and getattr(self, "refit", True)
             and hasattr(self, "best_estimator_")
         ):
-            best_target = self._get_target_optimizer(self.best_estimator_)
-            if best_target is not None:
-                set_previous_weights_chain(best_target, self.previous_weights)
-                self.best_estimator_.fit(X, y, **fit_params)
+            set_previous_weights_chain(self.best_estimator_, self.previous_weights)
+            self.best_estimator_.fit(X, y, **fit_params)
 
         inner = self._get_target_optimizer(self.best_estimator_)
         raw_weights = getattr(inner, "weights_", None)
