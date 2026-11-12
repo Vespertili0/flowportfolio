@@ -7,8 +7,7 @@ produces decision-ready trade analysis by quantifying the net risk/return
 benefit of executing a portfolio rebalance versus holding current positions,
 factoring in group drift, Total Expense Ratio (TER), slippage, and brokerage
 friction.
-
-**"""
+"""
 
 from __future__ import annotations
 
@@ -490,7 +489,9 @@ class PortfolioDeltaEngine:
             raise ValueError("portfolio_value must be a positive finite number.")
 
         if brokerage_flat > 0.0 and portfolio_value is None:
-            raise ValueError("portfolio_value must be provided when brokerage_flat > 0.")
+            raise ValueError(
+                "portfolio_value must be provided when brokerage_flat > 0."
+            )
 
         fees = self._universe.fees
         total_bps = brokerage_bps + slippage_bps

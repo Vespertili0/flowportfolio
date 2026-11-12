@@ -474,7 +474,9 @@ def test_skfolio_grid_search_cv_inner_folds_causality() -> None:
     assert turnover <= 0.05 + 1e-4
 
 
-def test_run_robustness_test_preserves_user_weights_with_preselection_and_freq() -> None:
+def test_run_robustness_test_preserves_user_weights_with_preselection_and_freq() -> (
+    None
+):
     """Verify live terminal refit satisfies max_turnover against user current_weights and supports freq='ME'."""
     from skfolio.optimization import MeanRisk
     from skfolio.pre_selection import DropCorrelated
@@ -500,5 +502,3 @@ def test_run_robustness_test_preserves_user_weights_with_preselection_and_freq()
     lw = engine.latest_weights["TurnoverPreSel"]
     for k, w_val in cw.items():
         assert abs(lw[k] - w_val) <= 0.05 + 1e-5
-
-

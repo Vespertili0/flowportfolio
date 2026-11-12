@@ -376,7 +376,9 @@ def test_anchor_history_rejects_disjoint_and_delisted_assets(mock_download) -> N
 
 
 @patch("yfinance.download")
-def test_universe_mixed_weekday_and_weekend_calendar_alignment(mock_download, caplog) -> None:
+def test_universe_mixed_weekday_and_weekend_calendar_alignment(
+    mock_download, caplog
+) -> None:
     """Verify combining 5-day weekday asset with 7-day weekend asset drops weekend rows."""
     # 14 days starting on a Monday (2026-01-05)
     # Week 1: 5-9 (Mon-Fri), 10-11 (Sat-Sun)
@@ -411,5 +413,3 @@ def test_universe_mixed_weekday_and_weekend_calendar_alignment(mock_download, ca
     assert len(univ._prices) == 10
     assert not univ._prices["SPY"].isna().any()
     assert not univ._prices["BTC-USD"].isna().any()
-
-

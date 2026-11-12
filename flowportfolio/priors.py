@@ -561,6 +561,8 @@ class PriorSynthesiser:
         ValueError
             If n_samples < 100.
         """
+        if not isinstance(n_samples, int) or isinstance(n_samples, bool):
+            raise TypeError("n_samples must be an integer.")
         if n_samples < 100:
             raise ValueError(f"n_samples must be at least 100, got {n_samples}")
 

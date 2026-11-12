@@ -376,7 +376,9 @@ def test_property_delta_engine_symmetry_when_hold_equals_target(
     n_days = 60
     dates = pd.date_range("2024-01-01", periods=n_days, freq="B")
     rets = rng.normal(0.0004, 0.01, size=(n_days, 3))
-    prices = pd.DataFrame((1.0 + rets).cumprod(axis=0) * 100.0, index=dates, columns=tickers)
+    prices = pd.DataFrame(
+        (1.0 + rets).cumprod(axis=0) * 100.0, index=dates, columns=tickers
+    )
 
     u = Universe(
         tickers=tickers,
@@ -400,7 +402,10 @@ def test_property_delta_engine_symmetry_when_hold_equals_target(
         delta_res["hold"]["cvar"], delta_res["rebalance"]["cvar"], rtol=1e-5, atol=1e-6
     )
     np.testing.assert_allclose(
-        delta_res["hold"]["sharpe"], delta_res["rebalance"]["sharpe"], rtol=1e-5, atol=1e-6
+        delta_res["hold"]["sharpe"],
+        delta_res["rebalance"]["sharpe"],
+        rtol=1e-5,
+        atol=1e-6,
     )
     np.testing.assert_allclose(
         delta_res["hold"]["max_drawdown"],
@@ -410,7 +415,9 @@ def test_property_delta_engine_symmetry_when_hold_equals_target(
     )
     cvar_delta = delta_res["rebalance"]["cvar"] - delta_res["hold"]["cvar"]
     sharpe_delta = delta_res["rebalance"]["sharpe"] - delta_res["hold"]["sharpe"]
-    mdd_delta = delta_res["rebalance"]["max_drawdown"] - delta_res["hold"]["max_drawdown"]
+    mdd_delta = (
+        delta_res["rebalance"]["max_drawdown"] - delta_res["hold"]["max_drawdown"]
+    )
     assert np.isclose(cvar_delta, 0.0, atol=1e-6)
     assert np.isclose(sharpe_delta, 0.0, atol=1e-6)
     assert np.isclose(mdd_delta, 0.0, atol=1e-6)
@@ -480,5 +487,6 @@ def test_property_delta_engine_flat_brokerage_accounting(
         assert np.isclose(float(row["transaction_cost"]), expected_tc, atol=1e-12)
         total_expected_tc += expected_tc
 
-    assert np.isclose(float(total_row["transaction_cost"]), total_expected_tc, atol=1e-12)
-
+    assert np.isclose(
+        float(total_row["transaction_cost"]), total_expected_tc, atol=1e-12
+    )

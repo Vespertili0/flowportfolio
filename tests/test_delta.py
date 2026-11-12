@@ -273,18 +273,22 @@ def test_calculate_rebalance_delta_multipath_window_alignment():
 
     assert np.isclose(res["hold"]["cvar"], np.median([h1.cvar, h2.cvar]))
     assert np.isclose(
-        res["hold"]["sharpe"], np.median([h1.annualized_sharpe_ratio, h2.annualized_sharpe_ratio])
+        res["hold"]["sharpe"],
+        np.median([h1.annualized_sharpe_ratio, h2.annualized_sharpe_ratio]),
     )
     assert np.isclose(res["rebalance"]["cvar"], np.median([r1.cvar, r2.cvar]))
     assert np.isclose(
-        res["rebalance"]["sharpe"], np.median([r1.annualized_sharpe_ratio, r2.annualized_sharpe_ratio])
+        res["rebalance"]["sharpe"],
+        np.median([r1.annualized_sharpe_ratio, r2.annualized_sharpe_ratio]),
     )
 
 
 def test_calculate_rebalance_delta_symmetric_when_hold_equals_target(stub_universe):
     """Verify that when current_weights == target_weights, hold and rebalance metrics are identical."""
     w = {"AAPL": 0.5, "MSFT": 0.3, "GOOG": 0.2}
-    engine = PortfolioDeltaEngine(universe=stub_universe, current_weights=w, target_weights=w)
+    engine = PortfolioDeltaEngine(
+        universe=stub_universe, current_weights=w, target_weights=w
+    )
     res = engine.calculate_rebalance_delta()
 
     assert np.isclose(res["hold"]["cvar"], res["rebalance"]["cvar"])
@@ -313,10 +317,13 @@ def test_calculate_net_friction_with_portfolio_value_and_flat_brokerage(stub_uni
     assert np.isclose(aapl_cost, 0.00025)
 
     # Validation: flat fee > 0 without portfolio_value
-    with pytest.raises(ValueError, match="portfolio_value must be provided when brokerage_flat > 0"):
+    with pytest.raises(
+        ValueError, match="portfolio_value must be provided when brokerage_flat > 0"
+    ):
         engine.calculate_net_friction(brokerage_flat=10.0, portfolio_value=None)
 
     # Validation: invalid portfolio_value
-    with pytest.raises(ValueError, match="portfolio_value must be a positive finite number"):
+    with pytest.raises(
+        ValueError, match="portfolio_value must be a positive finite number"
+    ):
         engine.calculate_net_friction(brokerage_flat=10.0, portfolio_value=-1000.0)
-

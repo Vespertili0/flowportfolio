@@ -302,9 +302,7 @@ class Universe:
                 and raw_prices.loc[weekend_mask, t].count() == 0
             ]
             weekend_active_tickers = [
-                t
-                for t in self._tickers
-                if raw_prices.loc[weekend_mask, t].count() >= 1
+                t for t in self._tickers if raw_prices.loc[weekend_mask, t].count() >= 1
             ]
 
             if weekday_only_tickers and weekend_active_tickers:
