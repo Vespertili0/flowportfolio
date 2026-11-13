@@ -338,3 +338,79 @@ def test_universe_anchor_history_all_nan_column(mock_download) -> None:
     univ = Universe(TICKERS, METADATA, FEES)
     with pytest.raises(ValueError):
         univ.fetch_data()
+
+
+@patch("yfinance.download")
+def test_anchor_history_rejects_disjoint_and_delisted_assets(mock_download) -> None:
+    """Verify disjoint trading histories and halts exceeding max_ffill_days raise ValueError."""
+    # 1. Disjoint histories: A trades days 1-50 (NaN 51-100), B trades days 60-100 (NaN 1-59)
+    prices_a = [100.0 + i for i in range(50)] + [np.nan] * 50
+    prices_b = [np.nan] * 59 + [200.0 + i for i in range(41)]
+
+    mock_download.return_value = _make_multiindex_prices(
+        ["SPY", "IVV"],
+        {"SPY": prices_a, "IVV": prices_b},
+        start="2026-01-01",
+    )
+    univ = Universe(
+        ["SPY", "IVV"], {"SPY": "core", "IVV": "core"}, {"SPY": 0.0, "IVV": 0.0}
+    )
+    univ.fetch_data(max_ffill_days=5)
+    with pytest.raises(ValueError, match="no valid returns after alignment"):
+        univ.anchor_history()
+
+    # 2. Halt exceeding max_ffill_days: 10-day halt in the middle
+    halt_spy = [100.0] * 20 + [np.nan] * 10 + [105.0] * 20
+    halt_ivv = [200.0] * 50
+    mock_download.return_value = _make_multiindex_prices(
+        ["SPY", "IVV"],
+        {"SPY": halt_spy, "IVV": halt_ivv},
+        start="2026-01-01",
+    )
+    univ2 = Universe(
+        ["SPY", "IVV"], {"SPY": "core", "IVV": "core"}, {"SPY": 0.0, "IVV": 0.0}
+    )
+    univ2.fetch_data(max_ffill_days=5)
+    with pytest.raises(ValueError, match="contains NaN return observations after"):
+        univ2.anchor_history()
+
+
+@patch("yfinance.download")
+def test_universe_mixed_weekday_and_weekend_calendar_alignment(
+    mock_download, caplog
+) -> None:
+    """Verify combining 5-day weekday asset with 7-day weekend asset drops weekend rows."""
+    # 14 days starting on a Monday (2026-01-05)
+    # Week 1: 5-9 (Mon-Fri), 10-11 (Sat-Sun)
+    # Week 2: 12-16 (Mon-Fri), 17-18 (Sat-Sun)
+    dates = pd.date_range("2026-01-05", periods=14, freq="D")
+    spy_prices = []
+    btc_prices = []
+    for d in dates:
+        btc_prices.append(50000.0 + d.day * 100.0)
+        if d.dayofweek < 5:
+            spy_prices.append(400.0 + d.day)
+        else:
+            spy_prices.append(np.nan)
+
+    mock_download.return_value = _make_multiindex_prices(
+        ["SPY", "BTC-USD"],
+        {"SPY": spy_prices, "BTC-USD": btc_prices},
+        start="2026-01-05",
+    )
+
+    univ = Universe(
+        ["SPY", "BTC-USD"],
+        {"SPY": "equity", "BTC-USD": "crypto"},
+        {"SPY": 0.0003, "BTC-USD": 0.001},
+    )
+    with caplog.at_level("WARNING"):
+        univ.fetch_data()
+
+    assert "Detected mixed 5-day" in caplog.text
+    assert univ._prices is not None
+    assert (univ._prices.index.dayofweek < 5).all()
+    assert (univ.returns.index.dayofweek < 5).all()
+    assert len(univ._prices) == 10
+    assert not univ._prices["SPY"].isna().any()
+    assert not univ._prices["BTC-USD"].isna().any()

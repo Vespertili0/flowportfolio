@@ -72,8 +72,8 @@ def test_generate_tearsheet_calls_all_plots(
     reporter.generate_tearsheet()
 
     # Verify calls
-    pop.boxplot_measure.assert_called_once()
-    pop.plot_distribution.assert_called_once()
+    mock_boxplot.assert_called_once()
+    mock_distribution.assert_called_once()
     mock_composition.assert_called_once()
 
 
@@ -132,8 +132,8 @@ def test_tag_list_includes_baseline(
     reporter.generate_tearsheet(baseline_tag="Baseline")
 
     # Verify tag_list passed to boxplot
-    boxplot_kwargs = pop.boxplot_measure.call_args[1]
-    assert "Baseline" in boxplot_kwargs["tag_list"]
+    boxplot_kwargs = mock_boxplot.call_args[1]
+    assert "Baseline" not in boxplot_kwargs["tag_list"]
     assert "StratA" in boxplot_kwargs["tag_list"]
 
 
@@ -200,7 +200,7 @@ def test_custom_baseline_tag(
     reporter = Reporter(pop)
     reporter.generate_tearsheet(baseline_tag="MyBaseline")
 
-    boxplot_kwargs = pop.boxplot_measure.call_args[1]
+    boxplot_kwargs = mock_boxplot.call_args[1]
     # It shouldn't add "Baseline" if "MyBaseline" is the designated baseline
     assert "Baseline" not in boxplot_kwargs["tag_list"]
     assert "MyBaseline" in boxplot_kwargs["tag_list"]
@@ -241,6 +241,25 @@ def test_plot_stress_impact_success(
     fig2.update_layout.assert_called_once_with(
         title="Max Drawdown Distribution: Stress vs Baseline"
     )
+
+
+def test_plot_stress_impact_explicit_population_instantiation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test plot_stress_impact explicitly instantiates Population without relying on list addition."""
+    p_baseline = _make_mock_portfolio("Baseline", 1.0)
+    p_stress = _make_mock_portfolio("Stress", 0.8)
+
+    mock_fig = MagicMock()
+    monkeypatch.setattr(Population, "boxplot_measure", lambda self, **kwargs: mock_fig)
+    monkeypatch.setattr(
+        Population, "plot_distribution", lambda self, **kwargs: mock_fig
+    )
+
+    real_pop = Population([p_baseline, p_stress])
+    reporter = Reporter(real_pop)
+    reporter.plot_stress_impact("Stress", "Baseline")
+    assert mock_fig.show.call_count == 2
 
 
 def test_plot_stress_impact_missing_stress_tag() -> None:
@@ -488,3 +507,92 @@ def test_to_markdown_artifact_unlabelled_assets() -> None:
 
     assert "Asset_0" in report or "0" in report
     assert "port_unlabelled" in report
+
+
+def test_to_markdown_artifact_multi_period_portfolio() -> None:
+    """Test formatting when best portfolio is a MultiPeriodPortfolio."""
+    from skfolio import MultiPeriodPortfolio
+
+    df = pd.DataFrame(np.random.randn(10, 2) / 100, columns=["AAPL", "MSFT"])
+    p = Portfolio(X=df, weights=np.array([0.6, 0.4]), name="p1", tag="StratA")
+    mp = MultiPeriodPortfolio(portfolios=[p], name="mp_port", tag="StratA")
+
+    pop = Population([mp])
+    reporter = Reporter(pop)
+    report = reporter.to_markdown_artifact()
+    assert "AAPL (60.00%)" in report
+    assert "MSFT (40.00%)" in report
+
+
+def test_reporter_consistent_trajectory_cvar_and_no_tag_mutation() -> None:
+    """Verify _best_tag_by_median_cvar granularity and immutability of child tags during unrolling."""
+    df = pd.DataFrame(np.random.randn(20, 2) / 100, columns=["SPY", "TLT"])
+    child1 = Portfolio(X=df.iloc[:10], weights=np.array([0.5, 0.5]), name="c1")
+    child2 = Portfolio(X=df.iloc[10:], weights=np.array([0.6, 0.4]), name="c2")
+    assert getattr(child1, "tag", None) is None
+    assert getattr(child2, "tag", None) is None
+
+    mp = MultiPeriodPortfolio(portfolios=[child1, child2], tag="StratA")
+    pop = Population([mp])
+
+    reporter = Reporter(pop)
+    unrolled = reporter._unroll_portfolios(pop)
+
+    # Verify original child portfolios were not mutated
+    assert getattr(child1, "tag", None) is None
+    assert getattr(child2, "tag", None) is None
+    # Verify unrolled clones inherited tag
+    assert unrolled[0].tag == "StratA"
+    assert unrolled[1].tag == "StratA"
+
+    best_tag = reporter._best_tag_by_median_cvar(["StratA"])
+    assert best_tag == "StratA"
+
+
+def test_reporter_annualized_metrics_and_uncensored_drawdown() -> None:
+    """Verify Reporter reports annualized metrics on real portfolios and evaluates full trajectory drawdown."""
+    from unittest.mock import patch
+
+    from skfolio import MultiPeriodPortfolio, Population, Portfolio
+
+    # 4 consecutive folds with negative returns
+    dates = pd.date_range("2026-01-01", periods=40, freq="B")
+    ret_df = pd.DataFrame({"A": [-0.01] * 40, "B": [-0.01] * 40}, index=dates)
+
+    p1 = Portfolio(X=ret_df.iloc[:10], weights=np.array([0.5, 0.5]), name="p1")
+    p2 = Portfolio(X=ret_df.iloc[10:20], weights=np.array([0.5, 0.5]), name="p2")
+    p3 = Portfolio(X=ret_df.iloc[20:30], weights=np.array([0.5, 0.5]), name="p3")
+    p4 = Portfolio(X=ret_df.iloc[30:], weights=np.array([0.5, 0.5]), name="p4")
+
+    mp = MultiPeriodPortfolio(portfolios=[p1, p2, p3, p4], name="MPP", tag="StratA")
+    pop = Population([mp])
+    reporter = Reporter(pop)
+
+    metrics_df = reporter.extract_metrics_dataframe()
+    # Check that annualized metrics match portfolio's annualized properties
+    assert np.isclose(metrics_df["sharpe"].iloc[0], mp.annualized_sharpe_ratio)
+    assert np.isclose(metrics_df["sortino"].iloc[0], mp.annualized_sortino_ratio)
+    assert np.isclose(metrics_df["mean_return"].iloc[0], mp.annualized_mean)
+
+    # Full trajectory drawdown should accumulate across all 4 folds (~33%),
+    # whereas individual 10-day fold drawdowns are only ~9.5%
+    total_dd = float(mp.max_drawdown)
+    child_max_dd = max(float(p.max_drawdown) for p in [p1, p2, p3, p4])
+    assert total_dd > child_max_dd
+
+    # Test plot_stress_impact preserves full multi-period trajectory
+    mp_baseline = MultiPeriodPortfolio(
+        portfolios=[p1, p2], name="BaseMPP", tag="Baseline"
+    )
+    stress_pop = Population([mp, mp_baseline])
+    stress_reporter = Reporter(stress_pop)
+
+    with (
+        patch.object(Population, "boxplot_measure") as mock_box,
+        patch.object(Population, "plot_distribution") as mock_dist,
+    ):
+        mock_box.return_value = MagicMock()
+        mock_dist.return_value = MagicMock()
+        stress_reporter.plot_stress_impact("StratA", "Baseline")
+        assert mock_dist.called
+        assert mock_box.called

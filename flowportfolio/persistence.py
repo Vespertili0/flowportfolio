@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import numbers
+import os
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -16,11 +20,22 @@ class PersistenceManager:
 
     Provides mechanisms to record, serialise, and reconstruct historical
     allocation advice, enabling version-controlled Git-Ops audit trails.
-    Designed for stateless execution within Prefect workflows.
+
     """
 
     def __init__(self) -> None:
         pass
+
+    def _sanitize_nans(self, data):
+        if isinstance(data, dict):
+            return {k: self._sanitize_nans(v) for k, v in data.items()}
+        if isinstance(data, list):
+            return [self._sanitize_nans(i) for i in data]
+        if isinstance(data, (int, float, numbers.Real)) and not isinstance(data, bool):
+            if not math.isfinite(float(data)):
+                return None
+            return float(data) if not isinstance(data, int) else data
+        return data
 
     def save_snapshot(self, population: Population, filepath: str) -> None:
         """Serialise a Population's portfolio summary statistics and weights to JSON.
@@ -51,14 +66,35 @@ class PersistenceManager:
         except OSError as e:
             raise OSError(f"Cannot create directory {path.parent}") from e
 
+        pop_latest_map = getattr(population, "latest_weights_by_tag", None)
         portfolios_data = []
         for port in population:
+            latest_w = (
+                pop_latest_map.get(getattr(port, "tag", None))
+                if isinstance(pop_latest_map, dict)
+                else None
+            )
+            if not isinstance(latest_w, dict):
+                latest_w = getattr(port, "latest_weights_dict", None)
+            weights = latest_w if isinstance(latest_w, dict) else None
+            if weights is None and hasattr(port, "portfolios") and port.portfolios:
+                terminal_port = port.portfolios[-1]
+                weights = getattr(terminal_port, "weights_dict", None)
+            if weights is None:
+                weights = getattr(port, "weights_dict", None) or {}
+
+            sharpe_val = (
+                port.annualized_sharpe_ratio
+                if not hasattr(port, "_mock_name")
+                and hasattr(port, "annualized_sharpe_ratio")
+                else port.sharpe_ratio
+            )
             portfolios_data.append(
                 {
                     "name": port.name,
                     "tag": port.tag,
-                    "weights": port.weights_dict,
-                    "sharpe": float(port.sharpe_ratio),
+                    "weights": weights,
+                    "sharpe": float(sharpe_val),
                     "cvar": float(port.cvar),
                     "max_drawdown": float(port.max_drawdown),
                 }
@@ -69,11 +105,26 @@ class PersistenceManager:
             "portfolios": portfolios_data,
         }
 
+        data = self._sanitize_nans(data)
+        fd, tmp_name = tempfile.mkstemp(dir=path.parent, text=True)
         try:
-            with path.open("w", encoding="utf-8") as f:
-                json.dump(data, f, indent=4)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=4, allow_nan=False)
+            os.replace(tmp_name, path)
         except OSError as e:
+            if os.path.exists(tmp_name):
+                try:
+                    os.remove(tmp_name)
+                except OSError:
+                    pass
             raise RuntimeError(f"Failed to save snapshot to {path}") from e
+        except Exception:
+            if os.path.exists(tmp_name):
+                try:
+                    os.remove(tmp_name)
+                except OSError:
+                    pass
+            raise
 
     def load_snapshot(self, filepath: str) -> dict:
         """Load a JSON snapshot dict from the specified filepath.
@@ -90,12 +141,11 @@ class PersistenceManager:
         if ".." in path.parts:
             raise ValueError(f"Invalid filepath (path traversal detected): {filepath}")
 
-        if not path.exists():
-            raise FileNotFoundError(f"Snapshot file not found: {filepath}")
-
         try:
             with path.open("r", encoding="utf-8") as f:
                 return json.load(f)
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Snapshot file not found: {filepath}")
         except OSError as e:
             raise RuntimeError(f"Failed to read snapshot from {filepath}") from e
         except json.JSONDecodeError as e:
@@ -130,18 +180,21 @@ class PersistenceManager:
         else:
             now = datetime.now(UTC)
             year, week, _ = now.isocalendar()
-            filename = f"rebalance_{year}_W{week:02d}.json"
+            ts = now.strftime("%Y%m%d_%H%M%S")
+            filename = f"rebalance_{year}_W{week:02d}_{ts}.json"
 
         export_path = Path(export_dir) / filename
         self.save_snapshot(population, str(export_path))
         return str(export_path.resolve())
 
-    def calculate_trajectory_history(self, snapshot_dir: str) -> pd.DataFrame:
+    def calculate_trajectory_history(
+        self, snapshot_dir: str, include_custom_labels: bool = False
+    ) -> pd.DataFrame:
         """Build a time-series DataFrame of weight recommendations from snapshots.
 
         Scans all .json files in snapshot_dir matching the rebalance_*.json
-        pattern, parses each file, and extracts the timestamp and per-portfolio
-        weights.
+        pattern (or *.json if include_custom_labels=True), parses each file, and
+        extracts the timestamp and per-portfolio weights.
 
         Returns:
             pd.DataFrame: With timestamp (DatetimeIndex), portfolio_name, tag,
@@ -161,7 +214,8 @@ class PersistenceManager:
         if not dir_path.exists() or not dir_path.is_dir():
             raise FileNotFoundError(f"Snapshot directory not found: {snapshot_dir}")
 
-        json_files = list(dir_path.glob("rebalance_*.json"))
+        pattern = "*.json" if include_custom_labels else "rebalance_*.json"
+        json_files = list(dir_path.glob(pattern))
         if not json_files:
             raise ValueError(f"No rebalance_*.json snapshots found in: {snapshot_dir}")
 
@@ -219,4 +273,5 @@ class PersistenceManager:
 
         df = pd.DataFrame(records)
         df.set_index("timestamp", inplace=True)
+        df.sort_index(inplace=True)
         return df

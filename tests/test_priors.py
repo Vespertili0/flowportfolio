@@ -21,11 +21,14 @@ def stub_universe() -> Universe:
     # A simple mock object mimicking Universe
     u = MagicMock(spec=Universe)
     u.tickers = ["AAPL", "MSFT"]
+    u.metadata = {"AAPL": "tech", "MSFT": "tech"}
+    u.fees = {"AAPL": 0.001, "MSFT": 0.001}
+    u.returns = MagicMock()
     return u
 
 
 def test_init_raises_type_error():
-    with pytest.raises(TypeError, match="universe must be an instance of"):
+    with pytest.raises(TypeError, match="universe must implement UniverseProtocol"):
         PriorSynthesiser(universe="not a universe")
 
 
@@ -76,7 +79,30 @@ def test_build_entropy_prior_success(mock_entropy_pooling, stub_universe):
 
     # Assert
     assert prior is mock_instance
-    mock_entropy_pooling.assert_called_once_with(views=["AAPL > 0.05"], tau=[0.8])
+    mock_entropy_pooling.assert_called_once_with(
+        mean_views=["AAPL >= 0.0001984126984126984"],
+        groups={"AAPL": ["tech"], "MSFT": ["tech"]},
+    )
+
+
+@patch("flowportfolio.priors.BlackLitterman")
+def test_build_black_litterman_prior_success(mock_bl, stub_universe):
+    mock_instance = MagicMock()
+    mock_bl.return_value = mock_instance
+
+    synthesiser = PriorSynthesiser(universe=stub_universe)
+    synthesiser.add_market_view("AAPL == 0.05", confidence=0.8)
+
+    prior = synthesiser.build_black_litterman_prior(tau=0.05)
+
+    assert prior is mock_instance
+    mock_bl.assert_called_once_with(
+        views=["AAPL == 0.0001984126984126984"],
+        tau=0.05,
+        view_confidences=[0.8],
+        groups={"AAPL": ["tech"], "MSFT": ["tech"]},
+        risk_free_rate=0.0,
+    )
 
 
 def test_build_entropy_prior_raises_runtime_error(stub_universe):
@@ -95,3 +121,95 @@ def test_build_synthetic_prior_raises_value_error(stub_universe):
     synthesiser = PriorSynthesiser(universe=stub_universe)
     with pytest.raises(ValueError, match="n_samples must be at least 100"):
         synthesiser.build_synthetic_prior(n_samples=50)
+
+
+def test_add_market_view_ticker_with_digits():
+    u = MagicMock(spec=Universe)
+    u.tickers = ["SP500", "TLT20"]
+    u.metadata = {"SP500": "equity", "TLT20": "bonds"}
+    u.fees = {"SP500": 0.0003, "TLT20": 0.0015}
+    u.returns = MagicMock()
+    synthesiser = PriorSynthesiser(universe=u)
+    synthesiser.add_market_view("SP500 >= 0.05", confidence=0.8)
+    assert synthesiser._views[0]["view"].startswith("SP500 >=")
+
+
+def test_relative_view_without_spaces_and_bl_inequality_rejection():
+    u = MagicMock(spec=Universe)
+    u.tickers = ["SPY", "TLT"]
+    u.metadata = {"SPY": "equity", "TLT": "bonds"}
+    u.fees = {"SPY": 0.0003, "TLT": 0.0015}
+    u.returns = MagicMock()
+
+    synth = PriorSynthesiser(universe=u)
+    synth.add_market_view("SPY-TLT == 0.02", 0.8)
+    assert len(synth._views) == 1
+
+    synth_bl = PriorSynthesiser(universe=u)
+    synth_bl.add_market_view("SPY >= 0.05", 0.8)
+    with pytest.raises(
+        ValueError, match="BlackLitterman only supports linear equality views"
+    ):
+        synth_bl.build_black_litterman_prior()
+
+    synth_ep = PriorSynthesiser(universe=u)
+    synth_ep.add_market_view("SPY >= TLT", 1.0)
+    with patch("flowportfolio.priors.EntropyPooling") as mock_ep:
+        mock_ep.return_value = MagicMock()
+        prior = synth_ep.build_entropy_prior()
+        assert prior is not None
+
+
+def test_relative_view_with_rhs_spread_and_no_bl_double_division(stub_universe):
+    """Verify RHS relative + spread views scale only the spread and BL avoids 1/N^2."""
+    synth = PriorSynthesiser(universe=stub_universe)
+    synth.add_market_view("AAPL == MSFT + 0.0252", confidence=0.8)
+    assert synth._views[0]["view"] == f"AAPL == MSFT + {0.0252 / 252.0}"
+    assert synth._views[0]["is_ranking"] is False
+
+    synth_grp = PriorSynthesiser(universe=stub_universe)
+    synth_grp.add_market_view("tech == 0.0504", confidence=0.9, average_groups=True)
+    # EntropyPooling gets 0.5 * tech, whereas BlackLitterman gets unscaled 'tech'
+    # because BlackLitterman already sets sum_to_one=True in equations_to_matrix.
+    ep = synth_grp.build_entropy_prior()
+    bl = synth_grp.build_black_litterman_prior()
+    assert ep.mean_views == [f"0.5 * tech == {0.0504 / 252.0}"]
+    assert bl.views == [f"tech == {0.0504 / 252.0}"]
+
+
+def test_empirical_prior_bayes_stein_and_post_multiplied_views(stub_universe):
+    """Verify Bayes-Stein shrinkage, LedoitWolf covariance, post-multiplied view parsing, and relative equality in BL."""
+    import numpy as np
+    import pandas as pd
+    from skfolio.moments import LedoitWolf, ShrunkMu, ShrunkMuMethods
+
+    # 1. Defaults
+    synth = PriorSynthesiser(universe=stub_universe)
+    emp_prior = synth.build_empirical_prior()
+    assert isinstance(emp_prior.covariance_estimator, LedoitWolf)
+    assert isinstance(emp_prior.mu_estimator, ShrunkMu)
+    assert emp_prior.mu_estimator.method == ShrunkMuMethods.BAYES_STEIN
+
+    # Fit on synthetic 2-asset returns and ensure beta_ in (0, 1]
+    rng = np.random.default_rng(42)
+    rets = pd.DataFrame(rng.normal(0.0005, 0.01, (100, 2)), columns=["AAPL", "MSFT"])
+    emp_prior.fit(rets)
+    assert 0.0 < emp_prior.mu_estimator_.beta_ <= 1.0
+    assert 0.0 <= emp_prior.mu_estimator_.alpha_ < 1.0
+
+    # 2. Post-multiplied view expression parsing
+    synth.add_market_view("tech * 2.0 == 0.0504", confidence=0.8)
+    # Default average_groups=True: tech has 2 members, so 2.0 * tech / 2 -> 1 * tech
+    ep = synth.build_entropy_prior()
+    assert ep.mean_views == [f"1 * tech == {0.0504 / 252.0}"]
+
+    # 3. Relative equality in BlackLitterman (SPY == TLT)
+    u_rel = MagicMock(spec=Universe)
+    u_rel.tickers = ["AAPL", "MSFT"]
+    u_rel.metadata = {"AAPL": "tech", "MSFT": "tech"}
+    u_rel.fees = {"AAPL": 0.001, "MSFT": 0.001}
+    u_rel.returns = MagicMock()
+    synth_rel = PriorSynthesiser(universe=u_rel)
+    synth_rel.add_market_view("AAPL == MSFT", confidence=0.7)
+    bl = synth_rel.build_black_litterman_prior()
+    assert bl.views == ["AAPL == MSFT"]

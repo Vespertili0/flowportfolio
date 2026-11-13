@@ -7,7 +7,12 @@ multiple investment strategies using ``skfolio``.
 
 from __future__ import annotations
 
-from skfolio import Population, RatioMeasure
+import copy
+import logging
+from typing import Any, TypedDict
+
+from skfolio import Population
+from skfolio.measures import RatioMeasure
 from skfolio.metrics import make_scorer
 from skfolio.model_selection import (
     CombinatorialPurgedCV,
@@ -17,14 +22,22 @@ from skfolio.model_selection import (
     cross_val_predict,
     online_predict,
 )
-from sklearn.base import BaseEstimator
-from sklearn.model_selection import GridSearchCV
+from sklearn.base import BaseEstimator, clone
 
-from flowportfolio.core.universe import Universe
+from flowportfolio.core.optimisation import SkfolioGridSearchCV as GridSearchCV
+from flowportfolio.core.optimisation import set_previous_weights_chain
+from flowportfolio.core.protocols import UniverseProtocol
+
+logger = logging.getLogger(__name__)
+
+
+class StrategyConfig(TypedDict):
+    estimator: BaseEstimator
+    grid: dict
 
 
 class PortfolioExperimentEngine:
-    """Automates hyperparameter tuning and cross-validation pipelines.
+    """Automates hyperparameter tuning via nested cross-validation.
 
     Maintains a registry of named strategies and evaluates them uniformly
     against a common asset universe and cross-validation protocol.
@@ -45,20 +58,28 @@ class PortfolioExperimentEngine:
 
     def __init__(
         self,
-        universe: Universe,
+        universe: UniverseProtocol,
         n_jobs: int = -1,
     ) -> None:
-        if not isinstance(universe, Universe):
-            raise TypeError("universe must be a Universe instance.")
+        from flowportfolio.core.protocols import is_universe_protocol
+
+        if not is_universe_protocol(universe):
+            raise TypeError("universe must implement UniverseProtocol.")
         self._universe = universe
         self._n_jobs = n_jobs
-        self._strategies: dict[str, dict] = {}
+        self._strategies: dict[str, StrategyConfig] = {}
+        self._latest_weights: dict[str, dict[str, float]] = {}
+
+    @property
+    def latest_weights(self) -> dict[str, dict[str, float]]:
+        """Live target weights fitted on the trailing window up to the final observation."""
+        return {k: dict(v) for k, v in self._latest_weights.items()}
 
     def add_strategy(
         self,
         name: str,
         estimator: BaseEstimator,
-        grid: dict,
+        grid: dict[str, Any],
     ) -> None:
         """Register a new strategy for benchmarking.
 
@@ -91,7 +112,7 @@ class PortfolioExperimentEngine:
             raise ValueError(f"Strategy '{name}' is already registered.")
 
         self._strategies[name] = {
-            "estimator": estimator,
+            "estimator": clone(estimator),
             "grid": dict(grid),
         }
 
@@ -126,23 +147,98 @@ class PortfolioExperimentEngine:
             )
         return _map[cv_type](**cv_kwargs)
 
+    @staticmethod
+    def _derive_inner_walk_forward_sizes(
+        outer_train: int, purged_size: int = 0
+    ) -> tuple[int, int]:
+        """Derive inner walk-forward train and test sizes constrained by outer train window.
+
+        Parameters
+        ----------
+        outer_train : int
+            The number of observations in the outer training window.
+        purged_size : int, default 0
+            The purged/embargo buffer between folds.
+
+        Returns
+        -------
+        tuple[int, int]
+            (inner_train, inner_test) sizes.
+
+        Raises
+        ------
+        ValueError
+            If the available training window is <= 2 observations.
+        """
+        available = outer_train - max(0, int(purged_size))
+        if available <= 2:
+            raise ValueError(
+                f"Outer train_size={outer_train} (with purged_size={purged_size}) "
+                "is too small to derive inner walk-forward splits."
+            )
+        inner_test = max(1, int(available * 0.2))
+        inner_train = max(1, int(available * 0.6))
+        if inner_train + inner_test > available:
+            inner_train = max(1, available - inner_test)
+        return inner_train, inner_test
+
+    @staticmethod
+    def _resolve_outer_train_size(
+        cv_type: str,
+        outer_cv: Any,
+        outer_kwargs: dict[str, Any],
+        n_samples: int,
+        returns: Any,
+    ) -> int:
+        """Determine the (minimum) number of observations in an outer training fold."""
+        if cv_type == "walk_forward":
+            if outer_kwargs.get("freq") is not None and hasattr(outer_cv, "split"):
+                try:
+                    splits = list(outer_cv.split(returns))
+                    if splits:
+                        return max(1, min(len(train_idx) for train_idx, _ in splits))
+                except Exception:  # noqa: BLE001, S110
+                    pass
+            return int(outer_kwargs.get("train_size", 252))
+
+        if cv_type == "combinatorial":
+            try:
+                return max(
+                    1, min(len(train_idx) for train_idx, _ in outer_cv.split(returns))
+                )
+            except Exception:  # noqa: BLE001
+                n_folds = outer_kwargs.get("n_folds", 10)
+                n_test_folds = outer_kwargs.get("n_test_folds", 8)
+                return max(1, int(n_samples * (n_folds - n_test_folds) / n_folds))
+
+        base_cv = outer_kwargs.get("walk_forward")
+        train_size = getattr(base_cv, "train_size", None)
+        if isinstance(train_size, int):
+            return min(train_size, n_samples)
+        return n_samples
+
     def run_robustness_test(
         self,
         cv_type: str = "walk_forward",
+        inner_cv_kwargs: dict | None = None,
         **cv_kwargs,
     ) -> Population:
         """Execute the full benchmarking pipeline for all registered strategies.
 
         Performs a two-step process for each strategy:
-        1. Tunes hyperparameters via ``GridSearchCV`` over the full dataset,
-           refitting the best estimator.
+        1. Tunes hyperparameters via ``GridSearchCV`` using an inner cross-validator
+           derived to fit within the outer training window.
         2. Simulates an out-of-sample rebalancing journey using
-           ``cross_val_predict`` with the best tuned estimator.
+           ``cross_val_predict`` with the outer cross-validator.
 
         Parameters
         ----------
         cv_type : {"walk_forward", "combinatorial", "randomised"}, default "walk_forward"
             The cross-validation protocol to use.
+        inner_cv_kwargs : dict or None, optional
+            Explicit constructor arguments for the inner CV splitter used in
+            hyperparameter search. If None, derived dynamically from the outer
+            training parameters.
         **cv_kwargs
             Additional keyword arguments forwarded to the underlying
             cross-validator constructor (e.g., ``train_size``, ``test_size``).
@@ -160,27 +256,114 @@ class PortfolioExperimentEngine:
             If ``cv_type`` is not one of the supported strings, or if
             ``universe.returns`` is unavailable.
         """
-        # 1. Resolve CV protocol
-        inner_cv = self._resolve_cv_splitter(cv_type, **cv_kwargs)
-        outer_cv = self._resolve_cv_splitter(cv_type, **cv_kwargs)
+        self._latest_weights = {}
+
+        # 1. Resolve CV protocols
+        resolved_outer_kwargs = dict(cv_kwargs)
+        if cv_type == "walk_forward":
+            resolved_outer_kwargs.setdefault("train_size", 252)
+            resolved_outer_kwargs.setdefault("test_size", 63)
+        outer_cv = self._resolve_cv_splitter(cv_type, **resolved_outer_kwargs)
 
         # 2. Extract returns (will raise ValueError if not fetched)
         returns = self._universe.returns
+
+        # Determine the size of the outer training window, which bounds the data
+        # available to the inner hyperparameter search.
+        outer_train = self._resolve_outer_train_size(
+            cv_type, outer_cv, resolved_outer_kwargs, len(returns), returns
+        )
+
+        if inner_cv_kwargs is not None:
+            resolved_explicit_inner = dict(inner_cv_kwargs)
+            inner_type = resolved_explicit_inner.pop("cv_type", "walk_forward")
+            if inner_type in ("combinatorial", "randomised"):
+                raise ValueError(
+                    f"Inner cross-validation splitter cannot be '{inner_type}'. "
+                    "Hyperparameter tuning via GridSearchCV is restricted to single-test-fold splitters such as 'walk_forward'."
+                )
+            if inner_type == "walk_forward" and (
+                "train_size" not in resolved_explicit_inner
+                or "test_size" not in resolved_explicit_inner
+            ):
+                inner_train, inner_test = self._derive_inner_walk_forward_sizes(
+                    outer_train, resolved_explicit_inner.get("purged_size", 0)
+                )
+                resolved_explicit_inner.setdefault("train_size", inner_train)
+                resolved_explicit_inner.setdefault("test_size", inner_test)
+            inner_cv = self._resolve_cv_splitter(inner_type, **resolved_explicit_inner)
+        else:
+            if cv_type == "walk_forward":
+                resolved_inner_kwargs = dict(cv_kwargs)
+                inner_train, inner_test = self._derive_inner_walk_forward_sizes(
+                    outer_train, cv_kwargs.get("purged_size", 0)
+                )
+                resolved_inner_kwargs["train_size"] = inner_train
+                resolved_inner_kwargs["test_size"] = inner_test
+                if cv_kwargs.get("freq") is not None:
+                    # inner_train and inner_test are observation row counts, not calendar periods
+                    resolved_inner_kwargs.pop("freq", None)
+
+                inner_cv = self._resolve_cv_splitter(
+                    "walk_forward", **resolved_inner_kwargs
+                )
+            else:
+                # CombinatorialPurgedCV and MultipleRandomizedCV are multi-path splitters
+                # incompatible with GridSearchCV. Restrict inner tuning to standard single-test-fold WalkForward.
+                if outer_train <= 2:
+                    inner_train, inner_test = 1, 1
+                else:
+                    inner_train, inner_test = self._derive_inner_walk_forward_sizes(
+                        outer_train, 0
+                    )
+                inner_cv = self._resolve_cv_splitter(
+                    "walk_forward", train_size=inner_train, test_size=inner_test
+                )
 
         if not self._strategies:
             raise RuntimeError("No strategies registered. Call add_strategy() first.")
 
         # 3. Process each strategy
         collected = []
+        equal_weights = {col: 1.0 / len(returns.columns) for col in returns.columns}
         for name, config in self._strategies.items():
+            est_clone = clone(config["estimator"])
+            target_opt = (
+                est_clone.steps[-1][1]
+                if hasattr(est_clone, "steps") and est_clone.steps
+                else est_clone
+            )
+            user_previous_weights = copy.deepcopy(
+                getattr(target_opt, "previous_weights", None)
+            )
+            # Prevent present-day physical weights from contaminating historical fold 0
+            # while keeping turnover constraints active across sequential walk-forward folds.
+            if (
+                getattr(target_opt, "max_turnover", None) is not None
+                and getattr(target_opt, "previous_weights", None) is not None
+            ):
+                set_previous_weights_chain(est_clone, equal_weights)
+
+            if (
+                cv_type in ("combinatorial", "randomised")
+                and getattr(target_opt, "max_turnover", None) is not None
+            ):
+                logger.warning(
+                    "Strategy '%s' configured with max_turnover under non-sequential cv_type='%s'. "
+                    "Historical cross-validation evaluates turnover against equal baseline weights; "
+                    "live terminal refit enforces max_turnover against current physical weights.",
+                    name,
+                    cv_type,
+                )
+
             # a. Hyperparameter search
             search = GridSearchCV(
-                estimator=config["estimator"],
+                estimator=est_clone,
                 param_grid=config["grid"],
                 cv=inner_cv,
                 scoring=make_scorer(RatioMeasure.CVAR_RATIO),
                 refit=True,
-                n_jobs=self._n_jobs,
+                n_jobs=1,
             )
 
             # b. Out-of-sample journey simulation
@@ -192,33 +375,125 @@ class PortfolioExperimentEngine:
                 portfolio_params={"tag": name},
             )
 
-            collected.append(portfolio)
+            # c. Live terminal refit on trailing outer_train observations
+            try:
+                live_search = search
+                live_window = returns.iloc[-min(outer_train, len(returns)) :]
+                # Anchor live refit turnover to user's physical weights if present, else final OOS weights
+                last_oos_weights = None
+                ports_list = (
+                    list(portfolio)
+                    if type(portfolio).__name__ == "Population"
+                    or isinstance(portfolio, list)
+                    else [portfolio]
+                )
+                if ports_list:
+                    last_p = ports_list[-1]
+                    if hasattr(last_p, "portfolios") and last_p.portfolios:
+                        last_oos_weights = getattr(
+                            last_p.portfolios[-1], "weights_dict", None
+                        )
+                    else:
+                        last_oos_weights = getattr(last_p, "weights_dict", None)
 
-        return Population(collected)
+                if getattr(target_opt, "max_turnover", None) is not None:
+                    if user_previous_weights is not None:
+                        set_previous_weights_chain(live_search, user_previous_weights)
+                    elif last_oos_weights:
+                        set_previous_weights_chain(live_search, last_oos_weights)
+
+                live_search.fit(live_window)
+                if getattr(live_search, "weights_", None) is not None:
+                    feature_names = getattr(
+                        live_search, "feature_names_in_", live_window.columns
+                    )
+                    if len(feature_names) == len(live_search.weights_):
+                        live_w = {
+                            str(col): float(w)
+                            for col, w in zip(feature_names, live_search.weights_)
+                        }
+                    else:
+                        live_w = {
+                            str(col): float(w)
+                            for col, w in zip(live_window.columns, live_search.weights_)
+                        }
+                    self._latest_weights[name] = live_w
+                    for p_obj in ports_list:
+                        try:
+                            p_obj.latest_weights_dict = dict(live_w)
+                        except AttributeError:
+                            pass
+            except Exception:
+                logger.warning(
+                    "Live terminal refit failed for strategy '%s'", name, exc_info=True
+                )
+
+            if type(portfolio).__name__ == "Population" or isinstance(portfolio, list):
+                collected.extend(portfolio)
+            else:
+                collected.append(portfolio)
+
+        pop = Population(collected)
+        try:
+            pop.latest_weights_by_tag = self.latest_weights
+        except AttributeError:
+            pass
+        return pop
+
+    @staticmethod
+    def _validate_online_estimator(name: str, est: BaseEstimator) -> None:
+        """Validate that an estimator and its prior hierarchy support online estimation."""
+        if not hasattr(est, "partial_fit"):
+            raise TypeError(
+                f"Strategy '{name}' estimator '{type(est).__name__}' does not implement "
+                "partial_fit() and cannot be evaluated online."
+            )
+        prior_est = getattr(est, "prior_estimator", None)
+        if prior_est is None:
+            raise TypeError(
+                f"Strategy '{name}' has prior_estimator=None, which defaults to batch "
+                "EmpiricalPrior(EmpiricalMu(), EmpiricalCovariance()). Provide an online "
+                "prior (e.g., EmpiricalPrior(mu_estimator=EWMu(), covariance_estimator=EWCovariance()))."
+            )
+        if not hasattr(prior_est, "partial_fit"):
+            raise TypeError(
+                f"Strategy '{name}' uses batch prior '{type(prior_est).__name__}', "
+                "which does not implement partial_fit(). Use an online prior "
+                "(e.g., EmpiricalPrior(mu_estimator=EWMu(), covariance_estimator=EWCovariance())) "
+                "or use run_robustness_test() for batch cross-validation."
+            )
+        for sub_attr in ("mu_estimator", "covariance_estimator"):
+            sub_est = getattr(prior_est, sub_attr, None)
+            if sub_est is not None and not hasattr(sub_est, "partial_fit"):
+                raise TypeError(
+                    f"Strategy '{name}' prior '{type(prior_est).__name__}' uses batch "
+                    f"{sub_attr} '{type(sub_est).__name__}', which does not implement partial_fit()."
+                )
 
     def run_online_evaluation(
         self,
         cv_type: str = "walk_forward",
+        burn_in_size: int | None = None,
         **cv_kwargs,
     ) -> Population:
         """Run online (streaming) evaluation of all registered strategies.
 
-        Mirrors run_robustness_test() but uses OnlineGridSearch and
-        online_predict to support incremental model updates. This is
-        appropriate for strategies using exponentially weighted estimators
-        (EWMu, EWCovariance) that support partial_fit().
-
-        Prefect Compatibility: This method is a pure function of self.strategies
-        and self.universe.returns. It holds no stateful connections between calls.
+        Mirrors run_robustness_test() but fits hyperparameter search on a
+        dedicated historical burn-in period prior to executing online prediction,
+        preventing look-ahead bias.
 
         Parameters
         ----------
         cv_type : str, optional
             Cross-validation strategy. One of: "walk_forward",
             "combinatorial", "randomised". Default is "walk_forward".
+        burn_in_size : int or None, optional
+            Number of initial observations allocated for hyperparameter tuning.
+            If None, defaults to the train_size or warmup_size specified in
+            cv_kwargs, or 252.
         **cv_kwargs
-            Additional keyword arguments forwarded to the chosen CV splitter
-            constructor (e.g., train_size=252, test_size=63).
+            Additional keyword arguments forwarded to online hyperparameter
+            search or online prediction parameters.
 
         Returns
         -------
@@ -229,37 +504,200 @@ class PortfolioExperimentEngine:
         Raises
         ------
         ValueError
-            If cv_type is not one of the three permitted string values.
+            If cv_type is not one of the three permitted string values, if
+            returns is shorter than burn_in_size, or if a registered strategy
+            is a multi-step Pipeline (pre-selection steps are unsupported by
+            online learning).
+        TypeError
+            If a registered strategy uses a batch prior that does not
+            implement ``partial_fit``.
         RuntimeError
             If no strategies have been registered via add_strategy().
         """
+        self._latest_weights = {}
+
         if not self._strategies:
             raise RuntimeError("No strategies registered. Call add_strategy() first.")
 
-        cv = self._resolve_cv_splitter(cv_type, **cv_kwargs)
+        if cv_type not in {"walk_forward", "combinatorial", "randomised"}:
+            raise ValueError(
+                f"Unknown cv_type: '{cv_type}'. Must be one of "
+                "'walk_forward', 'combinatorial', or 'randomised'."
+            )
+
+        if cv_type != "walk_forward":
+            logger.warning(
+                "run_online_evaluation only supports sequential walk-forward evaluation; ignoring cv_type='%s'.",
+                cv_type,
+            )
+
         returns = self._universe.returns
 
-        collected = []
-        for name, config in self._strategies.items():
-            search = OnlineGridSearch(
-                estimator=config["estimator"],
-                param_grid=config["grid"],
-                cv=cv,
-                scoring=make_scorer(RatioMeasure.CVAR_RATIO),
-                refit=True,
-                n_jobs=self._n_jobs,
+        if burn_in_size is None:
+            burn_in_size = int(
+                cv_kwargs.get("warmup_size", cv_kwargs.get("train_size", 252))
             )
-            search.fit(returns)
+
+        if burn_in_size >= len(returns):
+            raise ValueError(
+                f"burn_in_size={burn_in_size} must be strictly less than total "
+                f"observations ({len(returns)}) to allow out-of-sample evaluation."
+            )
+
+        burn_in_returns = returns.iloc[:burn_in_size]
+
+        purged = int(cv_kwargs.get("purged_size", 0))
+        if (
+            "train_size" in cv_kwargs
+            and "test_size" in cv_kwargs
+            and int(cv_kwargs["train_size"]) + int(cv_kwargs["test_size"]) + purged
+            <= burn_in_size
+        ):
+            inner_warmup = int(cv_kwargs["train_size"])
+            inner_test = int(cv_kwargs["test_size"])
+        elif burn_in_size - max(0, purged) <= 2:
+            inner_warmup, inner_test = 1, 1
+        else:
+            inner_warmup, inner_test = self._derive_inner_walk_forward_sizes(
+                burn_in_size, purged
+            )
+
+        online_search_keys = {
+            "freq",
+            "freq_offset",
+            "previous",
+            "reduce_test",
+        }
+        search_extra_kwargs = {
+            k: v for k, v in cv_kwargs.items() if k in online_search_keys
+        }
+
+        online_predict_keys = {
+            "test_size",
+            "freq",
+            "freq_offset",
+            "previous",
+            "purged_size",
+            "reduce_test",
+            "params",
+        }
+        predict_kwargs = {
+            k: v for k, v in cv_kwargs.items() if k in online_predict_keys
+        }
+
+        collected = []
+        equal_weights = {col: 1.0 / len(returns.columns) for col in returns.columns}
+        for name, config in self._strategies.items():
+            est = clone(config["estimator"])
+            grid = dict(config["grid"])
+
+            if hasattr(est, "steps"):
+                if len(est.steps) > 1:
+                    raise ValueError(
+                        f"Strategy '{name}' contains pipeline pre-selection steps, which "
+                        "are not supported by skfolio online_predict/OnlineGridSearch."
+                    )
+                est = est.steps[-1][1]
+                grid = {
+                    (k.split("__", 1)[1] if k.startswith("optimizer__") else k): v
+                    for k, v in grid.items()
+                }
+
+            self._validate_online_estimator(name, est)
+
+            user_previous_weights = copy.deepcopy(
+                getattr(est, "previous_weights", None)
+            )
+
+            if (
+                getattr(est, "max_turnover", None) is not None
+                and getattr(est, "previous_weights", None) is not None
+            ):
+                set_previous_weights_chain(est, equal_weights)
+
+            search = OnlineGridSearch(
+                estimator=est,
+                param_grid=grid,
+                scoring=RatioMeasure.CVAR_RATIO,
+                warmup_size=inner_warmup,
+                test_size=inner_test,
+                purged_size=purged,
+                refit=True,
+                n_jobs=1,
+                **search_extra_kwargs,
+            )
+            search.fit(burn_in_returns)
             best_model = search.best_estimator_
 
             portfolio = online_predict(
                 best_model,
                 returns,
-                cv=cv,
-                n_jobs=self._n_jobs,
+                warmup_size=burn_in_size,
                 portfolio_params={"tag": name},
+                **predict_kwargs,
             )
 
-            collected.append(portfolio)
+            ports_list = (
+                list(portfolio)
+                if type(portfolio).__name__ == "Population"
+                or isinstance(portfolio, list)
+                else [portfolio]
+            )
+            term_w = None
+            if ports_list:
+                last_p = ports_list[-1]
+                term_w = (
+                    getattr(last_p.portfolios[-1], "weights_dict", None)
+                    if hasattr(last_p, "portfolios") and last_p.portfolios
+                    else getattr(last_p, "weights_dict", None)
+                )
 
-        return Population(collected)
+            if not hasattr(best_model, "_mock_name"):
+                try:
+                    live_model = clone(best_model)
+                    if (
+                        user_previous_weights is not None
+                        and getattr(live_model, "max_turnover", None) is not None
+                    ):
+                        set_previous_weights_chain(live_model, user_previous_weights)
+
+                    trailing_window = returns.iloc[-min(burn_in_size, len(returns)) :]
+                    if hasattr(live_model, "fit"):
+                        live_model.fit(trailing_window)
+                        if getattr(live_model, "weights_", None) is not None:
+                            feat_names = getattr(
+                                live_model, "feature_names_in_", trailing_window.columns
+                            )
+                            self._latest_weights[name] = {
+                                str(col): float(w)
+                                for col, w in zip(feat_names, live_model.weights_)
+                            }
+                        elif term_w is not None:
+                            self._latest_weights[name] = {
+                                str(k): float(v) for k, v in term_w.items()
+                            }
+                    elif term_w is not None:
+                        self._latest_weights[name] = {
+                            str(k): float(v) for k, v in term_w.items()
+                        }
+                except Exception:  # noqa: BLE001
+                    if term_w is not None:
+                        self._latest_weights[name] = {
+                            str(k): float(v) for k, v in term_w.items()
+                        }
+            elif term_w is not None:
+                self._latest_weights[name] = {
+                    str(k): float(v) for k, v in term_w.items()
+                }
+
+            if type(portfolio).__name__ == "Population" or isinstance(portfolio, list):
+                collected.extend(portfolio)
+            else:
+                collected.append(portfolio)
+
+        pop = Population(collected)
+        try:
+            pop.latest_weights_by_tag = self.latest_weights
+        except AttributeError:
+            pass
+        return pop

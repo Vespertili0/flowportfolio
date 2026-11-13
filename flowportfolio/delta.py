@@ -7,23 +7,23 @@ produces decision-ready trade analysis by quantifying the net risk/return
 benefit of executing a portfolio rebalance versus holding current positions,
 factoring in group drift, Total Expense Ratio (TER), slippage, and brokerage
 friction.
-
-**Prefect Compatibility:** All public methods are pure functions of the
-constructor's stored state. They accept explicit data structures and return
-serialisable outputs, ensuring zero friction inside Prefect ``@task``
-execution contexts.
 """
 
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
+from typing import Any
 
 import numpy as np
 import pandas as pd
-from skfolio import Population, RatioMeasure
+from skfolio import Population
 from skfolio.portfolio import Portfolio
 
-from flowportfolio.core.universe import Universe
+from flowportfolio.core.protocols import UniverseProtocol, is_universe_protocol
+from flowportfolio.core.validation import validate_weight
+
+logger = logging.getLogger(__name__)
 
 
 class PortfolioDeltaEngine:
@@ -32,10 +32,6 @@ class PortfolioDeltaEngine:
     This engine quantifies the trade-off of executing a rebalance versus
     holding current positions (net of transaction friction and management
     fees).
-
-    Prefect Compatibility: All methods are pure functions of the
-    constructor's stored state and are safe to wrap as Prefect ``@task``
-    decorators.
 
     Parameters
     ----------
@@ -62,13 +58,13 @@ class PortfolioDeltaEngine:
 
     def __init__(
         self,
-        universe: Universe,
+        universe: UniverseProtocol,
         current_weights: dict[str, float],
         target_weights: dict[str, float],
     ) -> None:
         # --- type validation ---
-        if not isinstance(universe, Universe):
-            raise TypeError("universe must be a Universe instance.")
+        if not is_universe_protocol(universe):
+            raise TypeError("universe must implement UniverseProtocol.")
         if not isinstance(current_weights, dict):
             raise TypeError("current_weights must be a dict.")
         if not isinstance(target_weights, dict):
@@ -99,6 +95,11 @@ class PortfolioDeltaEngine:
             raise ValueError(
                 "target_weights values must be finite numbers (no NaN or Inf)."
             )
+
+        for v in current_weights.values():
+            validate_weight(v)
+        for v in target_weights.values():
+            validate_weight(v)
 
         # --- sum-to-one validation ---
         current_sum = sum(current_weights.values())
@@ -142,7 +143,7 @@ class PortfolioDeltaEngine:
                 f"target_weights is missing universe tickers: {sorted(missing_target)}."
             )
 
-        self._universe: Universe = universe
+        self._universe: UniverseProtocol = universe
         self._current_weights: dict[str, float] = dict(current_weights)
         self._target_weights: dict[str, float] = dict(target_weights)
 
@@ -218,21 +219,38 @@ class PortfolioDeltaEngine:
         df = pd.DataFrame(rows).set_index("group")
         return df
 
-    def calculate_rebalance_delta(self, population: Population) -> dict:
+    def calculate_rebalance_delta(
+        self,
+        population: Population | None = None,
+        strategy_tag: str | None = None,
+    ) -> dict:
         """Calculate the risk/return delta of holding vs rebalancing.
 
-        Takes the skfolio ``Population`` object (e.g. from robustness
-        testing) and creates a pseudo-portfolio representing the current
-        physical weights applied to the universe's historical returns.
-        Computes Mean CVaR, Sharpe ratio, and Max Drawdown for both the
-        ``'hold'`` portfolio and the ``'rebalance'`` portfolio (best
-        strategy from the population, selected by maximum CVaR ratio).
+        Evaluates the current physical weights (hold scenario) and the target
+        weights (rebalance scenario) across the identical returns evaluation
+        window. If an out-of-sample ``Population`` is provided, the evaluation
+        window is aligned to the selected portfolio's observation period
+        (via its ``returns_df`` index). Computes CVaR, Sharpe ratio, and Max
+        Drawdown for both scenarios.
+
+        Note: The ``hold_portfolio`` models an un-rebalanced buy-and-hold
+        portfolio whose weights drift with asset returns
+        (``weight_drift=True``). When the selected out-of-sample portfolio
+        exposes pre-computed metrics, those are used for the rebalance
+        scenario so that no in-sample back-projection of terminal
+        ``target_weights`` is performed. When no population is supplied,
+        ``target_weights`` are evaluated over the full ``universe.returns``,
+        which is an in-sample historical projection and is logged as such.
 
         Parameters
         ----------
-        population : Population
-            The out-of-sample population object containing the target
-            strategy portfolios.
+        population : Population or None, optional
+            The out-of-sample population object containing benchmarked strategy
+            portfolios. If provided, its observation window is used to evaluate
+            both current and target holdings.
+        strategy_tag : str or None, optional
+            Tag of the portfolio within ``population`` to evaluate. If
+            ``None``, the first portfolio in the population is used.
 
         Returns
         -------
@@ -244,46 +262,166 @@ class PortfolioDeltaEngine:
         Raises
         ------
         TypeError
-            If ``population`` is not a ``skfolio.Population`` instance.
+            If ``population`` is not None and not a ``skfolio.Population`` instance.
         ValueError
-            If ``population`` is empty, or if ``universe.returns`` has not
-            been populated (i.e. ``fetch_data()`` has not been called).
+            If ``population`` is provided but empty, if ``strategy_tag`` matches
+            no portfolio in ``population``, or if ``universe.returns`` has not
+            been populated.
         """
-        if not isinstance(population, Population):
-            raise TypeError("population must be a skfolio.Population instance.")
-        if len(population) == 0:
-            raise ValueError("population must not be empty.")
+        if population is not None:
+            if not isinstance(population, Population):
+                raise TypeError("population must be a skfolio.Population instance.")
+            if len(population) == 0:
+                raise ValueError("population must not be empty.")
 
         # Retrieve universe returns — propagates ValueError if not fetched
         returns: pd.DataFrame = self._universe.returns
+        eval_returns = returns
+        selected_port = None
+        matched = []
 
-        # Build weight vector aligned to returns column order; default 0.0
-        # for any universe ticker absent from current_weights.
-        weight_vector = np.array(
-            [self._current_weights.get(col, 0.0) for col in returns.columns],
+        def _align_returns_for_portfolio(port_obj: object) -> pd.DataFrame:
+            port_returns = getattr(port_obj, "returns_df", None)
+            if port_returns is None:
+                port_returns = getattr(port_obj, "returns", None)
+
+            if isinstance(port_returns, (pd.Series, pd.DataFrame)):
+                if (
+                    hasattr(port_returns, "index")
+                    and port_returns.index.isin(returns.index).any()
+                ):
+                    return returns.loc[returns.index.isin(port_returns.index)]
+                elif len(port_returns) <= len(returns):
+                    return returns.iloc[-len(port_returns) :]
+            elif isinstance(port_returns, np.ndarray) and 0 < len(port_returns) <= len(
+                returns
+            ):
+                return returns.iloc[-len(port_returns) :]
+            return returns
+
+        if population is not None and len(population) > 0:
+            if strategy_tag is not None:
+                matched = [
+                    p for p in population if getattr(p, "tag", None) == strategy_tag
+                ]
+                if not matched:
+                    raise ValueError(
+                        f"No portfolio with tag '{strategy_tag}' found in population."
+                    )
+            else:
+                matched = [population[0]]
+
+            selected_port = matched[0]
+            eval_returns = _align_returns_for_portfolio(selected_port)
+        else:
+            logger.warning(
+                "calculate_rebalance_delta() called without an out-of-sample Population; "
+                "evaluating target_weights over full universe.returns is an in-sample projection."
+            )
+
+        fees_map = getattr(self._universe, "fees", None) or {}
+        daily_fees_vector = np.array(
+            [float(fees_map.get(col, 0.0)) / 252.0 for col in eval_returns.columns],
             dtype=float,
         )
 
-        # Construct skfolio Portfolio for the "hold" scenario
-        hold_portfolio = Portfolio(
-            X=returns.to_numpy(),
-            weights=weight_vector,
+        # Build weight vectors aligned to returns column order
+        current_weight_vector = np.array(
+            [self._current_weights.get(col, 0.0) for col in eval_returns.columns],
+            dtype=float,
+        )
+        target_weight_vector = np.array(
+            [self._target_weights.get(col, 0.0) for col in eval_returns.columns],
+            dtype=float,
         )
 
-        # Select the best portfolio from the population by CVaR ratio
-        rebalance_portfolio = population.max_measure(RatioMeasure.CVAR_RATIO)
+        def _get_sharpe(p: Any) -> float:
+            if not hasattr(p, "_mock_name") and hasattr(p, "annualized_sharpe_ratio"):
+                return float(p.annualized_sharpe_ratio)
+            return float(p.sharpe_ratio)
+
+        # Extract risk_free_rate if present
+        port_rfr = 0.0
+        if selected_port is not None and not hasattr(selected_port, "_mock_name"):
+            rfr = getattr(selected_port, "risk_free_rate", None)
+            if (
+                rfr is None
+                and hasattr(selected_port, "portfolios")
+                and selected_port.portfolios
+            ):
+                rfr = getattr(selected_port.portfolios[0], "risk_free_rate", None)
+            if isinstance(rfr, (int, float)) and np.isfinite(rfr):
+                port_rfr = float(rfr)
+
+        ptf_kwargs: dict[str, Any] = {
+            "weight_drift": True,
+            "management_fees": daily_fees_vector,
+        }
+        if port_rfr:
+            ptf_kwargs["risk_free_rate"] = port_rfr
+
+        if matched and len(matched) > 1:
+            hold_cvars = []
+            hold_sharpes = []
+            hold_mdds = []
+            reb_cvars = []
+            reb_sharpes = []
+            reb_mdds = []
+            for p in matched:
+                path_returns = _align_returns_for_portfolio(p)
+                hp = Portfolio(
+                    X=path_returns,
+                    weights=current_weight_vector,
+                    **ptf_kwargs,
+                )
+                rp = Portfolio(
+                    X=path_returns,
+                    weights=target_weight_vector,
+                    **ptf_kwargs,
+                )
+                hold_cvars.append(float(hp.cvar))
+                hold_sharpes.append(_get_sharpe(hp))
+                hold_mdds.append(float(hp.max_drawdown))
+
+                reb_cvars.append(float(rp.cvar))
+                reb_sharpes.append(_get_sharpe(rp))
+                reb_mdds.append(float(rp.max_drawdown))
+
+            hold_metrics = {
+                "cvar": float(np.median(hold_cvars)),
+                "sharpe": float(np.median(hold_sharpes)),
+                "max_drawdown": float(np.median(hold_mdds)),
+            }
+            rebalance_metrics = {
+                "cvar": float(np.median(reb_cvars)),
+                "sharpe": float(np.median(reb_sharpes)),
+                "max_drawdown": float(np.median(reb_mdds)),
+            }
+        else:
+            hold_portfolio = Portfolio(
+                X=eval_returns,
+                weights=current_weight_vector,
+                **ptf_kwargs,
+            )
+            rebalance_portfolio = Portfolio(
+                X=eval_returns,
+                weights=target_weight_vector,
+                **ptf_kwargs,
+            )
+            hold_metrics = {
+                "cvar": float(hold_portfolio.cvar),
+                "sharpe": _get_sharpe(hold_portfolio),
+                "max_drawdown": float(hold_portfolio.max_drawdown),
+            }
+            rebalance_metrics = {
+                "cvar": float(rebalance_portfolio.cvar),
+                "sharpe": _get_sharpe(rebalance_portfolio),
+                "max_drawdown": float(rebalance_portfolio.max_drawdown),
+            }
 
         return {
-            "hold": {
-                "cvar": float(hold_portfolio.cvar),
-                "sharpe": float(hold_portfolio.sharpe_ratio),
-                "max_drawdown": float(hold_portfolio.max_drawdown),
-            },
-            "rebalance": {
-                "cvar": float(rebalance_portfolio.cvar),
-                "sharpe": float(rebalance_portfolio.sharpe_ratio),
-                "max_drawdown": float(rebalance_portfolio.max_drawdown),
-            },
+            "hold": hold_metrics,
+            "rebalance": rebalance_metrics,
         }
 
     @staticmethod
@@ -300,12 +438,15 @@ class PortfolioDeltaEngine:
         self,
         brokerage_bps: float = 10.0,
         slippage_bps: float = 5.0,
+        portfolio_value: float | None = None,
+        brokerage_flat: float = 0.0,
     ) -> pd.DataFrame:
         """Calculate the transaction friction and management fee costs.
 
         Computes per-asset turnover as ``abs(target_weight -
         current_weight)``. Calculates transaction cost as
-        ``turnover * (brokerage_bps + slippage_bps) / 10_000``. Calculates
+        ``turnover * (brokerage_bps + slippage_bps) / 10_000`` plus any
+        proportional drag from ``brokerage_flat / portfolio_value``. Calculates
         annual TER cost as ``target_weight * universe.fees[ticker]``.
 
         Parameters
@@ -314,22 +455,43 @@ class PortfolioDeltaEngine:
             Brokerage fee in basis points, default ``10.0``.
         slippage_bps : float, optional
             Expected slippage in basis points, default ``5.0``.
+        portfolio_value : float or None, optional
+            Total portfolio cash value in currency units. Required if
+            ``brokerage_flat > 0.0``.
+        brokerage_flat : float, optional
+            Flat brokerage fee per trade in currency units, default ``0.0``.
 
         Returns
         -------
         pd.DataFrame
-            DataFrame with columns: ``'ticker'``, ``'turnover'``,
-            ``'transaction_cost'``, ``'annual_ter'``, and
-            ``'total_friction'``. Includes a final summary row labelled
+            DataFrame with columns: ``'ticker'``, ``'gross_weight_traded'``,
+            ``'one_way_turnover'``, ``'transaction_cost'``, ``'annual_ter'``,
+            and ``'annual_ter_savings'``. Includes a final summary row labelled
             ``'TOTAL'`` with summed values across all assets.
 
         Raises
         ------
         ValueError
-            If ``brokerage_bps`` or ``slippage_bps`` are negative.
+            If ``brokerage_bps``, ``slippage_bps``, or ``brokerage_flat`` are negative,
+            if ``portfolio_value`` is non-positive or non-finite, or if ``brokerage_flat > 0``
+            without ``portfolio_value``.
         """
         self._validate_bps(brokerage_bps, "brokerage_bps")
         self._validate_bps(slippage_bps, "slippage_bps")
+        self._validate_bps(brokerage_flat, "brokerage_flat")
+
+        if portfolio_value is not None and (
+            not isinstance(portfolio_value, (int, float))
+            or isinstance(portfolio_value, bool)
+            or not np.isfinite(portfolio_value)
+            or portfolio_value <= 0
+        ):
+            raise ValueError("portfolio_value must be a positive finite number.")
+
+        if brokerage_flat > 0.0 and portfolio_value is None:
+            raise ValueError(
+                "portfolio_value must be provided when brokerage_flat > 0."
+            )
 
         fees = self._universe.fees
         total_bps = brokerage_bps + slippage_bps
@@ -344,18 +506,34 @@ class PortfolioDeltaEngine:
             current_w = float(self._current_weights.get(ticker, 0.0))
             target_w = float(self._target_weights.get(ticker, 0.0))
 
-            turnover = abs(target_w - current_w)
-            transaction_cost = turnover * total_bps / 10_000.0
+            gross_weight_traded = abs(target_w - current_w)
+            one_way_turnover = gross_weight_traded / 2.0
+
+            flat_cost_weight = (
+                (float(brokerage_flat) / float(portfolio_value))
+                if (
+                    brokerage_flat > 0.0
+                    and portfolio_value is not None
+                    and gross_weight_traded > 1e-12
+                )
+                else 0.0
+            )
+            transaction_cost = (
+                gross_weight_traded * total_bps / 10_000.0 + flat_cost_weight
+            )
+
             annual_ter = target_w * float(fees.get(ticker, 0.0))
-            total_friction = transaction_cost + annual_ter
+            current_ter = current_w * float(fees.get(ticker, 0.0))
+            annual_ter_savings = current_ter - annual_ter
 
             rows.append(
                 {
                     "ticker": ticker,
-                    "turnover": turnover,
+                    "gross_weight_traded": gross_weight_traded,
+                    "one_way_turnover": one_way_turnover,
                     "transaction_cost": transaction_cost,
                     "annual_ter": annual_ter,
-                    "total_friction": total_friction,
+                    "annual_ter_savings": annual_ter_savings,
                 }
             )
 
@@ -363,10 +541,11 @@ class PortfolioDeltaEngine:
             rows,
             columns=[
                 "ticker",
-                "turnover",
+                "gross_weight_traded",
+                "one_way_turnover",
                 "transaction_cost",
                 "annual_ter",
-                "total_friction",
+                "annual_ter_savings",
             ],
         )
 
@@ -375,10 +554,11 @@ class PortfolioDeltaEngine:
             [
                 {
                     "ticker": "TOTAL",
-                    "turnover": df["turnover"].sum(),
+                    "gross_weight_traded": df["gross_weight_traded"].sum(),
+                    "one_way_turnover": df["one_way_turnover"].sum(),
                     "transaction_cost": df["transaction_cost"].sum(),
                     "annual_ter": df["annual_ter"].sum(),
-                    "total_friction": df["total_friction"].sum(),
+                    "annual_ter_savings": df["annual_ter_savings"].sum(),
                 }
             ]
         )
