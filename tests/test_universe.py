@@ -408,6 +408,7 @@ def test_universe_mixed_weekday_and_weekend_calendar_alignment(
         univ.fetch_data()
 
     assert "Detected mixed 5-day" in caplog.text
+    assert univ._prices is not None
     assert (univ._prices.index.dayofweek < 5).all()
     assert (univ.returns.index.dayofweek < 5).all()
     assert len(univ._prices) == 10

@@ -256,7 +256,7 @@ class _SyntheticProvider:
         self._close_df = close_df
 
     def fetch(
-        self, tickers: list[str], start: str, end: str | None = None
+        self, tickers: list[str], start: str | None = None, end: str | None = None
     ) -> pd.DataFrame:
         arrays = [["Close"] * len(tickers), list(tickers)]
         cols = pd.MultiIndex.from_arrays(arrays)
