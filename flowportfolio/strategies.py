@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
@@ -16,12 +17,254 @@ from flowportfolio.core.constraints import ConstraintSpec
 
 logger = logging.getLogger(__name__)
 
+_SIMPLE_SUM_CONSTRAINT_RE = re.compile(
+    r"^\s*([A-Za-z_][A-Za-z0-9_.\-]*(?:\s*\+\s*[A-Za-z_][A-Za-z0-9_.\-]*)*)"
+    r"\s*(<=|>=|==)\s*"
+    r"([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*$"
+)
+
 
 def _safe_clone(estimator: Any) -> Any:
     """Clone an estimator safely."""
     if estimator is None:
         return None
     return clone(estimator)
+
+
+def _resolve_weight_bound(
+    bound: Any, all_cols: list[str], default: float
+) -> dict[str, float]:
+    """Resolve scalar, dict, or positional weight bounds across ``all_cols``."""
+    if bound is None:
+        return {c: default for c in all_cols}
+    if isinstance(bound, (int, float)) and not isinstance(bound, bool):
+        val = float(bound)
+        return {c: val for c in all_cols}
+    if isinstance(bound, dict):
+        return {
+            c: float(bound[c]) if c in bound and bound[c] is not None else default
+            for c in all_cols
+        }
+    if isinstance(bound, (list, tuple, np.ndarray)):
+        arr = np.asarray(bound, dtype=float)
+        if arr.ndim == 1 and len(arr) == len(all_cols):
+            return {c: float(arr[i]) for i, c in enumerate(all_cols)}
+    return {c: default for c in all_cols}
+
+
+def _effective_asset_bounds(
+    all_cols: list[str],
+    *,
+    min_weights: Any = None,
+    max_weights: Any = None,
+    previous_weights: dict[str, float] | None = None,
+    max_turnover: float | None = None,
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Compute effective per-asset ``(lower, upper)`` weight bounds."""
+    lbs = _resolve_weight_bound(min_weights, all_cols, 0.0)
+    ubs = _resolve_weight_bound(max_weights, all_cols, 1.0)
+    if max_turnover is not None and isinstance(previous_weights, dict):
+        max_t = float(max_turnover)
+        for col in all_cols:
+            w_raw = previous_weights.get(col, 0.0)
+            w_prev = 0.0 if w_raw is None else float(w_raw)
+            ubs[col] = min(ubs[col], w_prev + max_t)
+            lbs[col] = max(lbs[col], w_prev - max_t)
+    for col in all_cols:
+        ubs[col] = max(0.0, ubs[col])
+        lbs[col] = max(0.0, lbs[col])
+    return lbs, ubs
+
+
+def _restore_feasible_subset(
+    surviving: list[str],
+    all_cols: list[str],
+    *,
+    groups: dict[str, list[str]] | None = None,
+    linear_constraints: list[str] | None = None,
+    min_weights: Any = None,
+    max_weights: Any = None,
+    previous_weights: dict[str, float] | None = None,
+    max_turnover: float | None = None,
+) -> tuple[list[str], list[str]]:
+    """Statelessly restore dropped assets needed for constraint feasibility.
+
+    Ensures the surviving asset subset satisfies:
+    1. Group and asset-level linear lower-bound capacity (respecting ``max_weights``
+       and ``max_turnover`` upper bounds).
+    2. Complement upper-bound capacity for linear upper-bound constraints
+       (e.g. ``satellite <= 0.30`` requires non-satellite capacity ``>= 0.70``).
+    3. At least one surviving member per referenced group/ticker so ``skfolio``'s
+       constraint parser does not fail on missing identifiers.
+    4. Global simplex upper-bound capacity ``sum(ub_i) >= 1.0``.
+
+    Returns
+    -------
+    tuple[list[str], list[str]]
+        ``(restored_columns, reasons)`` with columns ordered as in ``all_cols``.
+    """
+    _, ubs = _effective_asset_bounds(
+        all_cols,
+        min_weights=min_weights,
+        max_weights=max_weights,
+        previous_weights=previous_weights,
+        max_turnover=max_turnover,
+    )
+    all_cols_set = set(all_cols)
+    surviving_set = {c for c in surviving if c in all_cols_set}
+    reasons: list[str] = []
+
+    def _members_for_term(term: str) -> list[str]:
+        if term in all_cols_set:
+            return [term]
+        if groups:
+            return [c for c in all_cols if c in groups and term in groups[c]]
+        return []
+
+    def _restore_until_capacity(pool: list[str], required: float, label: str) -> None:
+        pool_set = set(pool)
+        cap = sum(ubs[c] for c in all_cols if c in surviving_set and c in pool_set)
+        dropped = [c for c in pool if c not in surviving_set]
+        dropped.sort(key=lambda c: ubs[c], reverse=True)
+        while cap < required - 1e-9 and dropped:
+            col = dropped.pop(0)
+            surviving_set.add(col)
+            cap += ubs[col]
+            reasons.append(
+                f"Restored asset '{col}' to satisfy {label} (capacity={cap:.4g} >= {required:.4g})."
+            )
+
+    def _ensure_at_least_one(members: list[str], label: str) -> None:
+        if not members:
+            return
+        if any(c in surviving_set for c in members):
+            return
+        best = max(members, key=lambda c: ubs[c])
+        surviving_set.add(best)
+        reasons.append(
+            f"Restored asset '{best}' because pre-selection dropped all members of {label}."
+        )
+
+    # 1. Linear constraints (group-level and asset-level)
+    if linear_constraints:
+        all_known_groups = (
+            {g for grps in groups.values() for g in grps} if groups else set()
+        )
+        for lc in linear_constraints:
+            match = _SIMPLE_SUM_CONSTRAINT_RE.match(lc)
+            if match:
+                terms = [t.strip() for t in match.group(1).split("+")]
+                op = match.group(2)
+                rhs = float(match.group(3))
+                member_set: set[str] = set()
+                for term in terms:
+                    term_members = _members_for_term(term)
+                    _ensure_at_least_one(term_members, f"'{term}'")
+                    member_set.update(term_members)
+                members = [c for c in all_cols if c in member_set]
+                if op in (">=", "==") and rhs > 0.0 and members:
+                    _restore_until_capacity(members, rhs, f"linear constraint '{lc}'")
+                if op in ("<=", "==") and rhs < 1.0 and members:
+                    complement = [c for c in all_cols if c not in member_set]
+                    _restore_until_capacity(
+                        complement, 1.0 - rhs, f"complement of '{lc}'"
+                    )
+            else:
+                for g in sorted(all_known_groups):
+                    if re.search(r"\b" + re.escape(g) + r"\b", lc):
+                        _ensure_at_least_one(_members_for_term(g), f"group '{g}'")
+                for col in all_cols:
+                    if re.search(
+                        r"(?<![A-Za-z0-9_.\-])"
+                        + re.escape(col)
+                        + r"(?![A-Za-z0-9_.\-])",
+                        lc,
+                    ):
+                        _ensure_at_least_one([col], f"asset '{col}'")
+
+    # 2. Global simplex upper-bound feasibility (max_turnover & max_weights)
+    prev_map = previous_weights if isinstance(previous_weights, dict) else {}
+    dropped_all = [c for c in all_cols if c not in surviving_set]
+    dropped_all.sort(
+        key=lambda c: (
+            ubs[c],
+            0.0 if prev_map.get(c) is None else float(prev_map[c]),
+        ),
+        reverse=True,
+    )
+    total_cap = sum(ubs[c] for c in all_cols if c in surviving_set)
+    while total_cap < 1.0 - 1e-9 and dropped_all:
+        col = dropped_all.pop(0)
+        surviving_set.add(col)
+        total_cap += ubs[col]
+        reasons.append(
+            f"Restored asset '{col}' to maintain global simplex feasibility "
+            f"(capacity={total_cap:.4g} >= 1.0)."
+        )
+
+    restored = [c for c in all_cols if c in surviving_set]
+    return restored, reasons
+
+
+def _resolve_fee_vector(
+    management_fees: Any,
+    n_assets: int,
+    feature_names: Sequence[str] | None = None,
+) -> np.ndarray:
+    """Convert scalar, dict, or array ``management_fees`` into a 1D float array."""
+    if isinstance(management_fees, (int, float)) and not isinstance(
+        management_fees, bool
+    ):
+        return np.full(n_assets, float(management_fees), dtype=float)
+    if isinstance(management_fees, dict):
+        if feature_names is not None:
+            return np.array(
+                [float(management_fees.get(str(c), 0.0)) for c in feature_names],
+                dtype=float,
+            )
+        if len(management_fees) != n_assets:
+            raise ValueError(
+                f"management_fees dict length ({len(management_fees)}) does not match "
+                f"number of columns in X ({n_assets}). Pass a DataFrame or a "
+                "management_fees mapping matching X's column count."
+            )
+        return np.array([float(v) for v in management_fees.values()], dtype=float)
+    arr = np.asarray(management_fees, dtype=float)
+    if arr.ndim != 1 or len(arr) != n_assets:
+        raise ValueError(
+            f"management_fees length ({arr.shape}) does not match "
+            f"number of columns in X ({n_assets})."
+        )
+    return arr
+
+
+def _subtract_management_fees(
+    X: Any,
+    management_fees: Any,
+    feature_names: Sequence[str] | None = None,
+) -> Any:
+    """Return a copy of ``X`` with per-period ``management_fees`` subtracted."""
+    if management_fees is None:
+        return X
+    if isinstance(X, pd.DataFrame):
+        fee_vec = _resolve_fee_vector(
+            management_fees,
+            X.shape[1],
+            feature_names=[str(c) for c in X.columns],
+        )
+        X_net = X.copy()
+        if np.any(fee_vec != 0.0):
+            X_net = X_net.sub(fee_vec, axis=1)
+        return X_net
+    arr = np.asarray(X, dtype=float)
+    if arr.ndim != 2:
+        raise ValueError(f"Expected 2D returns array for X, got shape {arr.shape}.")
+    fee_vec = _resolve_fee_vector(
+        management_fees, arr.shape[1], feature_names=feature_names
+    )
+    if np.any(fee_vec != 0.0):
+        return arr - fee_vec
+    return arr.copy()
 
 
 class _SafePreSelectionTransformer(BaseEstimator, TransformerMixin):
@@ -39,12 +282,16 @@ class _SafePreSelectionTransformer(BaseEstimator, TransformerMixin):
         linear_constraints: list[str] | None = None,
         max_turnover: float | None = None,
         previous_weights: dict[str, float] | None = None,
+        min_weights: Any = None,
+        max_weights: Any = None,
     ) -> None:
         self.transformer = transformer
         self.groups = groups
         self.linear_constraints = linear_constraints
         self.max_turnover = max_turnover
         self.previous_weights = previous_weights
+        self.min_weights = min_weights
+        self.max_weights = max_weights
 
     def fit(
         self, X: Any, y: Any = None, **fit_params: Any
@@ -75,71 +322,20 @@ class _SafePreSelectionTransformer(BaseEstimator, TransformerMixin):
             else:
                 surviving = list(input_cols)
 
-            # 1. Group Protection
-            if self.groups and self.linear_constraints:
-                all_known_groups = {g for grps in self.groups.values() for g in grps}
-                constrained_groups = set()
-                for g in all_known_groups:
-                    for lc in self.linear_constraints:
-                        if re.search(r"\b" + re.escape(g) + r"\b", lc):
-                            constrained_groups.add(g)
-                            break
+            restored, reasons = _restore_feasible_subset(
+                surviving=surviving,
+                all_cols=input_cols,
+                groups=self.groups,
+                linear_constraints=self.linear_constraints,
+                min_weights=self.min_weights,
+                max_weights=self.max_weights,
+                previous_weights=self.previous_weights,
+                max_turnover=self.max_turnover,
+            )
+            for reason in reasons:
+                logger.warning("Pre-selection feasibility guard: %s", reason)
 
-                for g in constrained_groups:
-                    group_members = [
-                        col
-                        for col in input_cols
-                        if col in self.groups and g in self.groups[col]
-                    ]
-                    if len(group_members) >= 1:
-                        surviving_group_members = [
-                            c for c in surviving if c in group_members
-                        ]
-                        if not surviving_group_members:
-                            restore_col = group_members[0]
-                            if restore_col not in surviving:
-                                surviving.append(restore_col)
-                                logger.warning(
-                                    "Pre-selection dropped all assets for constrained group '%s'; "
-                                    "restoring asset '%s' to maintain feasibility.",
-                                    g,
-                                    restore_col,
-                                )
-
-            # 2. Turnover Feasibility Protection
-            if self.max_turnover is not None and isinstance(
-                self.previous_weights, dict
-            ):
-                prev_weights = self.previous_weights
-                max_t = float(self.max_turnover)
-
-                def _calc_max_cap(cols: list[str]) -> float:
-                    total_cap: float = 0.0
-                    for c in cols:
-                        w_val = prev_weights.get(c, 0.0)
-                        val = 0.0 if w_val is None else float(w_val)
-                        total_cap += min(1.0, val + max_t)
-                    return total_cap
-
-                dropped = [c for c in input_cols if c not in surviving]
-                dropped.sort(
-                    key=lambda c: (
-                        0.0 if prev_weights.get(c) is None else float(prev_weights[c])
-                    ),
-                    reverse=True,
-                )
-
-                while _calc_max_cap(surviving) < 1.0 - 1e-9 and dropped:
-                    restore_col = dropped.pop(0)
-                    surviving.append(restore_col)
-                    logger.warning(
-                        "Pre-selection produced an infeasible subset under max_turnover=%.4g; "
-                        "restoring asset '%s'.",
-                        self.max_turnover,
-                        restore_col,
-                    )
-
-            self.selected_columns_ = [c for c in input_cols if c in surviving]
+            self.selected_columns_ = restored
             self.columns_keep_ = np.asarray(self.selected_columns_, dtype=object)
         else:
             if hasattr(self.transformer_, "feature_names_in_"):
@@ -194,8 +390,12 @@ class _SafePreSelectionTransformer(BaseEstimator, TransformerMixin):
 class _AdaptiveKMeans(KMeans):
     """KMeans wrapper that dynamically adapts cluster count without mutating hyperparameter."""
 
+    effective_n_clusters_: int
+
     def fit(self, X: Any, y: Any = None, sample_weight: Any = None) -> _AdaptiveKMeans:
         n_samples = X.shape[0] if hasattr(X, "shape") else len(X)
+        if n_samples < 1:
+            raise ValueError("X must contain at least 1 sample.")
         effective_k = (
             max(2, min(int(self.n_clusters), n_samples // 2))
             if n_samples >= 4
@@ -213,6 +413,7 @@ class _AdaptiveKMeans(KMeans):
             algorithm=self.algorithm,
         )
         internal.fit(X, y=y, sample_weight=sample_weight)
+        self.effective_n_clusters_ = effective_k
         for attr in (
             "cluster_centers_",
             "labels_",
@@ -227,37 +428,100 @@ class _AdaptiveKMeans(KMeans):
         return self
 
 
+def _copy_fitted_attrs(src: object, dst: object) -> None:
+    """Copy scikit-learn fitted attributes (trailing underscore) from ``src`` to ``dst``."""
+    for key, value in src.__dict__.items():
+        if key.endswith("_") and not key.startswith("__"):
+            setattr(dst, key, value)
+
+
 class _FeeAwareNCO(NestedClustersOptimization):
     """NestedClustersOptimization subclass ensuring symmetric fee deduction across clusters."""
 
+    def _build_delegate(
+        self,
+        *,
+        inner_estimator: Any,
+        portfolio_params: dict[str, Any] | None,
+    ) -> NestedClustersOptimization:
+        return NestedClustersOptimization(
+            inner_estimator=inner_estimator,
+            outer_estimator=self.outer_estimator,
+            distance_estimator=self.distance_estimator,
+            clustering_estimator=self.clustering_estimator,
+            cv=self.cv,
+            quantile=self.quantile,
+            quantile_measure=self.quantile_measure,
+            n_jobs=self.n_jobs,
+            verbose=self.verbose,
+            portfolio_params=portfolio_params,
+            fallback=self.fallback,
+            previous_weights=self.previous_weights,
+            raise_on_failure=self.raise_on_failure,
+        )
+
     def fit(self, X: Any, y: Any = None, **fit_params: Any) -> _FeeAwareNCO:
-        fees_map = None
-        if (
-            isinstance(self.portfolio_params, dict)
-            and "management_fees" in self.portfolio_params
-            and isinstance(self.portfolio_params["management_fees"], dict)
-        ):
-            fees_map = self.portfolio_params["management_fees"]
+        fees_spec = (
+            self.portfolio_params.get("management_fees")
+            if isinstance(self.portfolio_params, dict)
+            else None
+        )
 
-        if fees_map is not None and isinstance(X, pd.DataFrame):
-            X_net = X.copy()
-            for col in X_net.columns:
-                fee = float(fees_map.get(str(col), 0.0))
-                if fee != 0.0:
-                    X_net[col] = X_net[col] - fee
-
-            orig_inner = getattr(self, "inner_estimator", None)
-            cloned_inner = _safe_clone(orig_inner)
+        cloned_inner = _safe_clone(self.inner_estimator)
+        if fees_spec is not None:
+            X_net = _subtract_management_fees(X, fees_spec)
             if cloned_inner is not None and hasattr(cloned_inner, "management_fees"):
                 cloned_inner.management_fees = None
-            self.inner_estimator = cloned_inner
-            try:
-                super().fit(X_net, y=y, **fit_params)
-            finally:
-                self.inner_estimator = orig_inner
-            return self
+        else:
+            X_net = X
 
-        return super().fit(X, y=y, **fit_params)
+        delegate = self._build_delegate(
+            inner_estimator=cloned_inner,
+            portfolio_params=self.portfolio_params,
+        )
+        delegate.fit(X_net, y=y, **fit_params)
+        _copy_fitted_attrs(delegate, self)
+        return self
+
+    def predict(self, X: Any) -> Any:
+        if (
+            isinstance(self.portfolio_params, dict)
+            and isinstance(self.portfolio_params.get("management_fees"), dict)
+            and not isinstance(X, pd.DataFrame)
+        ):
+            from skfolio.prior import ReturnDistribution
+
+            if isinstance(X, ReturnDistribution):
+                if hasattr(self, "feature_names_in_"):
+                    return super().predict(X)
+                n_assets = X.returns.shape[1]
+            else:
+                arr = np.asarray(X)
+                if arr.ndim != 2:
+                    raise ValueError(
+                        f"Expected 2D returns array for X, got shape {arr.shape}."
+                    )
+                n_assets = arr.shape[1]
+                if hasattr(self, "feature_names_in_"):
+                    # Convert array back to DataFrame with fitted asset names so
+                    # dict management_fees align by column without sklearn warnings.
+                    X_df = pd.DataFrame(arr, columns=list(self.feature_names_in_))
+                    return super().predict(X_df)
+
+            fee_vec = _resolve_fee_vector(
+                self.portfolio_params["management_fees"],
+                n_assets,
+            )
+            adjusted_params = dict(self.portfolio_params)
+            adjusted_params["management_fees"] = fee_vec
+            delegate = self._build_delegate(
+                inner_estimator=self.inner_estimator,
+                portfolio_params=adjusted_params,
+            )
+            _copy_fitted_attrs(self, delegate)
+            return delegate.predict(X)
+
+        return super().predict(X)
 
 
 class StrategyBuilder:
@@ -265,8 +529,8 @@ class StrategyBuilder:
 
     Acts as a fluent factory for sklearn.pipeline.Pipeline objects and
     NestedClustersOptimization ensembles. Consumes pre-selection transformers,
-    cross-sectional scalers, a prior, and an optimizer, then stitches them
-    into a single leak-proof estimator.
+    a prior, and an optimizer, then stitches them into a single leak-proof
+    estimator.
 
     Parameters
     ----------
@@ -359,7 +623,6 @@ class StrategyBuilder:
         self._optimizer = None
         self._raw_optimizer = None
         self._raw_fallbacks: list = []
-        self._fallback = None
         self._fallbacks: list = []
 
     def add_pre_selection(
@@ -368,8 +631,7 @@ class StrategyBuilder:
         """Add a pre-selection transformer to the pipeline queue.
 
         Pre-selection transformers dynamically filter the asset universe
-        before the optimizer sees it. They execute before cross-sectional
-        transformers in the assembled pipeline.
+        before the optimizer sees it.
 
         Parameters
         ----------
@@ -543,7 +805,7 @@ class StrategyBuilder:
     def reset(self, clear_base_config: bool = False) -> StrategyBuilder:
         """Reset the builder pipeline configuration.
 
-        Clears the transformer queues and optimizer, allowing the builder
+        Clears the pre-selection queue and optimizer, allowing the builder
         to be reconfigured with new pipeline components. By default, the
         foundational ``constraints`` and ``prior`` supplied at construction
         are retained.
@@ -564,7 +826,6 @@ class StrategyBuilder:
         self._optimizer = None
         self._raw_optimizer = None
         self._raw_fallbacks = []
-        self._fallback = None
         self._fallbacks = []
         if clear_base_config:
             self.constraints = []
@@ -572,12 +833,11 @@ class StrategyBuilder:
         return self
 
     def build_pipeline(self) -> Pipeline:
-        """Assemble all queued transformers and the optimizer into a Pipeline.
+        """Assemble all queued pre-selection transformers and the optimizer into a Pipeline.
 
         Assembly order (strict):
         1. All pre-selection transformers (in registration order).
-        2. All cross-sectional transformers (in registration order).
-        3. The configured optimizer (with prior injected if provided).
+        2. The configured optimizer (with prior injected if provided).
 
         Returns
         -------
@@ -593,19 +853,37 @@ class StrategyBuilder:
                 "No optimizer set. Call set_optimizer() before build_pipeline()."
             )
 
-        has_constraints = bool(
-            self._linear_constraints or self._max_turnover is not None
+        cloned_optimizer = self._wire_from_raw(include_prior=True)
+        opt_min_w = getattr(cloned_optimizer, "min_weights", None)
+        opt_max_w = getattr(cloned_optimizer, "max_weights", None)
+
+        has_weight_bounds = (
+            opt_min_w is not None
+            and not (isinstance(opt_min_w, (int, float)) and opt_min_w == 0.0)
+        ) or (
+            opt_max_w is not None
+            and not (isinstance(opt_max_w, (int, float)) and opt_max_w == 1.0)
+        )
+        needs_safe_wrapper = bool(
+            self._linear_constraints
+            or self._max_turnover is not None
+            or isinstance(self._management_fees, dict)
+            or isinstance(self._transaction_costs, dict)
+            or isinstance(self._previous_weights, dict)
+            or has_weight_bounds
         )
         steps = []
         for i, transformer in enumerate(self._pre_selection):
             cloned_tr = _safe_clone(transformer)
-            if has_constraints:
+            if needs_safe_wrapper:
                 tr_step = _SafePreSelectionTransformer(
                     transformer=cloned_tr,
                     groups=self._groups,
                     linear_constraints=self._linear_constraints,
                     max_turnover=self._max_turnover,
                     previous_weights=self._previous_weights,
+                    min_weights=opt_min_w,
+                    max_weights=opt_max_w,
                 )
             else:
                 tr_step = cloned_tr
@@ -616,8 +894,6 @@ class StrategyBuilder:
                         tr_step.set_output(transform="pandas")
             steps.append((f"pre_{i}", tr_step))
 
-        cloned_optimizer = self._wire_from_raw(include_prior=True)
-
         steps.append(("optimizer", cloned_optimizer))
 
         return Pipeline(steps)
@@ -627,13 +903,13 @@ class StrategyBuilder:
         inner_estimator,
         outer_estimator,
         clusterer: str = "ward",
-        random_state: int | None = None,
+        random_state: int | None = 42,
     ) -> NestedClustersOptimization:
         """Assemble a Nested Clusters Optimisation ensemble.
 
         Linear group constraints and turnover limits cannot be enforced
-        inside isolated sub-clusters and are rejected. Daily management fees
-        and a compatible prior (e.g. EmpiricalPrior, SyntheticData) are
+        inside isolated sub-clusters and are rejected. Period-scaled management
+        fees and a compatible prior (e.g. EmpiricalPrior, SyntheticData) are
         applied to the inner estimator only; the outer estimator receives
         neither, as it operates on synthetic cluster return series.
 
@@ -647,6 +923,9 @@ class StrategyBuilder:
         clusterer : str, optional
             Clustering algorithm. One of: "ward", "complete", "single",
             "average", "kmeans". Default is "ward".
+        random_state : int or None, optional
+            Non-negative integer seed for ``kmeans`` clustering reproducibility,
+            or ``None`` for unseeded clustering. Default is ``42``.
 
         Returns
         -------
@@ -657,10 +936,11 @@ class StrategyBuilder:
         TypeError
             If inner_estimator or outer_estimator is None.
         ValueError
-            If clusterer is not one of the permitted values, if linear group
-            constraints or turnover limits have been configured (they cannot
-            be enforced inside isolated sub-clusters), or if the prior is a
-            ticker-level view prior (BlackLitterman or EntropyPooling).
+            If clusterer is not one of the permitted values, if ``random_state``
+            is invalid, if linear group constraints or turnover limits have been
+            configured (they cannot be enforced inside isolated sub-clusters),
+            or if the prior is a ticker-level view prior (BlackLitterman or
+            EntropyPooling).
         """
         if inner_estimator is None:
             raise TypeError("inner_estimator must not be None.")
@@ -670,6 +950,15 @@ class StrategyBuilder:
         permitted_clusterers = ["ward", "complete", "single", "average", "kmeans"]
         if not isinstance(clusterer, str) or clusterer not in permitted_clusterers:
             raise ValueError(f"clusterer must be one of {permitted_clusterers}")
+
+        if random_state is not None and (
+            not isinstance(random_state, int)
+            or isinstance(random_state, bool)
+            or random_state < 0
+        ):
+            raise ValueError(
+                f"random_state must be a non-negative integer or None, got {random_state!r}."
+            )
 
         if (
             self._linear_constraints
