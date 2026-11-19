@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 
+import numpy as np
 import pandas as pd
 from skfolio.preprocessing import prices_to_returns
 
@@ -18,6 +19,66 @@ from flowportfolio.core.protocols import UniverseProtocol  # noqa: F401
 from flowportfolio.core.validation import validate_fee
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_price_index(prices: pd.DataFrame) -> pd.DataFrame:
+    """Ensure price DataFrame has non-null, unique, chronologically sorted timestamps."""
+    if prices.index.isna().any():
+        raise ValueError("Price data index contains missing (NaT) timestamps.")
+    if prices.index.has_duplicates:
+        dup_vals = prices.index[prices.index.duplicated()].unique().tolist()[:5]
+        raise ValueError(
+            f"Price data contains duplicate timestamps (examples: {dup_vals})."
+        )
+    if not prices.index.is_monotonic_increasing:
+        logger.warning(
+            "Price data index is not chronologically sorted; sorting index ascending "
+            "before computing returns."
+        )
+        return prices.sort_index()
+    return prices
+
+
+def _validate_positive_prices(prices: pd.DataFrame) -> None:
+    """Reject all-NaN columns, non-finite prices, or non-positive prices (ignoring NaNs)."""
+    for col in prices.columns:
+        valid = prices[col].dropna()
+        if valid.empty:
+            raise ValueError(f"Asset '{col}' has no valid price observations.")
+        arr = valid.to_numpy(dtype=float, copy=False)
+        if not np.isfinite(arr).all():
+            bad_idx = valid.index[~np.isfinite(arr)][0]
+            raise ValueError(f"Asset '{col}' contains non-finite price at {bad_idx}.")
+        if (arr <= 0.0).any():
+            bad_idx = valid.index[arr <= 0.0][0]
+            bad_val = float(valid.loc[bad_idx])
+            raise ValueError(
+                f"Asset '{col}' contains non-positive price ({bad_val}) at {bad_idx}; "
+                "all observed prices must be strictly positive."
+            )
+
+
+def _ffill_interior_gaps(
+    prices: pd.DataFrame, max_ffill_days: int | None
+) -> pd.DataFrame:
+    """Forward-fill interior holiday gaps only, never extrapolating past last_valid_index."""
+    if max_ffill_days == 0:
+        return prices.copy()
+
+    filled = (
+        prices.ffill() if max_ffill_days is None else prices.ffill(limit=max_ffill_days)
+    )
+
+    # Restore trailing NaNs strictly after each column's genuine last_valid_index
+    # so delisted or stale assets never receive fabricated 0.0 returns.
+    for col in prices.columns:
+        last_valid = prices[col].last_valid_index()
+        if last_valid is not None:
+            trailing_mask = filled.index > last_valid
+            if trailing_mask.any():
+                filled.loc[trailing_mask, col] = np.nan
+
+    return filled
 
 
 class DataFetchError(Exception):
@@ -206,9 +267,12 @@ class Universe:
         start date.
 
         Intermediate cross-exchange holiday gaps (``NaN`` prices occurring
-        after an asset's inception) are forward-filled, up to
-        ``max_ffill_days`` consecutive observations, before returns are
-        computed; leading pre-inception ``NaN`` values are left untouched.
+        between an asset's inception and its last valid observation) are
+        forward-filled, up to ``max_ffill_days`` consecutive observations,
+        before returns are computed; leading pre-inception ``NaN`` values and
+        trailing ``NaN`` values after an asset's last genuine price are left
+        untouched. Unsorted unique timestamps are sorted chronologically with
+        a warning.
 
         Parameters
         ----------
@@ -222,8 +286,9 @@ class Universe:
             The data provider to fetch data. Defaults to YFinanceProvider.
         max_ffill_days : int or None, default 5
             Maximum number of consecutive missing price observations that are
-            forward-filled across holidays or halts. ``None`` forward-fills
-            without a limit; ``0`` disables forward-filling.
+            forward-filled across interior holidays or halts. ``None``
+            forward-fills interior gaps without a limit; ``0`` disables
+            forward-filling.
 
         Raises
         ------
@@ -232,9 +297,11 @@ class Universe:
         ValueError
             If no data is returned, if the downloaded data is missing the
             ``"Close"`` price level, if any requested ticker is absent from
-            the downloaded data, if the resulting returns DataFrame is
-            empty, or if ``max_ffill_days`` is not a non-negative integer or
-            ``None``.
+            the downloaded data, if the price index contains missing
+            (``NaT``) or duplicate timestamps, if any ticker has no valid
+            prices or contains non-finite or non-positive prices, if the
+            resulting returns DataFrame is empty, or if ``max_ffill_days`` is
+            not a non-negative integer or ``None``.
         """
         if max_ffill_days is not None and (
             not isinstance(max_ffill_days, int)
@@ -283,6 +350,8 @@ class Universe:
 
         # Reorder columns to match the original tickers ordering.
         raw_prices = prices[self._tickers]
+        raw_prices = _normalize_price_index(raw_prices)
+        _validate_positive_prices(raw_prices)
 
         # Mixed calendar detection: if both weekday-only and weekend-active
         # tickers coexist, filter prices to weekdays (Monday-Friday) to prevent
@@ -316,35 +385,31 @@ class Universe:
                 raw_prices = raw_prices.loc[weekday_mask]
 
         # Record each ticker's last genuine price date before any forward-filling so that
-        # anchor_history() can detect histories that ended before the common start.
-        self._raw_last_valid = {
+        # anchor_history() can detect histories that ended before the common start or end.
+        raw_last_valid = {
             col: raw_prices[col].last_valid_index() for col in self._tickers
         }
 
-        # Forward-fill intermediate cross-exchange holiday gaps. The fill is
-        # bounded by ``max_ffill_days`` so that delisted or halted assets do not
-        # accumulate fabricated 0.0 returns. Leading pre-inception NaNs remain NaN.
-        if max_ffill_days is None:
-            prices = raw_prices.ffill()
-        elif max_ffill_days > 0:
-            prices = raw_prices.ffill(limit=max_ffill_days)
-        else:
-            prices = raw_prices.copy()
-
-        # Store raw prices. These are preserved across anchor_history calls
-        # so that state can be fully reset by re-calling fetch_data().
-        self._prices = prices
+        # Forward-fill intermediate cross-exchange holiday gaps only. Leading
+        # pre-inception NaNs and trailing stale/delisted NaNs remain NaN.
+        filled_prices = _ffill_interior_gaps(raw_prices, max_ffill_days=max_ffill_days)
 
         # Compute returns using skfolio's canonical preprocessing function.
         # This ensures the returns DataFrame layout is compatible with all
         # skfolio optimisers and cross-validation utilities.
-        returns = prices_to_returns(prices, drop_inceptions_nan=False, fill_nan=False)
+        returns = prices_to_returns(
+            filled_prices, drop_inceptions_nan=False, fill_nan=False
+        )
 
         if returns.empty:
             raise ValueError(
                 "Calculated returns DataFrame is empty after preprocessing."
             )
 
+        # Commit state atomically so a failed fetch_data() call never leaves
+        # _raw_last_valid, _prices, and _returns out of sync.
+        self._raw_last_valid = raw_last_valid
+        self._prices = filled_prices
         self._returns = returns
 
     def anchor_history(self) -> None:
@@ -362,9 +427,11 @@ class Universe:
             If ``fetch_data()`` has not been called yet, if any asset has
             no valid return observations whatsoever, if any asset has no
             valid returns after the alignment cut (fully disjoint trading
-            histories), or if any asset contains ``NaN`` returns after the
-            alignment cut (a delisting or trading halt exceeding
-            ``max_ffill_days``).
+            histories), if any asset has missing trailing prices before the
+            universe end date (possible delisting or stale feed), if any
+            asset contains ``NaN`` returns after the alignment cut (a
+            delisting or trading halt exceeding ``max_ffill_days``), or if
+            any asset contains non-finite return observations.
         """
         if self._returns is None:
             raise ValueError("Returns are not available. Call fetch_data() first.")
@@ -396,13 +463,19 @@ class Universe:
         # Disjoint / delisted-asset guards. ``_raw_last_valid`` records each
         # ticker's last genuine (un-forward-filled) price date so that bounded
         # forward-filling cannot mask an asset whose history ended before the
-        # common start date.
+        # common start date or before the universe end date.
+        series_end = anchored.index[-1]
         for col in anchored.columns:
             raw_last = self._raw_last_valid.get(col)
             if raw_last is not None and raw_last < latest_start:
                 raise ValueError(
                     f"Asset '{col}' has no valid returns after alignment. "
                     "Trading histories may be fully disjoint."
+                )
+            if raw_last is not None and raw_last < series_end:
+                raise ValueError(
+                    f"Asset '{col}' has missing trailing prices after {raw_last} "
+                    f"(universe ends at {series_end}; possible delisting or stale feed)."
                 )
             if anchored[col].first_valid_index() is None:
                 raise ValueError(
@@ -414,6 +487,11 @@ class Universe:
                     f"Asset '{col}' contains NaN return observations after "
                     f"{latest_start} (possible delisting or trading halt exceeding "
                     "max_ffill_days)."
+                )
+            if not np.isfinite(anchored[col].to_numpy(dtype=float, copy=False)).all():
+                raise ValueError(
+                    f"Asset '{col}' contains non-finite return observations after "
+                    f"{latest_start}."
                 )
 
         self._returns = anchored

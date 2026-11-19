@@ -414,3 +414,215 @@ def test_universe_mixed_weekday_and_weekend_calendar_alignment(
     assert len(univ._prices) == 10
     assert not univ._prices["SPY"].isna().any()
     assert not univ._prices["BTC-USD"].isna().any()
+
+
+# ---------------------------------------------------------------------------
+# 6. O4_PRICE_HYGIENE (Cycle 1: delisting, price validity & index ordering)
+# ---------------------------------------------------------------------------
+
+
+class _InMemoryProvider:
+    """Minimal DataProviderProtocol stub for deterministic hygiene tests."""
+
+    def __init__(self, close_df: pd.DataFrame) -> None:
+        self._close_df = close_df
+
+    def fetch(
+        self,
+        tickers: list[str],
+        start: str | None = None,
+        end: str | None = None,
+    ) -> pd.DataFrame:
+        return pd.concat({"Close": self._close_df[tickers]}, axis=1)
+
+
+@pytest.mark.parametrize("max_ffill_days", [5, None])
+def test_o4a_terminal_delisting_within_max_ffill_never_fabricates_zero_returns(
+    max_ffill_days: int | None,
+) -> None:
+    """Trailing NaNs within max_ffill_days (or unbounded fill) must NOT emit 0.0 returns and must fail anchor_history."""
+    dates = pd.bdate_range("2026-01-01", periods=10)
+    prices = pd.DataFrame(
+        {
+            "SPY": np.linspace(100.0, 109.0, 10),
+            # DEL stops trading 3 days before the end (< max_ffill_days=5)
+            "DEL": [50.0, 51.0, 52.0, 53.0, 54.0, 55.0, 56.0, np.nan, np.nan, np.nan],
+        },
+        index=dates,
+    )
+    univ = Universe(
+        ["SPY", "DEL"], {"SPY": "core", "DEL": "sat"}, {"SPY": 0.0, "DEL": 0.0}
+    )
+    univ.fetch_data(
+        data_provider=_InMemoryProvider(prices), max_ffill_days=max_ffill_days
+    )
+
+    # Layer 1: fetch_data must never forward-fill past last_valid_index into 0.0 returns
+    assert univ.returns["DEL"].iloc[-3:].isna().all()
+
+    # Layer 2: anchor_history must reject the stale/delisted tail loudly
+    with pytest.raises(ValueError, match="delisting|trailing|stale"):
+        univ.anchor_history()
+
+
+def test_o4a_interior_holiday_gap_still_forward_fills() -> None:
+    """Interior holiday gaps within max_ffill_days must remain forward-filled when trailing prices are valid."""
+    dates = pd.bdate_range("2026-01-01", periods=8)
+    prices = pd.DataFrame(
+        {
+            "SPY": np.linspace(100.0, 107.0, 8),
+            "HOL": [50.0, 51.0, np.nan, np.nan, 54.0, 55.0, 56.0, 57.0],
+        },
+        index=dates,
+    )
+    univ = Universe(
+        ["SPY", "HOL"], {"SPY": "core", "HOL": "sat"}, {"SPY": 0.0, "HOL": 0.0}
+    )
+    univ.fetch_data(data_provider=_InMemoryProvider(prices), max_ffill_days=5)
+    univ.anchor_history()
+
+    assert len(univ.returns) == 7
+    assert not univ.returns.isna().any().any()
+
+
+@pytest.mark.parametrize("bad_price", [0.0, -5.0, np.inf, -np.inf])
+def test_o4b_non_positive_or_non_finite_price_raises_value_error(
+    bad_price: float,
+) -> None:
+    """Prices <= 0 or non-finite must raise ValueError instead of leaking inf or sign-flipped returns."""
+    dates = pd.bdate_range("2026-01-01", periods=5)
+    prices = pd.DataFrame(
+        {
+            "SPY": [100.0, 101.0, bad_price, 102.0, 103.0],
+            "IVV": [200.0, 202.0, 204.0, 206.0, 208.0],
+        },
+        index=dates,
+    )
+    univ = Universe(
+        ["SPY", "IVV"], {"SPY": "core", "IVV": "core"}, {"SPY": 0.0, "IVV": 0.0}
+    )
+
+    with pytest.raises(ValueError, match="positive|finite"):
+        univ.fetch_data(data_provider=_InMemoryProvider(prices))
+
+
+def test_o4b_all_nan_column_via_custom_provider_raises_value_error() -> None:
+    """All-NaN columns from a custom DataProviderProtocol must fail fast instead of being silently dropped."""
+    dates = pd.bdate_range("2026-01-01", periods=5)
+    prices = pd.DataFrame(
+        {
+            "SPY": [100.0, 101.0, 102.0, 103.0, 104.0],
+            "IVV": [np.nan, np.nan, np.nan, np.nan, np.nan],
+        },
+        index=dates,
+    )
+    univ = Universe(
+        ["SPY", "IVV"], {"SPY": "core", "IVV": "core"}, {"SPY": 0.0, "IVV": 0.0}
+    )
+
+    with pytest.raises(ValueError, match="no valid price"):
+        univ.fetch_data(data_provider=_InMemoryProvider(prices))
+
+
+def test_o4c_unsorted_3row_timestamps_sort_chronologically_with_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Unsorted 3-row unique timestamps must warn, sort ascending, and yield exact chronological returns."""
+    unsorted_dates = pd.DatetimeIndex(["2026-01-01", "2026-01-03", "2026-01-02"])
+    prices = pd.DataFrame(
+        {
+            "SPY": [100.0, 120.0, 110.0],
+            "IVV": [200.0, 240.0, 220.0],
+        },
+        index=unsorted_dates,
+    )
+    univ = Universe(
+        ["SPY", "IVV"], {"SPY": "core", "IVV": "core"}, {"SPY": 0.0, "IVV": 0.0}
+    )
+    with caplog.at_level("WARNING"):
+        univ.fetch_data(data_provider=_InMemoryProvider(prices))
+    univ.anchor_history()
+
+    assert "not chronologically sorted" in caplog.text
+    assert univ.returns.index.is_monotonic_increasing
+    np.testing.assert_allclose(
+        univ.returns["SPY"].to_numpy(), [0.10, 10.0 / 110.0], rtol=1e-12
+    )
+
+
+def test_o4c_unsorted_4row_timestamps_prevent_silent_reverse_returns(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Unsorted 4-row timestamps must sort ascending instead of silently emitting reverse-time returns."""
+    unsorted_dates = pd.DatetimeIndex(
+        ["2026-01-01", "2026-01-03", "2026-01-02", "2026-01-04"]
+    )
+    prices = pd.DataFrame(
+        {
+            "SPY": [100.0, 120.0, 110.0, 132.0],
+            "IVV": [200.0, 240.0, 220.0, 264.0],
+        },
+        index=unsorted_dates,
+    )
+    univ = Universe(
+        ["SPY", "IVV"], {"SPY": "core", "IVV": "core"}, {"SPY": 0.0, "IVV": 0.0}
+    )
+    with caplog.at_level("WARNING"):
+        univ.fetch_data(data_provider=_InMemoryProvider(prices))
+    univ.anchor_history()
+
+    assert "not chronologically sorted" in caplog.text
+    assert univ.returns.index.is_monotonic_increasing
+    # Sorted prices: [100 -> 110 -> 120 -> 132] => [0.10, 10/110, 0.10]
+    np.testing.assert_allclose(
+        univ.returns["SPY"].to_numpy(), [0.10, 10.0 / 110.0, 0.10], rtol=1e-12
+    )
+
+
+def test_o4c_duplicate_timestamps_raise_value_error() -> None:
+    """Duplicate timestamps must fail fast rather than silently picking or distorting a bar."""
+    dup_dates = pd.DatetimeIndex(["2026-01-01", "2026-01-02", "2026-01-02"])
+    dup_prices = pd.DataFrame({"SPY": [100.0, 110.0, 112.0]}, index=dup_dates)
+    univ_dup = Universe(["SPY"], {"SPY": "core"}, {"SPY": 0.0})
+
+    with pytest.raises(ValueError, match="duplicate"):
+        univ_dup.fetch_data(data_provider=_InMemoryProvider(dup_prices))
+
+
+def test_o4c_nat_timestamp_in_index_raises_value_error() -> None:
+    """Missing (NaT) timestamps in the price index must fail fast with ValueError."""
+    nat_dates = pd.DatetimeIndex(["2026-01-01", pd.NaT, "2026-01-03"])
+    nat_prices = pd.DataFrame({"SPY": [100.0, 110.0, 120.0]}, index=nat_dates)
+    univ_nat = Universe(["SPY"], {"SPY": "core"}, {"SPY": 0.0})
+
+    with pytest.raises(ValueError, match="missing|NaT"):
+        univ_nat.fetch_data(data_provider=_InMemoryProvider(nat_prices))
+
+
+def test_o4_failed_refetch_preserves_prior_universe_state() -> None:
+    """A failed fetch_data() call (e.g., empty returns from 1-row prices) must not partially mutate prior state."""
+    dates = pd.bdate_range("2026-01-01", periods=5)
+    valid_prices = pd.DataFrame(
+        {
+            "SPY": [100.0, 101.0, 102.0, 103.0, 104.0],
+            "IVV": [200.0, 202.0, 204.0, 206.0, 208.0],
+        },
+        index=dates,
+    )
+    univ = Universe(
+        ["SPY", "IVV"], {"SPY": "core", "IVV": "core"}, {"SPY": 0.0, "IVV": 0.0}
+    )
+    univ.fetch_data(data_provider=_InMemoryProvider(valid_prices))
+    prior_returns = univ.returns.copy()
+
+    # Single-row price DataFrame produces empty returns and must fail atomically
+    one_row_prices = valid_prices.iloc[:1]
+    with pytest.raises(ValueError, match="empty"):
+        univ.fetch_data(data_provider=_InMemoryProvider(one_row_prices))
+
+    pd.testing.assert_frame_equal(univ.returns, prior_returns)
+    assert univ._prices is not None
+    assert len(univ._prices) == 5
+    # Must still anchor cleanly without stale _raw_last_valid poisoning
+    univ.anchor_history()
+    assert len(univ.returns) == 4
