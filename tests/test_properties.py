@@ -728,7 +728,7 @@ def test_property_delta_engine_flat_brokerage_accounting(
         assert np.isclose(float(row["gross_weight_traded"]), gross_w, atol=1e-12)
         flat_w = (
             (brokerage_flat / portfolio_value)
-            if (brokerage_flat > 0.0 and gross_w > 1e-12)
+            if (brokerage_flat > 0.0 and gross_w > 1e-6)
             else 0.0
         )
         expected_tc = gross_w * (brokerage_bps + slippage_bps) / 10_000.0 + flat_w
@@ -737,4 +737,40 @@ def test_property_delta_engine_flat_brokerage_accounting(
 
     assert np.isclose(
         float(total_row["transaction_cost"]), total_expected_tc, atol=1e-12
+    )
+
+
+@settings(max_examples=40, deadline=None)
+@given(
+    dust=st.floats(
+        min_value=1e-11, max_value=9e-7, allow_nan=False, allow_infinity=False
+    ),
+    brokerage_flat=st.floats(
+        min_value=1.0, max_value=50.0, allow_nan=False, allow_infinity=False
+    ),
+    portfolio_value=st.floats(
+        min_value=5_000.0, max_value=1_000_000.0, allow_nan=False, allow_infinity=False
+    ),
+)
+def test_property_delta_engine_flat_brokerage_ignores_sub_1e6_dust(
+    dust: float, brokerage_flat: float, portfolio_value: float
+) -> None:
+    """F-11: Sub-1e-6 solver dust never incurs flat brokerage tickets."""
+    tickers = ["X", "Y"]
+    u = Universe(
+        tickers=tickers, metadata={"X": "g", "Y": "g"}, fees={"X": 0.0, "Y": 0.0}
+    )
+    engine = PortfolioDeltaEngine(
+        universe=u,
+        current_weights={"X": 0.5, "Y": 0.5},
+        target_weights={"X": 0.5 + dust, "Y": 0.5 - dust},
+    )
+    fric_df = engine.calculate_net_friction(
+        brokerage_bps=0.0,
+        slippage_bps=0.0,
+        brokerage_flat=brokerage_flat,
+        portfolio_value=portfolio_value,
+    )
+    assert (
+        float(fric_df[fric_df["ticker"] == "TOTAL"]["transaction_cost"].iloc[0]) == 0.0
     )
