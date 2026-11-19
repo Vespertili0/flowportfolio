@@ -389,30 +389,109 @@ def test_property_delta_engine_zero_sum_drift_and_friction_identities(
     limit=st.floats(
         min_value=0.01, max_value=1.0, allow_nan=False, allow_infinity=False
     ),
+    periods_per_year=st.sampled_from([1, 4, 12, 52, 252]),
+    holding_period=st.floats(
+        min_value=1.0, max_value=252.0, allow_nan=False, allow_infinity=False
+    ),
+    raw_tx_cost=st.floats(
+        min_value=0.0, max_value=0.05, allow_nan=False, allow_infinity=False
+    ),
 )
-def test_property_constraint_builder_turnover_and_daily_fee_conversion(
-    base_weights: list[float], limit: float
+def test_property_constraint_builder_turnover_and_period_cost_scaling(
+    base_weights: list[float],
+    limit: float,
+    periods_per_year: int,
+    holding_period: float,
+    raw_tx_cost: float,
 ) -> None:
-    """Verify ConstraintBuilder.max_turnover and build() preserve simplex
-    previous_weights and convert annual decimal TER fees to daily frequency (/ 252).
+    """Verify ConstraintBuilder preserves simplex previous_weights, scales annual
+    TER fees by universe.periods_per_year, and amortizes transaction_costs by
+    holding_period.
     """
     tickers = ["A", "B", "C"]
     fees = {"A": 0.00252, "B": 0.00504, "C": 0.0}
-    u = Universe(
-        tickers=tickers,
-        metadata={"A": "g", "B": "g", "C": "g"},
-        fees=fees,
-    )
+
+    class _FreqUniverse:
+        @property
+        def tickers(self) -> list[str]:
+            return list(tickers)
+
+        @property
+        def metadata(self) -> dict[str, str]:
+            return {"A": "g", "B": "g", "C": "g"}
+
+        @property
+        def fees(self) -> dict[str, float]:
+            return dict(fees)
+
+        @property
+        def periods_per_year(self) -> int:
+            return periods_per_year
+
     weights_dict = dict(zip(tickers, base_weights))
 
-    spec = ConstraintBuilder(u).max_turnover(limit, weights_dict).build()
+    spec = (
+        ConstraintBuilder(_FreqUniverse(), holding_period=holding_period)  # type: ignore[arg-type]
+        .max_turnover(limit, weights_dict)
+        .transaction_costs(raw_tx_cost)
+        .build()
+    )
     assert spec.previous_weights is not None
     assert np.isclose(sum(spec.previous_weights.values()), 1.0, atol=1e-12)
     assert all(0.0 <= v <= 1.0 for v in spec.previous_weights.values())
     assert spec.max_turnover == limit
     assert spec.management_fees is not None
     for t in tickers:
-        assert np.isclose(spec.management_fees[t], fees[t] / 252.0, atol=1e-15)
+        assert np.isclose(
+            spec.management_fees[t],
+            fees[t] / float(periods_per_year),
+            rtol=0,
+            atol=1e-15,
+        )
+    assert isinstance(spec.transaction_costs, float)
+    assert np.isclose(
+        spec.transaction_costs, raw_tx_cost / holding_period, rtol=0, atol=1e-15
+    )
+
+
+@settings(max_examples=40, deadline=None)
+@given(
+    base_weights=simplex_weights_strategy(3),
+    drift=st.floats(
+        min_value=2e-6, max_value=0.05, allow_nan=False, allow_infinity=False
+    ),
+    sign=st.sampled_from([-1.0, 1.0]),
+)
+def test_property_constraint_builder_rejects_simplex_drift_beyond_1e6(
+    base_weights: list[float], drift: float, sign: float
+) -> None:
+    """Verify ConstraintBuilder.max_turnover rejects any weight vector whose sum
+    drifts from 1.0 by more than 1e-6 (matching PortfolioDeltaEngine).
+    """
+    tickers = ["A", "B", "C"]
+    u = Universe(
+        tickers=tickers,
+        metadata={"A": "g", "B": "g", "C": "g"},
+        fees={"A": 0.0, "B": 0.0, "C": 0.0},
+    )
+    perturbed = list(base_weights)
+    # Apply drift to a component that stays strictly inside [0.0, 1.0]
+    applied = False
+    for idx, w in enumerate(perturbed):
+        candidate = w + sign * drift
+        if 0.0 <= candidate <= 1.0:
+            perturbed[idx] = candidate
+            applied = True
+            break
+    if not applied:
+        return
+
+    weights_dict = dict(zip(tickers, perturbed))
+    if abs(sum(weights_dict.values()) - 1.0) <= 1e-6:
+        return
+
+    with pytest.raises(ValueError, match="1e-6"):
+        ConstraintBuilder(u).max_turnover(0.1, weights_dict)
 
 
 # ---------------------------------------------------------------------------
