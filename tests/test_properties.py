@@ -111,6 +111,114 @@ def test_property_prior_view_scaling_and_bl_ep_consistency(
         ps_ineq.build_black_litterman_prior()
 
 
+def _fmt_number(val: float, style: str) -> str:
+    """Format a signed float across standard, leading-dot, and scientific styles."""
+    sign = "-" if val < 0 else ""
+    mag = abs(val)
+    if style == "leading_dot" and 0.0 < mag < 1.0:
+        return f"{sign}{f'{mag:.4f}'.lstrip('0')}"  # e.g. ".2500" or "-.0500"
+    if style == "scientific":
+        return f"{sign}{mag:.4e}"
+    return f"{sign}{mag:.6g}"
+
+
+class _PeriodicUniverse:
+    """Lightweight UniverseProtocol-compliant stub with configurable periodicity."""
+
+    def __init__(
+        self,
+        tickers: list[str],
+        metadata: dict[str, str],
+        fees: dict[str, float],
+        periods_per_year: int,
+    ) -> None:
+        self.tickers = tickers
+        self.metadata = metadata
+        self.fees = fees
+        self.returns = pd.DataFrame()
+        self.periods_per_year = periods_per_year
+
+
+@settings(max_examples=75, deadline=None)
+@given(
+    n_group=st.integers(min_value=2, max_value=6),
+    group_coef=st.floats(
+        min_value=0.05, max_value=0.95, allow_nan=False, allow_infinity=False
+    ),
+    spread=st.floats(
+        min_value=-0.30, max_value=0.30, allow_nan=False, allow_infinity=False
+    ).filter(lambda x: abs(x) >= 1e-3),
+    num_style=st.sampled_from(["standard", "leading_dot", "scientific"]),
+    spread_style=st.sampled_from(["standard", "leading_dot", "scientific"]),
+    post_multiply=st.booleans(),
+    tight_minus=st.booleans(),
+    periods_per_year=st.sampled_from([252, 52, 12]),
+)
+def test_property_prior_parser_grammar_invariance(
+    n_group: int,
+    group_coef: float,
+    spread: float,
+    num_style: str,
+    spread_style: str,
+    post_multiply: bool,
+    tight_minus: bool,
+    periods_per_year: int,
+) -> None:
+    """Any valid formatting of group coefficients, RHS spreads, periodicity,
+    and hyphenated/dotted equity tickers must compile to the exact same (A, b)
+    linear equations in both EntropyPooling and BlackLitterman.
+    """
+    group_tickers = [f"EQ{i}" for i in range(n_group)]
+    tickers = [*group_tickers, "BRK-B", "VAS.AX"]
+    metadata = {
+        **{t: "tech" for t in group_tickers},
+        "BRK-B": "value",
+        "VAS.AX": "intl",
+    }
+    fees = {t: 0.001 for t in tickers}
+    u: Universe | _PeriodicUniverse = (
+        Universe(tickers=tickers, metadata=metadata, fees=fees)
+        if periods_per_year == 252
+        else _PeriodicUniverse(
+            tickers=tickers,
+            metadata=metadata,
+            fees=fees,
+            periods_per_year=periods_per_year,
+        )
+    )
+
+    coef_str = _fmt_number(group_coef, num_style)
+    coef_val = float(coef_str)
+    spread_str = _fmt_number(spread, spread_style)
+    spread_val = float(spread_str)
+
+    grp_term = f"tech * {coef_str}" if post_multiply else f"{coef_str} * tech"
+    sep = "-" if tight_minus else " - "
+    view_str = f"{grp_term}{sep}BRK-B == {spread_str}"
+
+    ps = PriorSynthesiser(u)
+    ps.add_market_view(view_str, confidence=0.8, average_groups=True)
+
+    groups_arr = np.array([tickers, [metadata[t] for t in tickers]], dtype=object)
+    a_ep, b_ep, _, _ = equations_to_matrix(
+        groups=groups_arr,
+        equations=ps.build_entropy_prior().mean_views,
+        sum_to_one=False,
+    )
+    a_bl, b_bl, _, _ = equations_to_matrix(
+        groups=groups_arr,
+        equations=ps.build_black_litterman_prior().views,
+        sum_to_one=True,
+    )
+
+    expected_a = [coef_val / n_group] * n_group + [-1.0, 0.0]
+    expected_b = spread_val / float(periods_per_year)
+    np.testing.assert_allclose(a_ep[0], expected_a, rtol=1e-9, atol=1e-10)
+    np.testing.assert_allclose(a_bl[0], expected_a, rtol=1e-9, atol=1e-10)
+    np.testing.assert_allclose(b_ep[0], expected_b, rtol=1e-9, atol=1e-10)
+    np.testing.assert_allclose(b_bl[0], expected_b, rtol=1e-9, atol=1e-10)
+
+
 # ---------------------------------------------------------------------------
 # 2. PortfolioDeltaEngine & ConstraintBuilder Algebraic Invariants
 # ---------------------------------------------------------------------------

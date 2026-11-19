@@ -1,8 +1,10 @@
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 from skfolio.moments import ShrunkCovariance
 from skfolio.prior import EmpiricalPrior, SyntheticData
+from skfolio.utils.equations import equations_to_matrix
 
 from flowportfolio.core.universe import Universe
 from flowportfolio.priors import PriorSynthesiser
@@ -213,3 +215,295 @@ def test_empirical_prior_bayes_stein_and_post_multiplied_views(stub_universe):
     synth_rel.add_market_view("AAPL == MSFT", confidence=0.7)
     bl = synth_rel.build_black_litterman_prior()
     assert bl.views == ["AAPL == MSFT"]
+
+
+class _PeriodicUniverseStub:
+    """Minimal UniverseProtocol-compliant stub exposing configurable periods_per_year."""
+
+    def __init__(
+        self,
+        tickers: list[str],
+        metadata: dict[str, str],
+        fees: dict[str, float],
+        periods_per_year: int,
+    ) -> None:
+        self.tickers = tickers
+        self.metadata = metadata
+        self.fees = fees
+        self.returns = MagicMock()
+        self.periods_per_year = periods_per_year
+
+
+def test_leading_dot_group_coefficient_exact_matrix_no_silent_10x_corruption() -> None:
+    """Leading-dot coefficients on multi-member groups must never corrupt strings or scale 10x."""
+    # Case 1: N=2 members (".5 * tech" currently emits ".2.5 * tech" and crashes)
+    u2 = Universe(
+        tickers=["AAPL", "MSFT", "SPY"],
+        metadata={"AAPL": "tech", "MSFT": "tech", "SPY": "broad"},
+        fees={"AAPL": 0.001, "MSFT": 0.001, "SPY": 0.0003},
+    )
+    s2 = PriorSynthesiser(u2)
+    s2.add_market_view(".5 * tech == 0.0504", confidence=0.8)
+
+    groups_2 = np.array(
+        [["AAPL", "MSFT", "SPY"], ["tech", "tech", "broad"]], dtype=object
+    )
+    a_ep, b_ep, _, _ = equations_to_matrix(
+        groups=groups_2,
+        equations=s2.build_entropy_prior().mean_views,
+        sum_to_one=False,
+    )
+    a_bl, b_bl, _, _ = equations_to_matrix(
+        groups=groups_2,
+        equations=s2.build_black_litterman_prior().views,
+        sum_to_one=True,
+    )
+    np.testing.assert_allclose(a_ep[0], [0.25, 0.25, 0.0], atol=1e-12)
+    np.testing.assert_allclose(a_bl[0], [0.25, 0.25, 0.0], atol=1e-12)
+    np.testing.assert_allclose(b_ep[0], 0.0504 / 252.0, atol=1e-12)
+    np.testing.assert_allclose(b_bl[0], 0.0504 / 252.0, atol=1e-12)
+
+    # Case 2: N=5 members (".25 * tech" currently silently emits ".5 * tech" -> 10x error!)
+    tickers_5 = ["AAPL", "MSFT", "NVDA", "AVGO", "ORCL"]
+    u5 = Universe(
+        tickers=tickers_5,
+        metadata={t: "tech" for t in tickers_5},
+        fees={t: 0.001 for t in tickers_5},
+    )
+    s5 = PriorSynthesiser(u5)
+    s5.add_market_view(".25 * tech == 0.0504", confidence=0.8)
+
+    groups_5 = np.array([tickers_5, ["tech"] * 5], dtype=object)
+    a_ep5, b_ep5, _, _ = equations_to_matrix(
+        groups=groups_5,
+        equations=s5.build_entropy_prior().mean_views,
+        sum_to_one=False,
+    )
+    a_bl5, b_bl5, _, _ = equations_to_matrix(
+        groups=groups_5,
+        equations=s5.build_black_litterman_prior().views,
+        sum_to_one=True,
+    )
+    # 0.25 / 5 = 0.05 per member (NOT 0.5!)
+    np.testing.assert_allclose(a_ep5[0], [0.05] * 5, atol=1e-12)
+    np.testing.assert_allclose(a_bl5[0], [0.05] * 5, atol=1e-12)
+    np.testing.assert_allclose(b_ep5[0], 0.0504 / 252.0, atol=1e-12)
+    np.testing.assert_allclose(b_bl5[0], 0.0504 / 252.0, atol=1e-12)
+
+
+@pytest.mark.parametrize(
+    ("view_str", "expected_a", "expected_b"),
+    [
+        ("BRK-B-SPY == 0.0252", [1.0, -1.0, 0.0, 0.0, 0.0], 0.0252 / 252.0),
+        ("SPY-BRK-B == 0.0252", [-1.0, 1.0, 0.0, 0.0, 0.0], 0.0252 / 252.0),
+        ("-BRK-B == -0.0252", [-1.0, 0.0, 0.0, 0.0, 0.0], -0.0252 / 252.0),
+        ("0.5*BRK-B-0.5*SPY == 0.0252", [0.5, -0.5, 0.0, 0.0, 0.0], 0.0252 / 252.0),
+        ("VAS.AX-BRK-B == 0.0252", [-1.0, 0.0, 1.0, 0.0, 0.0], 0.0252 / 252.0),
+        # Prefix-collision longest-match (both BRK-B and BRK exist in universe)
+        ("BRK-B-BRK == 0.0252", [1.0, 0.0, 0.0, -1.0, 0.0], 0.0252 / 252.0),
+        # Digit-prefixed exchange tickers (e.g. HSBC Hong Kong 0005.HK)
+        ("0005.HK-SPY == 0.0252", [0.0, -1.0, 0.0, 0.0, 1.0], 0.0252 / 252.0),
+        ("0.5*0005.HK == 0.0252", [0.0, 0.0, 0.0, 0.0, 0.5], 0.0252 / 252.0),
+    ],
+)
+def test_hyphenated_and_dotted_equity_tickers_parse_without_spaces(
+    view_str: str, expected_a: list[float], expected_b: float
+) -> None:
+    """Real equity/ETF tickers with hyphens, dots, shared prefixes, and leading digits parse cleanly."""
+    tickers = ["BRK-B", "SPY", "VAS.AX", "BRK", "0005.HK"]
+    metadata = {
+        "BRK-B": "value",
+        "SPY": "core",
+        "VAS.AX": "intl",
+        "BRK": "holding",
+        "0005.HK": "hk",
+    }
+    u = Universe(
+        tickers=tickers,
+        metadata=metadata,
+        fees={t: 0.0005 for t in tickers},
+    )
+    synth = PriorSynthesiser(u)
+    synth.add_market_view(view_str, confidence=0.8)
+
+    groups_arr = np.array([tickers, [metadata[t] for t in tickers]], dtype=object)
+    a_ep, b_ep, _, _ = equations_to_matrix(
+        groups=groups_arr,
+        equations=synth.build_entropy_prior().mean_views,
+        sum_to_one=False,
+    )
+    a_bl, b_bl, _, _ = equations_to_matrix(
+        groups=groups_arr,
+        equations=synth.build_black_litterman_prior().views,
+        sum_to_one=True,
+    )
+    np.testing.assert_allclose(a_ep[0], expected_a, atol=1e-12)
+    np.testing.assert_allclose(a_bl[0], expected_a, atol=1e-12)
+    np.testing.assert_allclose(b_ep[0], expected_b, atol=1e-12)
+    np.testing.assert_allclose(b_bl[0], expected_b, atol=1e-12)
+
+
+@pytest.mark.parametrize(
+    "bad_view",
+    [
+        "APPLE == 0.05",
+        "BRK-C == 0.05",
+        "SPY_2 == 0.05",
+    ],
+)
+def test_prefix_boundary_rejects_unknown_identifiers(bad_view: str) -> None:
+    """Valid tickers ('A', 'BRK-B', 'SPY') must never partially match unknown longer identifiers."""
+    tickers = ["A", "BRK-B", "SPY"]
+    u = Universe(
+        tickers=tickers,
+        metadata={"A": "health", "BRK-B": "value", "SPY": "core"},
+        fees={t: 0.0005 for t in tickers},
+    )
+    synth = PriorSynthesiser(u)
+    with pytest.raises(ValueError):
+        synth.add_market_view(bad_view, confidence=0.8)
+
+
+def test_rhs_group_post_multiply_leading_dot_and_average_groups_false() -> None:
+    """RHS post-multiplied leading-dot group views and average_groups=False compile to exact matrices."""
+    tickers = ["AAPL", "MSFT", "SPY"]
+    metadata = {"AAPL": "tech", "MSFT": "tech", "SPY": "broad"}
+    u = Universe(
+        tickers=tickers,
+        metadata=metadata,
+        fees={"AAPL": 0.001, "MSFT": 0.001, "SPY": 0.0003},
+    )
+    groups_arr = np.array([tickers, ["tech", "tech", "broad"]], dtype=object)
+
+    # 1. RHS group with post-multiplied leading dot + leading-dot spread, average_groups=True
+    s_rhs = PriorSynthesiser(u)
+    s_rhs.add_market_view(
+        "SPY == tech * .5 + .0252", confidence=0.8, average_groups=True
+    )
+    a_ep, b_ep, _, _ = equations_to_matrix(
+        groups=groups_arr,
+        equations=s_rhs.build_entropy_prior().mean_views,
+        sum_to_one=False,
+    )
+    a_bl, b_bl, _, _ = equations_to_matrix(
+        groups=groups_arr,
+        equations=s_rhs.build_black_litterman_prior().views,
+        sum_to_one=True,
+    )
+    np.testing.assert_allclose(a_ep[0], [-0.25, -0.25, 1.0], atol=1e-12)
+    np.testing.assert_allclose(a_bl[0], [-0.25, -0.25, 1.0], atol=1e-12)
+    np.testing.assert_allclose(b_ep[0], 0.0252 / 252.0, atol=1e-12)
+    np.testing.assert_allclose(b_bl[0], 0.0252 / 252.0, atol=1e-12)
+
+    # 2. Leading-dot group view with average_groups=False: EP stays unaveraged (0.5 per member), BL sums to 0.5
+    s_unavg = PriorSynthesiser(u)
+    s_unavg.add_market_view(".5 * tech == 0.0504", confidence=0.8, average_groups=False)
+    a_ep_u, b_ep_u, _, _ = equations_to_matrix(
+        groups=groups_arr,
+        equations=s_unavg.build_entropy_prior().mean_views,
+        sum_to_one=False,
+    )
+    a_bl_u, b_bl_u, _, _ = equations_to_matrix(
+        groups=groups_arr,
+        equations=s_unavg.build_black_litterman_prior().views,
+        sum_to_one=True,
+    )
+    np.testing.assert_allclose(a_ep_u[0], [0.5, 0.5, 0.0], atol=1e-12)
+    np.testing.assert_allclose(a_bl_u[0], [0.25, 0.25, 0.0], atol=1e-12)
+    np.testing.assert_allclose(b_ep_u[0], 0.0504 / 252.0, atol=1e-12)
+    np.testing.assert_allclose(b_bl_u[0], 0.0504 / 252.0, atol=1e-12)
+
+
+@pytest.mark.parametrize("ppy", [52, 12])
+def test_market_view_scales_constants_by_universe_periods_per_year_and_mock_fallback(
+    ppy: int,
+) -> None:
+    """Standalone scalar constants scale by 1/periods_per_year while mocks without periods_per_year default to 252."""
+    tickers = ["AAPL", "MSFT"]
+    metadata = {"AAPL": "tech", "MSFT": "tech"}
+    fees = {"AAPL": 0.001, "MSFT": 0.001}
+    groups_arr = np.array([tickers, ["tech", "tech"]], dtype=object)
+
+    u_periodic = _PeriodicUniverseStub(
+        tickers=tickers, metadata=metadata, fees=fees, periods_per_year=ppy
+    )
+    synth = PriorSynthesiser(u_periodic)
+    synth.add_market_view("2.0 * AAPL - MSFT == 0.06", confidence=0.8)
+
+    a_ep, b_ep, _, _ = equations_to_matrix(
+        groups=groups_arr,
+        equations=synth.build_entropy_prior().mean_views,
+        sum_to_one=False,
+    )
+    a_bl, b_bl, _, _ = equations_to_matrix(
+        groups=groups_arr,
+        equations=synth.build_black_litterman_prior().views,
+        sum_to_one=True,
+    )
+    np.testing.assert_allclose(a_ep[0], [2.0, -1.0], atol=1e-12)
+    np.testing.assert_allclose(a_bl[0], [2.0, -1.0], atol=1e-12)
+    np.testing.assert_allclose(b_ep[0], 0.06 / float(ppy), atol=1e-12)
+    np.testing.assert_allclose(b_bl[0], 0.06 / float(ppy), atol=1e-12)
+
+    # Legacy MagicMock(spec=Universe) without explicit periods_per_year must NOT resolve to 1.0
+    u_mock = MagicMock(spec=Universe)
+    u_mock.tickers = tickers
+    u_mock.metadata = metadata
+    u_mock.fees = fees
+    u_mock.returns = MagicMock()
+    synth_mock = PriorSynthesiser(u_mock)
+    synth_mock.add_market_view("AAPL == 0.0504", confidence=0.8)
+    _, b_mock_ep, _, _ = equations_to_matrix(
+        groups=groups_arr,
+        equations=synth_mock.build_entropy_prior().mean_views,
+        sum_to_one=False,
+    )
+    _, b_mock_bl, _, _ = equations_to_matrix(
+        groups=groups_arr,
+        equations=synth_mock.build_black_litterman_prior().views,
+        sum_to_one=True,
+    )
+    np.testing.assert_allclose(b_mock_ep[0], 0.0504 / 252.0, atol=1e-12)
+    np.testing.assert_allclose(b_mock_bl[0], 0.0504 / 252.0, atol=1e-12)
+
+
+def test_group_averaging_high_precision_and_typed_ir_stored() -> None:
+    """Non-terminating group averages keep >=11 digits of precision and store typed IR terms."""
+    tickers = ["AAPL", "MSFT", "GOOG"]
+    metadata = {t: "tech" for t in tickers}
+    u = Universe(tickers=tickers, metadata=metadata, fees={t: 0.001 for t in tickers})
+    synth = PriorSynthesiser(u)
+    synth.add_market_view("tech == 0.03", confidence=0.8)
+
+    groups_arr = np.array([tickers, ["tech", "tech", "tech"]], dtype=object)
+    a_ep, b_ep, _, _ = equations_to_matrix(
+        groups=groups_arr,
+        equations=synth.build_entropy_prior().mean_views,
+        sum_to_one=False,
+    )
+    np.testing.assert_allclose(a_ep[0], [1.0 / 3.0] * 3, rtol=1e-11, atol=1e-12)
+    np.testing.assert_allclose(b_ep[0], 0.03 / 252.0, atol=1e-12)
+
+    view_record = synth._views[0]
+    assert "lhs_terms" in view_record and "rhs_terms" in view_record
+    assert isinstance(view_record["lhs_terms"], tuple)
+    assert isinstance(view_record["rhs_terms"], tuple)
+    assert len(view_record["lhs_terms"]) == 1
+    assert len(view_record["rhs_terms"]) == 1
+    assert view_record["lhs_terms"][0].ident == "tech"
+    assert view_record["lhs_terms"][0].coef == pytest.approx(1.0)
+    assert view_record["rhs_terms"][0].ident is None
+    assert view_record["rhs_terms"][0].coef == pytest.approx(0.03)
+
+
+def test_parse_view_side_empty_valid_identifiers_fails_fast() -> None:
+    """Direct calls to _parse_view_side with empty valid_identifiers must raise ValueError, not loop forever."""
+    from flowportfolio.priors import _parse_view_side
+
+    with pytest.raises(ValueError, match="valid linear view expression"):
+        _parse_view_side(
+            "AAPL + MSFT",
+            set(),
+            "AAPL + MSFT == 0.05",
+            side_label="Left-hand side",
+        )
