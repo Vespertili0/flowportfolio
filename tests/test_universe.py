@@ -48,11 +48,26 @@ def _make_multiindex_prices(
         a ``DatetimeIndex`` as the row index, matching yfinance output.
     """
     n = len(next(iter(price_arrays.values())))
-    dates = pd.date_range(start, periods=n)
+    dates = pd.bdate_range(start, periods=n)
     data = {("Close", t): price_arrays[t] for t in tickers}
     df = pd.DataFrame(data, index=dates)
     df.columns = pd.MultiIndex.from_tuples(df.columns, names=["Attributes", "Ticker"])
     return df
+
+
+class _InMemoryProvider:
+    """Minimal DataProviderProtocol stub for deterministic hygiene tests."""
+
+    def __init__(self, close_df: pd.DataFrame) -> None:
+        self._close_df = close_df
+
+    def fetch(
+        self,
+        tickers: list[str],
+        start: str | None = None,
+        end: str | None = None,
+    ) -> pd.DataFrame:
+        return pd.concat({"Close": self._close_df[tickers]}, axis=1)
 
 
 # ---------------------------------------------------------------------------
@@ -180,7 +195,7 @@ def test_universe_fetch_data_multiindex(mock_download) -> None:
 @patch("yfinance.download")
 def test_universe_fetch_data_single_ticker_flat_columns(mock_download) -> None:
     """Test fetch_data with a flat-column response (single ticker, older yfinance)."""
-    dates = pd.date_range("2026-01-01", periods=5)
+    dates = pd.bdate_range("2026-01-01", periods=5)
     mock_download.return_value = pd.DataFrame(
         {
             "Open": [99.0, 100.0, 101.0, 102.0, 103.0],
@@ -218,7 +233,7 @@ def test_universe_fetch_data_empty_response(mock_download) -> None:
 @patch("yfinance.download")
 def test_universe_fetch_data_no_close_column(mock_download) -> None:
     """Missing 'Close' level in a MultiIndex response must raise ValueError."""
-    dates = pd.date_range("2026-01-01", periods=3)
+    dates = pd.bdate_range("2026-01-01", periods=3)
     mock_df = pd.DataFrame(
         {
             ("Open", "SPY"): [100.0, 101.0, 102.0],
@@ -278,7 +293,7 @@ def test_universe_anchor_history_aligns_to_latest_start(mock_download) -> None:
         IVV return at date 4 = 200 / NaN  = NaN  ← transition row
         IVV return at date 5 = 198 / 200 - 1 = valid
 
-    The latest first_valid_index is therefore date 5 (2026-01-05), and
+    The latest first_valid_index is therefore date 5 (2026-01-07), and
     anchor_history slices from there, leaving 3 rows.
     """
     mock_download.return_value = _make_multiindex_prices(
@@ -298,7 +313,7 @@ def test_universe_anchor_history_aligns_to_latest_start(mock_download) -> None:
     univ.anchor_history()
 
     assert len(univ.returns) == 3
-    assert univ.returns.index[0] == pd.Timestamp("2026-01-05")
+    assert univ.returns.index[0] == pd.Timestamp("2026-01-07")
     assert not univ.returns.isna().any().any()
 
 
@@ -375,65 +390,128 @@ def test_anchor_history_rejects_disjoint_and_delisted_assets(mock_download) -> N
         univ2.anchor_history()
 
 
-@patch("yfinance.download")
-def test_universe_mixed_weekday_and_weekend_calendar_alignment(
-    mock_download, caplog
-) -> None:
-    """Verify combining 5-day weekday asset with 7-day weekend asset drops weekend rows."""
-    # 14 days starting on a Monday (2026-01-05)
-    # Week 1: 5-9 (Mon-Fri), 10-11 (Sat-Sun)
-    # Week 2: 12-16 (Mon-Fri), 17-18 (Sat-Sun)
+# ---------------------------------------------------------------------------
+# 6. Weekday exchange calendar boundary & periodicity contract (Cycle 2)
+# ---------------------------------------------------------------------------
+
+
+def test_universe_rejects_mixed_weekday_and_weekend_calendar() -> None:
+    """Out-of-scope 7-day feeds mixed with weekday ETFs must raise ValueError (never fabricate 3-day Monday bars)."""
     dates = pd.date_range("2026-01-05", periods=14, freq="D")
-    spy_prices = []
-    btc_prices = []
-    for d in dates:
-        btc_prices.append(50000.0 + d.day * 100.0)
-        if d.dayofweek < 5:
-            spy_prices.append(400.0 + d.day)
-        else:
-            spy_prices.append(np.nan)
-
-    mock_download.return_value = _make_multiindex_prices(
-        ["SPY", "BTC-USD"],
-        {"SPY": spy_prices, "BTC-USD": btc_prices},
-        start="2026-01-05",
+    prices = pd.DataFrame(
+        {
+            "SPY": [
+                400.0 + i if d.dayofweek < 5 else np.nan for i, d in enumerate(dates)
+            ],
+            "BTC-USD": [100.0 * (1.02**i) for i in range(14)],
+        },
+        index=dates,
     )
-
     univ = Universe(
         ["SPY", "BTC-USD"],
-        {"SPY": "equity", "BTC-USD": "crypto"},
+        {"SPY": "equity", "BTC-USD": "other"},
         {"SPY": 0.0003, "BTC-USD": 0.001},
     )
-    with caplog.at_level("WARNING"):
-        univ.fetch_data()
+    with pytest.raises(ValueError, match="weekend|weekday exchange"):
+        univ.fetch_data(data_provider=_InMemoryProvider(prices))
 
-    assert "Detected mixed 5-day" in caplog.text
+
+def test_universe_rejects_pure_weekend_trading_feed() -> None:
+    """Pure 7-day weekend-active feeds are outside ETF/equity scope and must raise ValueError."""
+    dates = pd.date_range("2026-01-05", periods=14, freq="D")
+    prices = pd.DataFrame(
+        {"BTC-USD": [100.0 * (1.02**i) for i in range(14)]},
+        index=dates,
+    )
+    univ = Universe(["BTC-USD"], {"BTC-USD": "other"}, {"BTC-USD": 0.001})
+
+    with pytest.raises(ValueError, match="weekend|weekday exchange"):
+        univ.fetch_data(data_provider=_InMemoryProvider(prices))
+
+
+def test_universe_strips_all_nan_weekend_placeholder_rows() -> None:
+    """Vendor-padded all-NaN Sat/Sun rows (including trailing weekends) are stripped cleanly for weekday ETFs."""
+    # 14 calendar days: Mon Jan 5 .. Sun Jan 18 (ends on a weekend with all-NaN rows)
+    dates = pd.date_range("2026-01-05", periods=14, freq="D")
+    prices = pd.DataFrame(
+        {
+            "SPY": [
+                400.0 + i if d.dayofweek < 5 else np.nan for i, d in enumerate(dates)
+            ],
+            "IVV": [
+                200.0 + i if d.dayofweek < 5 else np.nan for i, d in enumerate(dates)
+            ],
+        },
+        index=dates,
+    )
+    univ = Universe(
+        ["SPY", "IVV"],
+        {"SPY": "core", "IVV": "core"},
+        {"SPY": 0.0003, "IVV": 0.0003},
+    )
+    univ.fetch_data(data_provider=_InMemoryProvider(prices))
+    univ.anchor_history()
+
     assert univ._prices is not None
-    assert (univ._prices.index.dayofweek < 5).all()
-    assert (univ.returns.index.dayofweek < 5).all()
     assert len(univ._prices) == 10
-    assert not univ._prices["SPY"].isna().any()
-    assert not univ._prices["BTC-USD"].isna().any()
+    assert (univ._prices.index.dayofweek < 5).all()
+    assert len(univ.returns) == 9
+    assert (univ.returns.index.dayofweek < 5).all()
+    assert univ.periods_per_year == 252
+
+
+@pytest.mark.parametrize(
+    ("dates", "expected_ppy"),
+    [
+        (pd.bdate_range("2026-01-05", periods=20), 252),
+        (pd.date_range("2026-01-09", periods=10, freq="W-FRI"), 52),
+        (pd.date_range("2025-01-31", periods=10, freq="BME"), 12),
+        (pd.date_range("2024-03-29", periods=8, freq="BQE"), 4),
+        (pd.date_range("2020-12-31", periods=5, freq="BYE"), 1),
+        # 2-bar monthly series yields 1 return row; inference must still detect monthly (12)
+        (pd.date_range("2025-01-31", periods=2, freq="BME"), 12),
+    ],
+)
+def test_universe_infers_exchange_periods_per_year(
+    dates: pd.DatetimeIndex, expected_ppy: int
+) -> None:
+    """Universe exposes periods_per_year matching standard ETF/equity exchange frequencies."""
+    prices = pd.DataFrame(
+        {"SPY": np.linspace(100.0, 120.0, len(dates))},
+        index=dates,
+    )
+    univ = Universe(["SPY"], {"SPY": "core"}, {"SPY": 0.0003})
+    assert univ.periods_per_year == 252  # Default before fetch_data()
+
+    univ.fetch_data(data_provider=_InMemoryProvider(prices))
+    assert univ.periods_per_year == expected_ppy
+
+
+def test_universe_failed_refetch_preserves_periods_per_year() -> None:
+    """A failed fetch_data() call must preserve the previously inferred periods_per_year."""
+    weekly_dates = pd.date_range("2026-01-09", periods=10, freq="W-FRI")
+    weekly_prices = pd.DataFrame(
+        {"SPY": np.linspace(100.0, 110.0, len(weekly_dates))},
+        index=weekly_dates,
+    )
+    univ = Universe(["SPY"], {"SPY": "core"}, {"SPY": 0.0003})
+    univ.fetch_data(data_provider=_InMemoryProvider(weekly_prices))
+    assert univ.periods_per_year == 52
+
+    # Rejected weekend-active re-fetch must leave periods_per_year untouched
+    weekend_dates = pd.date_range("2026-01-05", periods=7, freq="D")
+    weekend_prices = pd.DataFrame(
+        {"SPY": np.linspace(100.0, 106.0, len(weekend_dates))},
+        index=weekend_dates,
+    )
+    with pytest.raises(ValueError, match="weekend|weekday exchange"):
+        univ.fetch_data(data_provider=_InMemoryProvider(weekend_prices))
+    assert univ.periods_per_year == 52
 
 
 # ---------------------------------------------------------------------------
-# 6. O4_PRICE_HYGIENE (Cycle 1: delisting, price validity & index ordering)
+# 7. O4_PRICE_HYGIENE (Cycle 1: delisting, price validity & index ordering)
 # ---------------------------------------------------------------------------
-
-
-class _InMemoryProvider:
-    """Minimal DataProviderProtocol stub for deterministic hygiene tests."""
-
-    def __init__(self, close_df: pd.DataFrame) -> None:
-        self._close_df = close_df
-
-    def fetch(
-        self,
-        tickers: list[str],
-        start: str | None = None,
-        end: str | None = None,
-    ) -> pd.DataFrame:
-        return pd.concat({"Close": self._close_df[tickers]}, axis=1)
 
 
 @pytest.mark.parametrize("max_ffill_days", [5, None])
@@ -528,7 +606,8 @@ def test_o4c_unsorted_3row_timestamps_sort_chronologically_with_warning(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Unsorted 3-row unique timestamps must warn, sort ascending, and yield exact chronological returns."""
-    unsorted_dates = pd.DatetimeIndex(["2026-01-01", "2026-01-03", "2026-01-02"])
+    # Mon 2026-01-05, Wed 2026-01-07, Tue 2026-01-06
+    unsorted_dates = pd.DatetimeIndex(["2026-01-05", "2026-01-07", "2026-01-06"])
     prices = pd.DataFrame(
         {
             "SPY": [100.0, 120.0, 110.0],
@@ -554,8 +633,9 @@ def test_o4c_unsorted_4row_timestamps_prevent_silent_reverse_returns(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Unsorted 4-row timestamps must sort ascending instead of silently emitting reverse-time returns."""
+    # Mon 2026-01-05, Wed 2026-01-07, Tue 2026-01-06, Thu 2026-01-08
     unsorted_dates = pd.DatetimeIndex(
-        ["2026-01-01", "2026-01-03", "2026-01-02", "2026-01-04"]
+        ["2026-01-05", "2026-01-07", "2026-01-06", "2026-01-08"]
     )
     prices = pd.DataFrame(
         {
@@ -581,7 +661,7 @@ def test_o4c_unsorted_4row_timestamps_prevent_silent_reverse_returns(
 
 def test_o4c_duplicate_timestamps_raise_value_error() -> None:
     """Duplicate timestamps must fail fast rather than silently picking or distorting a bar."""
-    dup_dates = pd.DatetimeIndex(["2026-01-01", "2026-01-02", "2026-01-02"])
+    dup_dates = pd.DatetimeIndex(["2026-01-05", "2026-01-06", "2026-01-06"])
     dup_prices = pd.DataFrame({"SPY": [100.0, 110.0, 112.0]}, index=dup_dates)
     univ_dup = Universe(["SPY"], {"SPY": "core"}, {"SPY": 0.0})
 
@@ -591,7 +671,7 @@ def test_o4c_duplicate_timestamps_raise_value_error() -> None:
 
 def test_o4c_nat_timestamp_in_index_raises_value_error() -> None:
     """Missing (NaT) timestamps in the price index must fail fast with ValueError."""
-    nat_dates = pd.DatetimeIndex(["2026-01-01", pd.NaT, "2026-01-03"])
+    nat_dates = pd.DatetimeIndex(["2026-01-05", pd.NaT, "2026-01-07"])
     nat_prices = pd.DataFrame({"SPY": [100.0, 110.0, 120.0]}, index=nat_dates)
     univ_nat = Universe(["SPY"], {"SPY": "core"}, {"SPY": 0.0})
 

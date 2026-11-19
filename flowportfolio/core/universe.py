@@ -81,6 +81,49 @@ def _ffill_interior_gaps(
     return filled
 
 
+def _validate_weekday_exchange_calendar(
+    raw_prices: pd.DataFrame, tickers: list[str]
+) -> None:
+    """Reject feeds containing weekend trading observations (out of scope for ETFs/equities)."""
+    if not isinstance(raw_prices.index, pd.DatetimeIndex):
+        return
+    weekend_mask = raw_prices.index.dayofweek >= 5
+    if not weekend_mask.any():
+        return
+
+    weekend_active = [
+        t for t in tickers if raw_prices.loc[weekend_mask, t].notna().any()
+    ]
+    if weekend_active:
+        raise ValueError(
+            f"Unsupported weekend trading observations detected for tickers {weekend_active}. "
+            "flowportfolio only supports weekday exchange calendars (ETFs and equities)."
+        )
+
+
+def _infer_periods_per_year(index: pd.Index) -> int:
+    """Infer annualisation frequency for weekday exchange calendars (252, 52, 12, 4, 1)."""
+    if not isinstance(index, pd.DatetimeIndex) or len(index) < 2:
+        return 252
+
+    deltas = index.to_series().diff().dropna().dt.total_seconds() / 86400.0
+    if deltas.empty:
+        return 252
+
+    median_days = float(deltas.median())
+    if median_days <= 3.5:
+        return 252
+    if 5.0 <= median_days <= 9.0:
+        return 52
+    if 25.0 <= median_days <= 35.0:
+        return 12
+    if 80.0 <= median_days <= 100.0:
+        return 4
+    if 350.0 <= median_days <= 380.0:
+        return 1
+    return 252
+
+
 class DataFetchError(Exception):
     """Raised when the yfinance download process fails unexpectedly.
 
@@ -183,6 +226,8 @@ class Universe:
         # Last genuine (un-forward-filled) price date per ticker, recorded by
         # fetch_data() and consumed by anchor_history().
         self._raw_last_valid: dict[str, pd.Timestamp | None] = {}
+        # Exchange return frequency (observations per calendar year); updated on fetch_data().
+        self._periods_per_year: int = 252
 
     # ------------------------------------------------------------------
     # Public properties
@@ -223,6 +268,22 @@ class Universe:
         return dict(self._fees)
 
     @property
+    def periods_per_year(self) -> int:
+        """Number of return observations per calendar year.
+
+        Defaults to ``252`` before :meth:`fetch_data` is called, and is
+        inferred from the weekday exchange price index afterwards
+        (``252`` daily, ``52`` weekly, ``12`` monthly, ``4`` quarterly,
+        ``1`` annual).
+
+        Returns
+        -------
+        int
+            Annualisation frequency for the fetched return series.
+        """
+        return self._periods_per_year
+
+    @property
     def returns(self) -> pd.DataFrame:
         """Daily asset returns DataFrame.
 
@@ -254,12 +315,14 @@ class Universe:
         data_provider: DataProviderProtocol | None = None,
         max_ffill_days: int | None = 5,
     ) -> None:
-        """Download adjusted close prices and compute daily returns.
+        """Download adjusted close prices and compute simple returns.
 
         Fetches adjusted close prices from the provided data provider for all
-        tickers in the universe, then computes daily simple returns using
-        :func:`skfolio.preprocessing.prices_to_returns`. Both raw prices
-        and returns are stored internally.
+        tickers in the universe, validates weekday exchange calendar hygiene,
+        computes simple returns using
+        :func:`skfolio.preprocessing.prices_to_returns`, and infers
+        :attr:`periods_per_year` from the price observation cadence. Both raw
+        prices and returns are stored internally.
 
         Assets with shorter listing histories will have leading ``NaN``
         values in the returns DataFrame. Call :meth:`anchor_history`
@@ -272,7 +335,9 @@ class Universe:
         before returns are computed; leading pre-inception ``NaN`` values and
         trailing ``NaN`` values after an asset's last genuine price are left
         untouched. Unsorted unique timestamps are sorted chronologically with
-        a warning.
+        a warning. Only weekday exchange calendars (Monday–Friday) are
+        supported; weekend-active feeds raise ``ValueError``, while empty
+        all-``NaN`` weekend placeholder rows are stripped cleanly.
 
         Parameters
         ----------
@@ -299,9 +364,10 @@ class Universe:
             ``"Close"`` price level, if any requested ticker is absent from
             the downloaded data, if the price index contains missing
             (``NaT``) or duplicate timestamps, if any ticker has no valid
-            prices or contains non-finite or non-positive prices, if the
-            resulting returns DataFrame is empty, or if ``max_ffill_days`` is
-            not a non-negative integer or ``None``.
+            prices or contains non-finite or non-positive prices, if any
+            ticker contains weekend trading observations, if the resulting
+            returns DataFrame is empty, or if ``max_ffill_days`` is not a
+            non-negative integer or ``None``.
         """
         if max_ffill_days is not None and (
             not isinstance(max_ffill_days, int)
@@ -352,37 +418,12 @@ class Universe:
         raw_prices = prices[self._tickers]
         raw_prices = _normalize_price_index(raw_prices)
         _validate_positive_prices(raw_prices)
+        _validate_weekday_exchange_calendar(raw_prices, self._tickers)
 
-        # Mixed calendar detection: if both weekday-only and weekend-active
-        # tickers coexist, filter prices to weekdays (Monday-Friday) to prevent
-        # forward-fill variance dilution and 365-day fee overcharging on weekday assets.
-        if (
-            isinstance(raw_prices.index, pd.DatetimeIndex)
-            and len(self._tickers) > 1
-            and (raw_prices.index.dayofweek >= 5).any()
-        ):
-            weekend_mask = raw_prices.index.dayofweek >= 5
-            weekday_mask = ~weekend_mask
-
-            weekday_only_tickers = [
-                t
-                for t in self._tickers
-                if raw_prices.loc[weekday_mask, t].count() >= 1
-                and raw_prices.loc[weekend_mask, t].count() == 0
-            ]
-            weekend_active_tickers = [
-                t for t in self._tickers if raw_prices.loc[weekend_mask, t].count() >= 1
-            ]
-
-            if weekday_only_tickers and weekend_active_tickers:
-                logger.warning(
-                    "Detected mixed 5-day (weekday-only: %s) and 7-day (weekend-active: %s) "
-                    "trading calendars. Filtering prices to weekdays (Monday-Friday) to prevent "
-                    "forward-fill variance dilution and 365-day fee overcharging on weekday assets.",
-                    weekday_only_tickers,
-                    weekend_active_tickers,
-                )
-                raw_prices = raw_prices.loc[weekday_mask]
+        # If a vendor returned empty all-NaN weekend placeholder rows with no active
+        # weekend tickers, drop those empty rows cleanly before computing returns.
+        if isinstance(raw_prices.index, pd.DatetimeIndex):
+            raw_prices = raw_prices.loc[raw_prices.index.dayofweek < 5]
 
         # Record each ticker's last genuine price date before any forward-filling so that
         # anchor_history() can detect histories that ended before the common start or end.
@@ -406,11 +447,14 @@ class Universe:
                 "Calculated returns DataFrame is empty after preprocessing."
             )
 
+        inferred_ppy = _infer_periods_per_year(filled_prices.index)
+
         # Commit state atomically so a failed fetch_data() call never leaves
-        # _raw_last_valid, _prices, and _returns out of sync.
+        # _raw_last_valid, _prices, _returns, and _periods_per_year out of sync.
         self._raw_last_valid = raw_last_valid
         self._prices = filled_prices
         self._returns = returns
+        self._periods_per_year = inferred_ppy
 
     def anchor_history(self) -> None:
         """Align return histories to the asset with the shortest history.

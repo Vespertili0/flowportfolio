@@ -33,6 +33,10 @@ def test_universe_protocol_valid_properties() -> None:
         def fees(self) -> dict[str, float]:
             return {"A": 0.001, "B": 0.002}
 
+        @property
+        def periods_per_year(self) -> int:
+            return 252
+
     instance = ValidUniverseProperties()
     assert isinstance(instance, UniverseProtocol)
 
@@ -46,6 +50,7 @@ def test_universe_protocol_valid_attributes() -> None:
             self.metadata = {"A": "core", "B": "satellite"}
             self.returns = pd.DataFrame()
             self.fees = {"A": 0.001, "B": 0.002}
+            self.periods_per_year = 252
 
     instance = ValidUniverseAttributes()
     assert isinstance(instance, UniverseProtocol)
@@ -73,6 +78,22 @@ def test_universe_protocol_missing_metadata() -> None:
 
     instance = MissingMetadata()
     assert not isinstance(instance, UniverseProtocol)
+
+
+def test_universe_protocol_missing_periods_per_year() -> None:
+    """Test that an object missing periods_per_year fails UniverseProtocol and is_universe_protocol."""
+    from flowportfolio.core.protocols import is_universe_protocol
+
+    class MissingPeriodsPerYear:
+        def __init__(self) -> None:
+            self.tickers = ["A"]
+            self.metadata = {"A": "core"}
+            self.fees = {"A": 0.001}
+            self.returns = pd.DataFrame()
+
+    instance = MissingPeriodsPerYear()
+    assert not isinstance(instance, UniverseProtocol)
+    assert is_universe_protocol(instance) is False
 
 
 def test_universe_protocol_empty_class() -> None:
@@ -108,6 +129,7 @@ def test_is_universe_protocol_fees_dict_check() -> None:
             self.metadata = {"A": "core"}
             self.fees = {"A": 0.001}
             self.returns = pd.DataFrame()
+            self.periods_per_year = 252
 
     assert is_universe_protocol(ValidObj()) is True
 
@@ -117,5 +139,25 @@ def test_is_universe_protocol_fees_dict_check() -> None:
             self.metadata = {"A": "core"}
             self.fees = [0.001]
             self.returns = pd.DataFrame()
+            self.periods_per_year = 252
 
     assert is_universe_protocol(NonDictFees()) is False
+
+
+def test_is_universe_protocol_real_unfetched_universe_and_magic_mock() -> None:
+    """Verify is_universe_protocol accepts unfetched Universe and MagicMock(spec=Universe) safely."""
+    from unittest.mock import MagicMock
+
+    from flowportfolio.core.protocols import is_universe_protocol
+    from flowportfolio.core.universe import Universe
+
+    unfetched = Universe(["SPY"], {"SPY": "core"}, {"SPY": 0.0003})
+    assert is_universe_protocol(unfetched) is True
+
+    mock_u = MagicMock(spec=Universe)
+    mock_u.tickers = ["SPY"]
+    mock_u.metadata = {"SPY": "core"}
+    mock_u.fees = {"SPY": 0.0003}
+    mock_u.returns = MagicMock()
+    # periods_per_year is intentionally NOT assigned on mock_u (mirrors test_priors.py / test_delta.py)
+    assert is_universe_protocol(mock_u) is True

@@ -23,11 +23,10 @@ import pandas as pd
 
 @runtime_checkable
 class UniverseProtocol(Protocol):
-    """Minimal structural interface required by constraint builders.
+    """Minimal structural interface for asset universe containers.
 
-    Any object that exposes a ``tickers`` property returning a
-    ``list[str]`` and a ``metadata`` property returning a
-    ``dict[str, str]`` satisfies this protocol.
+    Any object that exposes ``tickers``, ``metadata``, ``returns``, ``fees``,
+    and ``periods_per_year`` satisfies this protocol.
 
     This protocol is ``@runtime_checkable``, so ``isinstance`` checks
     work at runtime (structural attribute presence is verified, not
@@ -46,12 +45,17 @@ class UniverseProtocol(Protocol):
 
     @property
     def returns(self) -> pd.DataFrame:
-        """Daily asset returns DataFrame."""
+        """Asset returns DataFrame."""
         ...
 
     @property
     def fees(self) -> dict[str, float]:
         """Asset management fees mapping."""
+        ...
+
+    @property
+    def periods_per_year(self) -> int:
+        """Number of return observations per calendar year (e.g. 252, 52, 12, 4, 1)."""
         ...
 
 
@@ -66,7 +70,12 @@ def is_universe_protocol(obj: object) -> bool:
         or "returns" in getattr(obj, "__dict__", {})
         or hasattr(obj, "_returns")
     )
-    if not has_returns:
+    has_ppy = (
+        hasattr(type(obj), "periods_per_year")
+        or "periods_per_year" in getattr(obj, "__dict__", {})
+        or hasattr(obj, "periods_per_year")
+    )
+    if not (has_returns and has_ppy):
         return False
     return (
         isinstance(getattr(obj, "tickers", None), list)
