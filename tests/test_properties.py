@@ -219,6 +219,67 @@ def test_property_prior_parser_grammar_invariance(
     np.testing.assert_allclose(b_bl[0], expected_b, rtol=1e-9, atol=1e-10)
 
 
+@settings(max_examples=50, deadline=None)
+@given(
+    rfr=st.floats(min_value=0.0, max_value=0.10, allow_nan=False, allow_infinity=False),
+    c1=st.floats(min_value=0.25, max_value=2.0, allow_nan=False, allow_infinity=False),
+    c2=st.floats(min_value=-2.0, max_value=2.0, allow_nan=False, allow_infinity=False),
+    target_ann=st.floats(
+        min_value=-0.20, max_value=0.30, allow_nan=False, allow_infinity=False
+    ),
+    use_empirical=st.booleans(),
+    periods_per_year=st.sampled_from([252, 52, 12]),
+)
+def test_property_bl_exact_total_return_recovery_across_rfr(
+    rfr: float,
+    c1: float,
+    c2: float,
+    target_ann: float,
+    use_empirical: bool,
+    periods_per_year: int,
+) -> None:
+    """For any risk_free_rate >= 0, periodicity, and linear equality view
+    c1 * SPY + c2 * TLT == target_ann, a 100%-confidence Black-Litterman
+    posterior must satisfy c1 * mu_SPY + c2 * mu_TLT == target_ann under
+    both EquilibriumMu and EmpiricalPrior.
+    """
+    rng = np.random.default_rng(7)
+    freq = {252: "B", 52: "W-FRI", 12: "BME"}[periods_per_year]
+    dates = pd.date_range("2025-01-02", periods=60, freq=freq)
+    rets = pd.DataFrame(
+        rng.normal(0.05 / periods_per_year, 0.005, size=(60, 3)),
+        index=dates,
+        columns=["SPY", "TLT", "GLD"],
+    )
+    u = Universe(
+        tickers=["SPY", "TLT", "GLD"],
+        metadata={"SPY": "eq", "TLT": "fi", "GLD": "alt"},
+        fees={"SPY": 0.0003, "TLT": 0.0015, "GLD": 0.0040},
+    )
+    u._returns = rets
+    u._periods_per_year = periods_per_year
+
+    c1_str = f"{c1:.6g}"
+    c2_mag_str = f"{abs(c2):.6g}"
+    target_str = f"{target_ann:.6g}"
+    c1_val = float(c1_str)
+    c2_val = -float(c2_mag_str) if c2 < 0 else float(c2_mag_str)
+    target_val = float(target_str)
+
+    sign = "-" if c2 < 0 else "+"
+    view = f"{c1_str} * SPY {sign} {c2_mag_str} * TLT == {target_str}"
+
+    ps = PriorSynthesiser(u)
+    ps.add_market_view(view, confidence=1.0)
+    prior_est = ps.build_empirical_prior() if use_empirical else None
+    bl = ps.build_black_litterman_prior(prior_estimator=prior_est, risk_free_rate=rfr)
+    bl.fit(rets)
+
+    mu_ann = bl.return_distribution_.mu * float(periods_per_year)
+    realized = c1_val * float(mu_ann[0]) + c2_val * float(mu_ann[1])
+    assert realized == pytest.approx(target_val, abs=1e-6)
+
+
 # ---------------------------------------------------------------------------
 # 2. PortfolioDeltaEngine & ConstraintBuilder Algebraic Invariants
 # ---------------------------------------------------------------------------

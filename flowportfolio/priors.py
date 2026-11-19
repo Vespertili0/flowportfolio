@@ -5,10 +5,12 @@ from __future__ import annotations
 import logging
 import math
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from skfolio.distribution import VineCopula
 from skfolio.moments import (
+    EquilibriumMu,
     LedoitWolf,
     ShrunkMu,
     ShrunkMuMethods,
@@ -201,7 +203,7 @@ def _parse_view_side(
 
 
 def _format_view_side(
-    terms: list[_ViewTerm],
+    terms: Sequence[_ViewTerm],
     *,
     periods_per_year: float = 252.0,
     group_divisors: dict[str, int] | None = None,
@@ -233,6 +235,80 @@ def _format_view_side(
             out.append(f"{term.sign} {core}")
 
     return " ".join(out)
+
+
+def _compute_group_divisors(
+    valid_tickers: set[str], raw_metadata: dict[str, object]
+) -> dict[str, int]:
+    """Return member counts for multi-member metadata groups that are not ticker names."""
+    counts: dict[str, int] = {}
+    for value in raw_metadata.values():
+        if isinstance(value, str):
+            counts[value] = counts.get(value, 0) + 1
+    return {g: n for g, n in counts.items() if n > 1 and g not in valid_tickers}
+
+
+def _prior_uses_excess_returns(prior_estimator: BasePrior | None) -> bool:
+    """Return True if prior_estimator estimates excess returns (skfolio EquilibriumMu convention)."""
+    if prior_estimator is None:
+        return True
+    mu_est = getattr(prior_estimator, "mu_estimator", None)
+    return isinstance(mu_est, EquilibriumMu)
+
+
+def _format_bl_equality_view(
+    lhs_terms: Sequence[_ViewTerm],
+    rhs_terms: Sequence[_ViewTerm],
+    *,
+    periods_per_year: float,
+    risk_free_rate_annual: float,
+) -> str:
+    """Compile typed equality view terms into a BlackLitterman equation string.
+
+    When risk_free_rate_annual != 0.0 (excess-return prior mode), transforms
+    p^T r = q_total into p^T r_excess = q_total - (sum p_j) * risk_free_rate_annual
+    before scaling scalar constants by 1 / periods_per_year.
+    """
+    if risk_free_rate_annual == 0.0:
+        lhs_str = _format_view_side(lhs_terms, periods_per_year=periods_per_year)
+        rhs_str = _format_view_side(rhs_terms, periods_per_year=periods_per_year)
+        return f"{lhs_str} == {rhs_str}"
+
+    # Canonical form: all identifier terms on LHS, net scalar constant on RHS
+    id_terms: list[_ViewTerm] = []
+    net_loading = 0.0
+    rhs_const_ann = 0.0
+
+    for term in lhs_terms:
+        signed_val = -term.coef if term.sign == "-" else term.coef
+        if term.ident is not None:
+            id_terms.append(term)
+            net_loading += signed_val
+        else:
+            rhs_const_ann -= signed_val
+
+    for term in rhs_terms:
+        signed_val = -term.coef if term.sign == "-" else term.coef
+        if term.ident is not None:
+            flipped_sign = "+" if term.sign == "-" else "-"
+            id_terms.append(
+                _ViewTerm(
+                    sign=flipped_sign,
+                    coef=term.coef,
+                    ident=term.ident,
+                    raw_coef=term.raw_coef,
+                )
+            )
+            net_loading -= signed_val
+        else:
+            rhs_const_ann += signed_val
+
+    excess_rhs_ann = rhs_const_ann - net_loading * risk_free_rate_annual
+    lhs_str = _format_view_side(id_terms, periods_per_year=periods_per_year)
+    rhs_per_period = excess_rhs_ann / periods_per_year
+    if rhs_per_period == 0.0:
+        rhs_per_period = 0.0
+    return f"{lhs_str} == {rhs_per_period}"
 
 
 class PriorSynthesiser:
@@ -270,6 +346,24 @@ class PriorSynthesiser:
         normalised = re.sub(r"(?<![<>=!])>(?!=)", ">=", view_str)
         normalised = re.sub(r"(?<![<>=!])<(?!=)", "<=", normalised)
         return normalised
+
+    def _raw_metadata(self) -> dict[str, object]:
+        """Return universe metadata as a dict, or an empty dict if absent."""
+        metadata = getattr(self._universe, "metadata", None)
+        return metadata if isinstance(metadata, dict) else {}
+
+    def _build_groups_mapping(self) -> dict[str, list[str]] | None:
+        """Build the skfolio ``groups`` mapping from universe tickers and metadata."""
+        raw_metadata = self._raw_metadata()
+        groups: dict[str, list[str]] = {}
+        for ticker in getattr(self._universe, "tickers", []):
+            if ticker in raw_metadata:
+                val = raw_metadata[ticker]
+                if isinstance(val, str):
+                    groups[ticker] = [val]
+                elif isinstance(val, Sequence):
+                    groups[ticker] = [str(item) for item in val]
+        return groups if groups else None
 
     def add_market_view(
         self, view_str: str, confidence: float, *, average_groups: bool = True
@@ -322,11 +416,7 @@ class PriorSynthesiser:
             raise ValueError("confidence must be between 0.0 and 1.0")
 
         valid_tickers = set(self._universe.tickers)
-        raw_metadata = (
-            self._universe.metadata
-            if isinstance(getattr(self._universe, "metadata", None), dict)
-            else {}
-        )
+        raw_metadata = self._raw_metadata()
         valid_groups = {v for v in raw_metadata.values() if isinstance(v, str)}
         valid_identifiers = valid_tickers | valid_groups
 
@@ -357,13 +447,7 @@ class PriorSynthesiser:
                 f"View '{view_str}' must contain exactly one comparison operator."
             )
 
-        counts: dict[str, int] = {}
-        for value in raw_metadata.values():
-            if isinstance(value, str):
-                counts[value] = counts.get(value, 0) + 1
-        group_divisors = {
-            g: n for g, n in counts.items() if n > 1 and g not in valid_tickers
-        }
+        group_divisors = _compute_group_divisors(valid_tickers, raw_metadata)
 
         lhs_terms = _parse_view_side(
             lhs, valid_identifiers, view_str, side_label="Left-hand side"
@@ -409,6 +493,7 @@ class PriorSynthesiser:
                 "raw_view": view_str,
                 "lhs_terms": tuple(lhs_terms),
                 "rhs_terms": tuple(rhs_terms),
+                "average_groups": average_groups,
             }
         )
         return self
@@ -466,21 +551,30 @@ class PriorSynthesiser:
                 "fractional confidence values (< 1.0)."
             )
 
-        views = [v["view"] for v in self._views]
+        raw_metadata = self._raw_metadata()
+        valid_tickers = set(getattr(self._universe, "tickers", []))
+        group_divisors = _compute_group_divisors(valid_tickers, raw_metadata)
+        ppy = _resolve_periods_per_year(self._universe)
 
-        raw_metadata = (
-            self._universe.metadata
-            if isinstance(getattr(self._universe, "metadata", None), dict)
-            else {}
-        )
-        groups: dict[str, list[str]] = {}
-        for ticker in getattr(self._universe, "tickers", []):
-            if ticker in raw_metadata:
-                val = raw_metadata[ticker]
-                groups[ticker] = [val] if isinstance(val, str) else list(val)
-        groups_arg = groups if groups else None
+        views: list[str] = []
+        for v in self._views:
+            if "lhs_terms" in v and "rhs_terms" in v:
+                divisors = (
+                    group_divisors
+                    if v.get("average_groups", True) and group_divisors
+                    else None
+                )
+                ep_lhs = _format_view_side(
+                    v["lhs_terms"], periods_per_year=ppy, group_divisors=divisors
+                )
+                ep_rhs = _format_view_side(
+                    v["rhs_terms"], periods_per_year=ppy, group_divisors=divisors
+                )
+                views.append(f"{ep_lhs} {v['operator']} {ep_rhs}")
+            else:
+                views.append(v["view"])
 
-        return EntropyPooling(mean_views=views, groups=groups_arg)
+        return EntropyPooling(mean_views=views, groups=self._build_groups_mapping())
 
     def build_black_litterman_prior(
         self,
@@ -497,8 +591,10 @@ class PriorSynthesiser:
         prior_estimator : BasePrior or None, optional
             Prior distribution estimator. If None, skfolio default is used.
         risk_free_rate : float, default 0.0
-            Annualised risk-free rate; converted internally to a daily rate
-            (divided by 252.0) to match the frequency of the returns and views.
+            Annualised risk-free rate; converted internally to a per-period rate
+            (divided by ``universe.periods_per_year``) when using excess-return
+            priors (``EquilibriumMu``). Suppressed for total-return priors to
+            prevent double-counting.
 
         Returns
         -------
@@ -547,29 +643,45 @@ class PriorSynthesiser:
                     f"0.0; got 0.0 for view '{v['raw_view']}'."
                 )
 
-        # BlackLitterman already sets sum_to_one=True in equations_to_matrix,
-        # so use bl_view (formatted without group_divisors) to avoid 1/N^2 scaling.
-        views = [v.get("bl_view", v["view"]) for v in self._views]
-        confidences = [v["confidence"] for v in self._views]
+        ppy = _resolve_periods_per_year(self._universe)
+        rfr_annual = float(risk_free_rate)
+        uses_excess = _prior_uses_excess_returns(prior_estimator)
 
-        raw_metadata = (
-            self._universe.metadata
-            if isinstance(getattr(self._universe, "metadata", None), dict)
-            else {}
-        )
-        groups: dict[str, list[str]] = {}
-        for ticker in getattr(self._universe, "tickers", []):
-            if ticker in raw_metadata:
-                val = raw_metadata[ticker]
-                groups[ticker] = [val] if isinstance(val, str) else list(val)
-        groups_arg = groups if groups else None
+        if uses_excess:
+            effective_view_rfr_ann = rfr_annual
+            bl_rfr_per_period = rfr_annual / ppy
+        else:
+            if rfr_annual != 0.0:
+                logger.warning(
+                    "prior_estimator '%s' estimates total returns directly (already including "
+                    "the risk-free rate). Suppressing BlackLitterman's additive risk_free_rate "
+                    "offset to prevent double-counting.",
+                    type(prior_estimator).__name__,
+                )
+            effective_view_rfr_ann = 0.0
+            bl_rfr_per_period = 0.0
+
+        # BlackLitterman already sets sum_to_one=True in equations_to_matrix,
+        # so format without group_divisors to avoid 1/N^2 scaling.
+        views = [
+            _format_bl_equality_view(
+                v["lhs_terms"],
+                v["rhs_terms"],
+                periods_per_year=ppy,
+                risk_free_rate_annual=effective_view_rfr_ann,
+            )
+            if "lhs_terms" in v and "rhs_terms" in v
+            else v.get("bl_view", v["view"])
+            for v in self._views
+        ]
+        confidences = [v["confidence"] for v in self._views]
 
         kwargs: dict[str, object] = {
             "views": views,
             "tau": float(tau),
             "view_confidences": confidences,
-            "groups": groups_arg,
-            "risk_free_rate": float(risk_free_rate) / 252.0,
+            "groups": self._build_groups_mapping(),
+            "risk_free_rate": bl_rfr_per_period,
         }
         if prior_estimator is not None:
             kwargs["prior_estimator"] = prior_estimator
@@ -591,7 +703,8 @@ class PriorSynthesiser:
         n_samples : int, optional
             Number of synthetic return paths to generate. Default is 5000.
         random_state : int or None, optional
-            Seed for the random number generator used by the VineCopula.
+            Non-negative integer seed for the VineCopula random number
+            generator. Pass an integer for reproducible sampling.
 
         Returns
         -------
@@ -599,13 +712,28 @@ class PriorSynthesiser:
 
         Raises
         ------
+        TypeError
+            If n_samples is not an integer.
         ValueError
-            If n_samples < 100.
+            If n_samples < 100 or random_state is not None or a non-negative integer.
         """
         if not isinstance(n_samples, int) or isinstance(n_samples, bool):
             raise TypeError("n_samples must be an integer.")
         if n_samples < 100:
             raise ValueError(f"n_samples must be at least 100, got {n_samples}")
+        if random_state is not None and (
+            not isinstance(random_state, int)
+            or isinstance(random_state, bool)
+            or random_state < 0
+        ):
+            raise ValueError(
+                f"random_state must be a non-negative integer or None, got {random_state!r}."
+            )
+        if random_state is None:
+            logger.warning(
+                "build_synthetic_prior() called with random_state=None; VineCopula "
+                "sampling will be non-deterministic across runs."
+            )
 
         return SyntheticData(
             distribution_estimator=VineCopula(random_state=random_state),
