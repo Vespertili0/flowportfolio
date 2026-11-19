@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import copy
 import logging
-from typing import Any, TypedDict
+from dataclasses import dataclass
+from typing import Any, Literal, TypedDict, overload
 
+import numpy as np
+import pandas as pd
 from skfolio import Population
 from skfolio.measures import RatioMeasure
 from skfolio.metrics import make_scorer
@@ -34,6 +37,209 @@ logger = logging.getLogger(__name__)
 class StrategyConfig(TypedDict):
     estimator: BaseEstimator
     grid: dict
+
+
+@dataclass(frozen=True)
+class ExperimentResult:
+    """Immutable container pairing an OOS Population with live terminal weights.
+
+    Unlike dynamic attributes attached onto ``skfolio`` ``Population`` or
+    ``__slots__``-based ``MultiPeriodPortfolio`` instances, this explicit
+    result object preserves live terminal weights across downstream slicing,
+    filtering, or ``Population(list(pop))`` reconstruction.
+    """
+
+    population: Population
+    live_weights: dict[str, dict[str, float]]
+
+
+class _GapAwareWalkForward(WalkForward):
+    """WalkForward splitter that never spans purged discontinuities in CPCV folds.
+
+    When an outer ``CombinatorialPurgedCV`` training slice omits purged/test
+    blocks from ``reference_index``, this splitter partitions the slice into
+    maximal contiguous runs (adjacent positions in ``reference_index``) and
+    yields walk-forward ``(train, test)`` pairs strictly inside each contiguous
+    segment.
+    """
+
+    def __init__(
+        self,
+        train_size: int = 252,
+        test_size: int = 63,
+        *,
+        purged_size: int = 0,
+        reference_index: pd.Index | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(
+            train_size=train_size,
+            test_size=test_size,
+            purged_size=purged_size,
+            **kwargs,
+        )
+        self.reference_index = reference_index
+
+    def _contiguous_segments(self, X: Any) -> list[np.ndarray] | None:
+        if self.reference_index is None or not hasattr(X, "index"):
+            return None
+        orig_pos = self.reference_index.get_indexer(X.index)
+        if len(orig_pos) == 0 or bool(np.any(orig_pos < 0)):
+            return None
+        break_pts = np.where(np.diff(orig_pos) != 1)[0] + 1
+        if len(break_pts) == 0:
+            return None
+        return [
+            seg for seg in np.split(np.arange(len(orig_pos)), break_pts) if len(seg) > 0
+        ]
+
+    @staticmethod
+    def _yield_segment_splits(
+        seg: np.ndarray, train_size: int, test_size: int, purged_size: int
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
+        splits: list[tuple[np.ndarray, np.ndarray]] = []
+        n = len(seg)
+        offset = 0
+        while offset + train_size + purged_size + test_size <= n:
+            tr = seg[offset : offset + train_size]
+            te_start = offset + train_size + purged_size
+            te = seg[te_start : te_start + test_size]
+            splits.append((tr, te))
+            offset += test_size
+        return splits
+
+    def split(self, X: Any, y: Any = None, groups: Any = None):
+        segments = self._contiguous_segments(X)
+        if segments is None:
+            yield from super().split(X, y=y, groups=groups)
+            return
+
+        purge = max(0, int(self.purged_size))
+        tr_sz = int(self.train_size)
+        te_sz = int(self.test_size)
+
+        collected: list[tuple[np.ndarray, np.ndarray]] = []
+        for seg in segments:
+            collected.extend(self._yield_segment_splits(seg, tr_sz, te_sz, purge))
+
+        if not collected:
+            # Segments are shorter than requested train+test; adapt within each
+            # contiguous segment while strictly respecting segment boundaries.
+            for seg in segments:
+                n = len(seg)
+                if n < 2:
+                    continue
+                seg_purge = purge if n - purge >= 2 else 0
+                avail = n - seg_purge
+                seg_te = max(1, int(avail * 0.2))
+                seg_tr = max(1, min(int(avail * 0.6), avail - seg_te))
+                collected.extend(
+                    self._yield_segment_splits(seg, seg_tr, seg_te, seg_purge)
+                )
+
+        if not collected:
+            raise ValueError(
+                "No contiguous segment inside the CombinatorialPurgedCV training "
+                "fold has at least 2 observations to form an inner walk-forward split."
+            )
+
+        yield from collected
+
+    def get_n_splits(self, X: Any = None, y: Any = None, groups: Any = None) -> int:
+        if X is not None and self._contiguous_segments(X) is not None:
+            return sum(1 for _ in self.split(X, y=y, groups=groups))
+        return super().get_n_splits(X=X, y=y, groups=groups)
+
+
+def _has_transaction_costs(opt: Any) -> bool:
+    """Return True if ``opt`` configures any strictly positive transaction cost."""
+    tc = getattr(opt, "transaction_costs", None)
+    if tc is None:
+        return False
+    if isinstance(tc, (int, float)) and not isinstance(tc, bool):
+        return float(tc) > 0.0
+    if isinstance(tc, dict):
+        return any(float(v) > 0.0 for v in tc.values())
+    try:
+        return bool(np.any(np.asarray(tc, dtype=float) > 0.0))
+    except (TypeError, ValueError):
+        return False
+
+
+def _has_rebalancing_friction(opt: Any) -> bool:
+    """Return True if ``opt`` or any fallback has max_turnover or transaction_costs."""
+    current = opt
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if getattr(current, "max_turnover", None) is not None:
+            return True
+        if _has_transaction_costs(current):
+            return True
+        current = getattr(current, "fallback", None)
+    return False
+
+
+def _collect_chain_neutral_params(
+    opt: Any, prefix: str, params: dict[str, Any]
+) -> None:
+    """Populate Fold-0 neutral entry params across an optimizer and its fallback chain."""
+    current = opt
+    cur_prefix = prefix
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if getattr(current, "max_turnover", None) is not None:
+            params[f"{cur_prefix}max_turnover"] = None
+        if _has_transaction_costs(current):
+            params[f"{cur_prefix}transaction_costs"] = 0.0
+        current = getattr(current, "fallback", None)
+        cur_prefix = f"{cur_prefix}fallback__"
+
+
+def _build_entry_rebalancing_params(
+    est: Any, *, prefix: str = "estimator__"
+) -> dict[str, Any] | None:
+    """Build ``skfolio`` ``entry_rebalancing_params`` neutralizing Fold-0 entry friction."""
+    params: dict[str, Any] = {}
+    if hasattr(est, "steps") and est.steps:
+        for step_name, step in est.steps:
+            _collect_chain_neutral_params(step, f"{prefix}{step_name}__", params)
+    else:
+        _collect_chain_neutral_params(est, prefix, params)
+    return params or None
+
+
+def _extract_weights_dict(
+    model: Any, fallback_columns: pd.Index
+) -> dict[str, float] | None:
+    """Extract a ``{ticker: float}`` mapping from a fitted estimator's ``weights_``."""
+    weights = getattr(model, "weights_", None)
+    if weights is None:
+        return None
+    feature_names = getattr(model, "feature_names_in_", fallback_columns)
+    cols = feature_names if len(feature_names) == len(weights) else fallback_columns
+    return {str(col): float(w) for col, w in zip(cols, weights)}
+
+
+def _extract_terminal_oos_weights(portfolio: Any) -> dict[str, float] | None:
+    """Extract the terminal OOS weights_dict from a Portfolio, MultiPeriodPortfolio, or Population."""
+    ports_list = (
+        list(portfolio)
+        if type(portfolio).__name__ == "Population" or isinstance(portfolio, list)
+        else [portfolio]
+    )
+    if not ports_list:
+        return None
+    last_p = ports_list[-1]
+    raw = (
+        getattr(last_p.portfolios[-1], "weights_dict", None)
+        if hasattr(last_p, "portfolios") and last_p.portfolios
+        else getattr(last_p, "weights_dict", None)
+    )
+    if isinstance(raw, dict):
+        return {str(k): float(v) for k, v in raw.items()}
+    return None
 
 
 class PortfolioExperimentEngine:
@@ -69,11 +275,17 @@ class PortfolioExperimentEngine:
         self._n_jobs = n_jobs
         self._strategies: dict[str, StrategyConfig] = {}
         self._latest_weights: dict[str, dict[str, float]] = {}
+        self._last_result: ExperimentResult | None = None
 
     @property
     def latest_weights(self) -> dict[str, dict[str, float]]:
         """Live target weights fitted on the trailing window up to the final observation."""
         return {k: dict(v) for k, v in self._latest_weights.items()}
+
+    @property
+    def last_result(self) -> ExperimentResult | None:
+        """Immutable :class:`ExperimentResult` from the most recent evaluation run."""
+        return self._last_result
 
     def add_strategy(
         self,
@@ -217,12 +429,34 @@ class PortfolioExperimentEngine:
             return min(train_size, n_samples)
         return n_samples
 
+    @overload
     def run_robustness_test(
         self,
         cv_type: str = "walk_forward",
         inner_cv_kwargs: dict | None = None,
-        **cv_kwargs,
-    ) -> Population:
+        *,
+        return_result: Literal[False] = False,
+        **cv_kwargs: Any,
+    ) -> Population: ...
+
+    @overload
+    def run_robustness_test(
+        self,
+        cv_type: str = "walk_forward",
+        inner_cv_kwargs: dict | None = None,
+        *,
+        return_result: Literal[True],
+        **cv_kwargs: Any,
+    ) -> ExperimentResult: ...
+
+    def run_robustness_test(
+        self,
+        cv_type: str = "walk_forward",
+        inner_cv_kwargs: dict | None = None,
+        *,
+        return_result: bool = False,
+        **cv_kwargs: Any,
+    ) -> Population | ExperimentResult:
         """Execute the full benchmarking pipeline for all registered strategies.
 
         Performs a two-step process for each strategy:
@@ -239,16 +473,20 @@ class PortfolioExperimentEngine:
             Explicit constructor arguments for the inner CV splitter used in
             hyperparameter search. If None, derived dynamically from the outer
             training parameters.
+        return_result : bool, default False
+            If ``True``, return an immutable :class:`ExperimentResult` containing
+            both the OOS ``Population`` and ``live_weights``. If ``False``,
+            return ``Population`` directly (while also recording the result on
+            :attr:`last_result`).
         **cv_kwargs
             Additional keyword arguments forwarded to the underlying
             cross-validator constructor (e.g., ``train_size``, ``test_size``).
 
         Returns
         -------
-        Population
-            A combined population containing the out-of-sample portfolio
-            trajectories for all strategies. Each portfolio is tagged with
-            its generating strategy name.
+        Population or ExperimentResult
+            The combined out-of-sample portfolio population (or immutable
+            :class:`ExperimentResult` when ``return_result=True``).
 
         Raises
         ------
@@ -257,6 +495,7 @@ class PortfolioExperimentEngine:
             ``universe.returns`` is unavailable.
         """
         self._latest_weights = {}
+        self._last_result = None
 
         # 1. Resolve CV protocols
         resolved_outer_kwargs = dict(cv_kwargs)
@@ -291,7 +530,14 @@ class PortfolioExperimentEngine:
                 )
                 resolved_explicit_inner.setdefault("train_size", inner_train)
                 resolved_explicit_inner.setdefault("test_size", inner_test)
-            inner_cv = self._resolve_cv_splitter(inner_type, **resolved_explicit_inner)
+            if cv_type == "combinatorial" and inner_type == "walk_forward":
+                inner_cv: Any = _GapAwareWalkForward(
+                    reference_index=returns.index, **resolved_explicit_inner
+                )
+            else:
+                inner_cv = self._resolve_cv_splitter(
+                    inner_type, **resolved_explicit_inner
+                )
         else:
             if cv_type == "walk_forward":
                 resolved_inner_kwargs = dict(cv_kwargs)
@@ -316,9 +562,16 @@ class PortfolioExperimentEngine:
                     inner_train, inner_test = self._derive_inner_walk_forward_sizes(
                         outer_train, 0
                     )
-                inner_cv = self._resolve_cv_splitter(
-                    "walk_forward", train_size=inner_train, test_size=inner_test
-                )
+                if cv_type == "combinatorial":
+                    inner_cv = _GapAwareWalkForward(
+                        train_size=inner_train,
+                        test_size=inner_test,
+                        reference_index=returns.index,
+                    )
+                else:
+                    inner_cv = self._resolve_cv_splitter(
+                        "walk_forward", train_size=inner_train, test_size=inner_test
+                    )
 
         if not self._strategies:
             raise RuntimeError("No strategies registered. Call add_strategy() first.")
@@ -336,13 +589,24 @@ class PortfolioExperimentEngine:
             user_previous_weights = copy.deepcopy(
                 getattr(target_opt, "previous_weights", None)
             )
-            # Prevent present-day physical weights from contaminating historical fold 0
-            # while keeping turnover constraints active across sequential walk-forward folds.
-            if (
-                getattr(target_opt, "max_turnover", None) is not None
-                and getattr(target_opt, "previous_weights", None) is not None
-            ):
-                set_previous_weights_chain(est_clone, equal_weights)
+            has_friction = _has_rebalancing_friction(target_opt)
+
+            # Prevent present-day physical weights from contaminating historical
+            # Fold 0 under BOTH max_turnover and transaction_costs.
+            entry_params: dict[str, Any] | None = None
+            if has_friction or user_previous_weights is not None:
+                if cv_type == "walk_forward":
+                    set_previous_weights_chain(est_clone, None)
+                    entry_params = _build_entry_rebalancing_params(
+                        est_clone, prefix="estimator__"
+                    )
+                else:
+                    baseline_pw = (
+                        equal_weights
+                        if getattr(target_opt, "max_turnover", None) is not None
+                        else None
+                    )
+                    set_previous_weights_chain(est_clone, baseline_pw)
 
             if (
                 cv_type in ("combinatorial", "randomised")
@@ -367,62 +631,36 @@ class PortfolioExperimentEngine:
             )
 
             # b. Out-of-sample journey simulation
+            cv_predict_kwargs: dict[str, Any] = {
+                "cv": outer_cv,
+                "n_jobs": self._n_jobs,
+                "portfolio_params": {"tag": name},
+            }
+            if entry_params is not None:
+                cv_predict_kwargs["entry_rebalancing_params"] = entry_params
+
             portfolio = cross_val_predict(
                 search,
                 returns,
-                cv=outer_cv,
-                n_jobs=self._n_jobs,
-                portfolio_params={"tag": name},
+                **cv_predict_kwargs,
             )
 
             # c. Live terminal refit on trailing outer_train observations
             try:
-                live_search = search
+                live_search = clone(search)
                 live_window = returns.iloc[-min(outer_train, len(returns)) :]
-                # Anchor live refit turnover to user's physical weights if present, else final OOS weights
-                last_oos_weights = None
-                ports_list = (
-                    list(portfolio)
-                    if type(portfolio).__name__ == "Population"
-                    or isinstance(portfolio, list)
-                    else [portfolio]
-                )
-                if ports_list:
-                    last_p = ports_list[-1]
-                    if hasattr(last_p, "portfolios") and last_p.portfolios:
-                        last_oos_weights = getattr(
-                            last_p.portfolios[-1], "weights_dict", None
-                        )
-                    else:
-                        last_oos_weights = getattr(last_p, "weights_dict", None)
+                last_oos_weights = _extract_terminal_oos_weights(portfolio)
 
-                if getattr(target_opt, "max_turnover", None) is not None:
+                if has_friction:
                     if user_previous_weights is not None:
                         set_previous_weights_chain(live_search, user_previous_weights)
                     elif last_oos_weights:
                         set_previous_weights_chain(live_search, last_oos_weights)
 
                 live_search.fit(live_window)
-                if getattr(live_search, "weights_", None) is not None:
-                    feature_names = getattr(
-                        live_search, "feature_names_in_", live_window.columns
-                    )
-                    if len(feature_names) == len(live_search.weights_):
-                        live_w = {
-                            str(col): float(w)
-                            for col, w in zip(feature_names, live_search.weights_)
-                        }
-                    else:
-                        live_w = {
-                            str(col): float(w)
-                            for col, w in zip(live_window.columns, live_search.weights_)
-                        }
+                live_w = _extract_weights_dict(live_search, live_window.columns)
+                if live_w is not None:
                     self._latest_weights[name] = live_w
-                    for p_obj in ports_list:
-                        try:
-                            p_obj.latest_weights_dict = dict(live_w)
-                        except AttributeError:
-                            pass
             except Exception:
                 logger.warning(
                     "Live terminal refit failed for strategy '%s'", name, exc_info=True
@@ -433,12 +671,20 @@ class PortfolioExperimentEngine:
             else:
                 collected.append(portfolio)
 
+        return self._finalize_run(collected, return_result=return_result)
+
+    def _finalize_run(
+        self, collected: list[Any], *, return_result: bool
+    ) -> Population | ExperimentResult:
+        """Assemble Population, record immutable ExperimentResult, and return requested view."""
         pop = Population(collected)
         try:
             pop.latest_weights_by_tag = self.latest_weights
         except AttributeError:
             pass
-        return pop
+        result = ExperimentResult(population=pop, live_weights=self.latest_weights)
+        self._last_result = result
+        return result if return_result else pop
 
     @staticmethod
     def _validate_online_estimator(name: str, est: BaseEstimator) -> None:
@@ -470,17 +716,41 @@ class PortfolioExperimentEngine:
                     f"{sub_attr} '{type(sub_est).__name__}', which does not implement partial_fit()."
                 )
 
+    @overload
     def run_online_evaluation(
         self,
         cv_type: str = "walk_forward",
         burn_in_size: int | None = None,
-        **cv_kwargs,
-    ) -> Population:
+        *,
+        return_result: Literal[False] = False,
+        **cv_kwargs: Any,
+    ) -> Population: ...
+
+    @overload
+    def run_online_evaluation(
+        self,
+        cv_type: str = "walk_forward",
+        burn_in_size: int | None = None,
+        *,
+        return_result: Literal[True],
+        **cv_kwargs: Any,
+    ) -> ExperimentResult: ...
+
+    def run_online_evaluation(
+        self,
+        cv_type: str = "walk_forward",
+        burn_in_size: int | None = None,
+        *,
+        return_result: bool = False,
+        **cv_kwargs: Any,
+    ) -> Population | ExperimentResult:
         """Run online (streaming) evaluation of all registered strategies.
 
         Mirrors run_robustness_test() but fits hyperparameter search on a
         dedicated historical burn-in period prior to executing online prediction,
-        preventing look-ahead bias.
+        preventing look-ahead bias. Live terminal weights are obtained by
+        continuing streaming ``partial_fit`` across the post-burn-in observations
+        rather than truncating history via batch ``fit()``.
 
         Parameters
         ----------
@@ -491,14 +761,18 @@ class PortfolioExperimentEngine:
             Number of initial observations allocated for hyperparameter tuning.
             If None, defaults to the train_size or warmup_size specified in
             cv_kwargs, or 252.
+        return_result : bool, default False
+            If ``True``, return an immutable :class:`ExperimentResult` pairing
+            the OOS ``Population`` with ``live_weights``.
         **cv_kwargs
             Additional keyword arguments forwarded to online hyperparameter
             search or online prediction parameters.
 
         Returns
         -------
-        skfolio.Population
-            A Population object containing one MultiPeriodPortfolio per
+        skfolio.Population or ExperimentResult
+            A Population object (or :class:`ExperimentResult` when
+            ``return_result=True``) containing one MultiPeriodPortfolio per
             registered strategy, each tagged with the strategy name.
 
         Raises
@@ -515,6 +789,7 @@ class PortfolioExperimentEngine:
             If no strategies have been registered via add_strategy().
         """
         self._latest_weights = {}
+        self._last_result = None
 
         if not self._strategies:
             raise RuntimeError("No strategies registered. Call add_strategy() first.")
@@ -545,6 +820,7 @@ class PortfolioExperimentEngine:
             )
 
         burn_in_returns = returns.iloc[:burn_in_size]
+        post_burn_in_returns = returns.iloc[burn_in_size:]
 
         purged = int(cv_kwargs.get("purged_size", 0))
         if (
@@ -608,12 +884,17 @@ class PortfolioExperimentEngine:
             user_previous_weights = copy.deepcopy(
                 getattr(est, "previous_weights", None)
             )
+            has_friction = _has_rebalancing_friction(est)
+            entry_params: dict[str, Any] | None = None
 
-            if (
-                getattr(est, "max_turnover", None) is not None
-                and getattr(est, "previous_weights", None) is not None
-            ):
-                set_previous_weights_chain(est, equal_weights)
+            if has_friction or user_previous_weights is not None:
+                baseline_pw = (
+                    equal_weights
+                    if getattr(est, "max_turnover", None) is not None
+                    else None
+                )
+                set_previous_weights_chain(est, baseline_pw)
+                entry_params = _build_entry_rebalancing_params(est, prefix="")
 
             search = OnlineGridSearch(
                 estimator=est,
@@ -624,6 +905,7 @@ class PortfolioExperimentEngine:
                 purged_size=purged,
                 refit=True,
                 n_jobs=1,
+                entry_rebalancing_params=entry_params,
                 **search_extra_kwargs,
             )
             search.fit(burn_in_returns)
@@ -634,70 +916,39 @@ class PortfolioExperimentEngine:
                 returns,
                 warmup_size=burn_in_size,
                 portfolio_params={"tag": name},
+                entry_rebalancing_params=entry_params,
                 **predict_kwargs,
             )
 
-            ports_list = (
-                list(portfolio)
-                if type(portfolio).__name__ == "Population"
-                or isinstance(portfolio, list)
-                else [portfolio]
-            )
-            term_w = None
-            if ports_list:
-                last_p = ports_list[-1]
-                term_w = (
-                    getattr(last_p.portfolios[-1], "weights_dict", None)
-                    if hasattr(last_p, "portfolios") and last_p.portfolios
-                    else getattr(last_p, "weights_dict", None)
-                )
+            term_w = _extract_terminal_oos_weights(portfolio)
 
-            if not hasattr(best_model, "_mock_name"):
-                try:
-                    live_model = clone(best_model)
-                    if (
-                        user_previous_weights is not None
-                        and getattr(live_model, "max_turnover", None) is not None
-                    ):
+            try:
+                live_model = copy.deepcopy(best_model)
+                if has_friction:
+                    if user_previous_weights is not None:
                         set_previous_weights_chain(live_model, user_previous_weights)
-
-                    trailing_window = returns.iloc[-min(burn_in_size, len(returns)) :]
-                    if hasattr(live_model, "fit"):
-                        live_model.fit(trailing_window)
-                        if getattr(live_model, "weights_", None) is not None:
-                            feat_names = getattr(
-                                live_model, "feature_names_in_", trailing_window.columns
-                            )
-                            self._latest_weights[name] = {
-                                str(col): float(w)
-                                for col, w in zip(feat_names, live_model.weights_)
-                            }
-                        elif term_w is not None:
-                            self._latest_weights[name] = {
-                                str(k): float(v) for k, v in term_w.items()
-                            }
                     elif term_w is not None:
-                        self._latest_weights[name] = {
-                            str(k): float(v) for k, v in term_w.items()
-                        }
-                except Exception:  # noqa: BLE001
-                    if term_w is not None:
-                        self._latest_weights[name] = {
-                            str(k): float(v) for k, v in term_w.items()
-                        }
-            elif term_w is not None:
-                self._latest_weights[name] = {
-                    str(k): float(v) for k, v in term_w.items()
-                }
+                        set_previous_weights_chain(live_model, term_w)
+
+                if len(post_burn_in_returns) > 0:
+                    live_model.partial_fit(post_burn_in_returns)
+                live_w = _extract_weights_dict(live_model, returns.columns)
+                if live_w is not None:
+                    self._latest_weights[name] = live_w
+                elif term_w is not None:
+                    self._latest_weights[name] = dict(term_w)
+            except Exception:
+                logger.warning(
+                    "Streaming live partial_fit failed for strategy '%s'",
+                    name,
+                    exc_info=True,
+                )
+                if term_w is not None:
+                    self._latest_weights[name] = dict(term_w)
 
             if type(portfolio).__name__ == "Population" or isinstance(portfolio, list):
                 collected.extend(portfolio)
             else:
                 collected.append(portfolio)
 
-        pop = Population(collected)
-        try:
-            pop.latest_weights_by_tag = self.latest_weights
-        except AttributeError:
-            pass
-        return pop
+        return self._finalize_run(collected, return_result=return_result)
