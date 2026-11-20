@@ -101,8 +101,8 @@ def _validate_weekday_exchange_calendar(
         )
 
 
-def _infer_periods_per_year(index: pd.Index) -> int:
-    """Infer annualisation frequency for weekday exchange calendars (252, 52, 12, 4, 1)."""
+def _validate_daily_exchange_frequency(index: pd.Index) -> int:
+    """Enforce daily weekday exchange cadence (252 trading days per year)."""
     if not isinstance(index, pd.DatetimeIndex) or len(index) < 2:
         return 252
 
@@ -111,17 +111,12 @@ def _infer_periods_per_year(index: pd.Index) -> int:
         return 252
 
     median_days = float(deltas.median())
-    if median_days <= 3.5:
+    if 0.9 <= median_days <= 3.5:
         return 252
-    if 5.0 <= median_days <= 9.0:
-        return 52
-    if 25.0 <= median_days <= 35.0:
-        return 12
-    if 80.0 <= median_days <= 100.0:
-        return 4
-    if 350.0 <= median_days <= 380.0:
-        return 1
-    return 252
+    raise ValueError(
+        f"Unsupported non-daily return cadence (median step {median_days:.2f} days). "
+        "flowportfolio only supports daily weekday exchange data (252 trading days per year)."
+    )
 
 
 class DataFetchError(Exception):
@@ -168,7 +163,7 @@ class Universe:
         are not ``dict`` instances with the correct value types.
     ValueError
         If ``tickers`` is empty, contains non-string elements, or if any
-        ticker is missing from ``metadata`` or ``fees``.
+        ticker is missing from or extra to ``metadata`` or ``fees``.
     """
 
     def __init__(
@@ -204,15 +199,26 @@ class Universe:
             validate_fee(v)
 
         # --- coverage checks ---
-        missing_metadata = set(tickers) - set(metadata.keys())
+        ticker_set = set(tickers)
+        missing_metadata = ticker_set - set(metadata.keys())
         if missing_metadata:
             raise ValueError(
                 f"Missing metadata entries for tickers: {missing_metadata}"
             )
+        extra_metadata = set(metadata.keys()) - ticker_set
+        if extra_metadata:
+            raise ValueError(
+                f"Unknown extra metadata entries not in tickers: {sorted(extra_metadata)}"
+            )
 
-        missing_fees = set(tickers) - set(fees.keys())
+        missing_fees = ticker_set - set(fees.keys())
         if missing_fees:
             raise ValueError(f"Missing fees entries for tickers: {missing_fees}")
+        extra_fees = set(fees.keys()) - ticker_set
+        if extra_fees:
+            raise ValueError(
+                f"Unknown extra fees entries not in tickers: {sorted(extra_fees)}"
+            )
 
         self._tickers: list[str] = list(tickers)
         self._metadata: dict[str, str] = dict(metadata)
@@ -226,7 +232,7 @@ class Universe:
         # Last genuine (un-forward-filled) price date per ticker, recorded by
         # fetch_data() and consumed by anchor_history().
         self._raw_last_valid: dict[str, pd.Timestamp | None] = {}
-        # Exchange return frequency (observations per calendar year); updated on fetch_data().
+        # Exchange return frequency (observations per calendar year; fixed daily 252).
         self._periods_per_year: int = 252
 
     # ------------------------------------------------------------------
@@ -318,11 +324,10 @@ class Universe:
         """Download adjusted close prices and compute simple returns.
 
         Fetches adjusted close prices from the provided data provider for all
-        tickers in the universe, validates weekday exchange calendar hygiene,
-        computes simple returns using
-        :func:`skfolio.preprocessing.prices_to_returns`, and infers
-        :attr:`periods_per_year` from the price observation cadence. Both raw
-        prices and returns are stored internally.
+        tickers in the universe, validates daily weekday exchange calendar
+        hygiene (252 trading days per year), and computes simple returns using
+        :func:`skfolio.preprocessing.prices_to_returns`. Both raw prices and
+        returns are stored internally.
 
         Assets with shorter listing histories will have leading ``NaN``
         values in the returns DataFrame. Call :meth:`anchor_history`
@@ -447,7 +452,7 @@ class Universe:
                 "Calculated returns DataFrame is empty after preprocessing."
             )
 
-        inferred_ppy = _infer_periods_per_year(filled_prices.index)
+        inferred_ppy = _validate_daily_exchange_frequency(filled_prices.index)
 
         # Commit state atomically so a failed fetch_data() call never leaves
         # _raw_last_valid, _prices, _returns, and _periods_per_year out of sync.

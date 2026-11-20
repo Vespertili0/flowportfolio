@@ -404,48 +404,23 @@ def test_max_turnover_rejects_unknown_tickers_and_non_dict(
         builder.max_turnover(0.05, [("A", 0.5), ("B", 0.3), ("C", 0.2)])  # type: ignore[arg-type]
 
 
-class _FreqPriceProvider:
-    """Synthetic DataProvider producing weekday prices at a specified frequency."""
-
-    def __init__(self, freq: str, periods: int = 30) -> None:
-        self._freq = freq
-        self._periods = periods
-
-    def fetch(
-        self, tickers: list[str], start: str | None = None, end: str | None = None
-    ) -> pd.DataFrame:
-        idx = pd.date_range("2000-01-03", periods=self._periods, freq=self._freq)
-        data = {
-            ("Close", t): np.linspace(100.0, 120.0 + i, len(idx))
-            for i, t in enumerate(tickers)
-        }
-        return pd.DataFrame(data, index=idx)
-
-
-@pytest.mark.parametrize(
-    ("freq", "expected_ppy"),
-    [
-        ("B", 252),
-        ("W-FRI", 52),
-        ("BME", 12),
-        ("BQE", 4),
-        ("BYE", 1),
-    ],
-)
+@pytest.mark.parametrize("expected_ppy", [252, 52, 12, 4, 1])
 def test_build_scales_management_fees_by_live_periods_per_year(
-    freq: str, expected_ppy: int
+    expected_ppy: int,
 ) -> None:
-    """F-06: build() divides annual management fees by live universe.periods_per_year."""
+    """F-06: build() divides annual management fees by live UniverseProtocol.periods_per_year."""
     fees = {"A": 0.0052, "B": 0.0104, "C": 0.0}
-    u = Universe(
-        tickers=["A", "B", "C"],
-        metadata={"A": "core", "B": "core", "C": "satellite"},
-        fees=fees,
-    )
-    # Construct builder BEFORE fetch_data() to prove live resolution at build() time
-    builder = ConstraintBuilder(u)
-    u.fetch_data(data_provider=_FreqPriceProvider(freq=freq, periods=30))
-    assert u.periods_per_year == expected_ppy
+
+    class _ProtocolStub:
+        def __init__(self, ppy: int) -> None:
+            self.tickers = ["A", "B", "C"]
+            self.metadata = {"A": "core", "B": "core", "C": "satellite"}
+            self.fees = fees
+            self.periods_per_year = ppy
+
+    stub = _ProtocolStub(252)
+    builder = ConstraintBuilder(stub)  # type: ignore[arg-type]
+    stub.periods_per_year = expected_ppy
 
     spec = builder.build()
     assert spec.management_fees is not None
@@ -453,6 +428,30 @@ def test_build_scales_management_fees_by_live_periods_per_year(
         assert spec.management_fees[ticker] == pytest.approx(
             annual_fee / float(expected_ppy), rel=0, abs=1e-15
         )
+
+
+def test_ghost_group_in_protocol_metadata_rejected_and_excluded_from_spec() -> None:
+    """P1-3: Groups belonging only to non-universe metadata keys must be rejected and omitted from ConstraintSpec.groups."""
+
+    class _GhostMetadataStub:
+        def __init__(self) -> None:
+            self.tickers = ["A", "B", "C"]
+            self.metadata = {"A": "core", "B": "core", "C": "satellite", "Z": "ghost"}
+            self.fees = {"A": 0.001, "B": 0.001, "C": 0.001}
+            self.periods_per_year = 252
+
+    builder = ConstraintBuilder(_GhostMetadataStub())  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="Group 'ghost' not found"):
+        builder.min_group("ghost", 0.2)
+    with pytest.raises(ValueError, match="Group 'ghost' not found"):
+        builder.max_group("ghost", 0.5)
+    with pytest.raises(ValueError, match="Group 'ghost' not found"):
+        builder.max_combined_groups(["core", "ghost"], 0.8)
+
+    spec = builder.min_group("core", 0.3).build()
+    assert set(spec.groups.keys()) == {"A", "B", "C"}
+    assert "Z" not in spec.groups
 
 
 def test_build_management_fees_magicmock_periods_per_year_fallback() -> None:

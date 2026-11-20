@@ -14,26 +14,6 @@ from flowportfolio.core.universe import Universe
 from flowportfolio.delta import PortfolioDeltaEngine
 
 
-class _FreqPriceProvider:
-    """Synthetic DataProvider generating weekday prices at a specified frequency."""
-
-    def __init__(self, freq: str, periods: int = 40, seed: int = 7) -> None:
-        self._freq = freq
-        self._periods = periods
-        self._seed = seed
-
-    def fetch(
-        self, tickers: list[str], start: str | None = None, end: str | None = None
-    ) -> pd.DataFrame:
-        rng = np.random.default_rng(self._seed)
-        idx = pd.date_range("2015-01-02", periods=self._periods, freq=self._freq)
-        data = {}
-        for t in tickers:
-            rets = rng.normal(0.002, 0.02, len(idx))
-            data[("Close", t)] = 100.0 * np.cumprod(1.0 + rets)
-        return pd.DataFrame(data, index=idx)
-
-
 @pytest.fixture
 def stub_universe() -> Universe:
     """Real Universe with deterministic daily returns (zero mocks)."""
@@ -504,13 +484,25 @@ def test_calculate_rebalance_delta_rejects_disjoint_and_partial_indices() -> Non
 def test_calculate_rebalance_delta_scales_fees_and_annualization_by_periods_per_year(
     freq: str, expected_ppy: int
 ) -> None:
-    """F-01: Hold fees, annualization_factor, and compounded follow universe.periods_per_year & selected_port."""
+    """F-01: Hold fees, annualization_factor, and compounded follow UniverseProtocol.periods_per_year & selected_port."""
     fees = {"A": 0.024, "B": 0.012}
-    u = Universe(["A", "B"], {"A": "eq", "B": "eq"}, fees=fees)
-    u.fetch_data(data_provider=_FreqPriceProvider(freq=freq, periods=40))
-    assert u.periods_per_year == expected_ppy
+    dates = pd.date_range("2025-01-03", periods=40, freq=freq)
+    rng = np.random.default_rng(7)
+    rets = pd.DataFrame(
+        rng.normal(0.001, 0.01, size=(len(dates), 2)),
+        index=dates,
+        columns=["A", "B"],
+    )
 
-    rets = u.returns
+    class _FreqProtocolUniverse:
+        def __init__(self) -> None:
+            self.tickers = ["A", "B"]
+            self.metadata = {"A": "eq", "B": "eq"}
+            self.fees = fees
+            self.returns = rets
+            self.periods_per_year = expected_ppy
+
+    u = _FreqProtocolUniverse()
     oos_port = Portfolio(
         X=rets,
         weights=[0.8, 0.2],
@@ -521,7 +513,9 @@ def test_calculate_rebalance_delta_scales_fees_and_annualization_by_periods_per_
     pop = Population([oos_port])
 
     eng = PortfolioDeltaEngine(
-        u, current_weights={"A": 0.5, "B": 0.5}, target_weights={"A": 0.8, "B": 0.2}
+        u,  # type: ignore[arg-type]
+        current_weights={"A": 0.5, "B": 0.5},
+        target_weights={"A": 0.8, "B": 0.2},
     )
     res = eng.calculate_rebalance_delta(pop, strategy_tag="FreqStrat")
 

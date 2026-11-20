@@ -461,52 +461,126 @@ def test_universe_strips_all_nan_weekend_placeholder_rows() -> None:
 
 
 @pytest.mark.parametrize(
-    ("dates", "expected_ppy"),
+    "bad_dates",
     [
-        (pd.bdate_range("2026-01-05", periods=20), 252),
-        (pd.date_range("2026-01-09", periods=10, freq="W-FRI"), 52),
-        (pd.date_range("2025-01-31", periods=10, freq="BME"), 12),
-        (pd.date_range("2024-03-29", periods=8, freq="BQE"), 4),
-        (pd.date_range("2020-12-31", periods=5, freq="BYE"), 1),
-        # 2-bar monthly series yields 1 return row; inference must still detect monthly (12)
-        (pd.date_range("2025-01-31", periods=2, freq="BME"), 12),
+        pd.date_range("2026-01-09", periods=10, freq="W-FRI"),
+        pd.date_range("2026-01-09", periods=10, freq="2W-FRI"),
+        pd.date_range("2025-01-31", periods=10, freq="BME"),
+        pd.date_range("2024-03-29", periods=8, freq="BQE"),
+        pd.date_range("2020-12-31", periods=5, freq="BYE"),
+        pd.date_range("2025-01-31", periods=2, freq="BME"),
+        pd.date_range("2026-01-05 09:30", periods=12, freq="h"),
     ],
 )
-def test_universe_infers_exchange_periods_per_year(
-    dates: pd.DatetimeIndex, expected_ppy: int
-) -> None:
-    """Universe exposes periods_per_year matching standard ETF/equity exchange frequencies."""
+def test_universe_rejects_non_daily_frequencies(bad_dates: pd.DatetimeIndex) -> None:
+    """P2-2 & daily scope: Universe.fetch_data enforces daily weekday data (252) and rejects non-daily feeds."""
     prices = pd.DataFrame(
-        {"SPY": np.linspace(100.0, 120.0, len(dates))},
-        index=dates,
+        {"SPY": np.linspace(100.0, 120.0, len(bad_dates))},
+        index=bad_dates,
     )
     univ = Universe(["SPY"], {"SPY": "core"}, {"SPY": 0.0003})
-    assert univ.periods_per_year == 252  # Default before fetch_data()
+    assert univ.periods_per_year == 252
 
-    univ.fetch_data(data_provider=_InMemoryProvider(prices))
-    assert univ.periods_per_year == expected_ppy
+    with pytest.raises(ValueError, match="daily"):
+        univ.fetch_data(data_provider=_InMemoryProvider(prices))
 
 
-def test_universe_failed_refetch_preserves_periods_per_year() -> None:
-    """A failed fetch_data() call must preserve the previously inferred periods_per_year."""
+def test_universe_failed_refetch_preserves_state_atomically() -> None:
+    """A rejected non-daily or weekend re-fetch must leave prior daily returns and periods_per_year intact."""
+    daily_dates = pd.bdate_range("2026-01-05", periods=10)
+    daily_prices = pd.DataFrame(
+        {"SPY": np.linspace(100.0, 110.0, len(daily_dates))},
+        index=daily_dates,
+    )
+    univ = Universe(["SPY"], {"SPY": "core"}, {"SPY": 0.0003})
+    univ.fetch_data(data_provider=_InMemoryProvider(daily_prices))
+    original_returns = univ.returns.copy()
+    assert univ.periods_per_year == 252
+
+    # Rejected weekly re-fetch must leave prior state untouched
     weekly_dates = pd.date_range("2026-01-09", periods=10, freq="W-FRI")
     weekly_prices = pd.DataFrame(
         {"SPY": np.linspace(100.0, 110.0, len(weekly_dates))},
         index=weekly_dates,
     )
-    univ = Universe(["SPY"], {"SPY": "core"}, {"SPY": 0.0003})
-    univ.fetch_data(data_provider=_InMemoryProvider(weekly_prices))
-    assert univ.periods_per_year == 52
+    with pytest.raises(ValueError, match="daily"):
+        univ.fetch_data(data_provider=_InMemoryProvider(weekly_prices))
+    assert univ.periods_per_year == 252
+    pd.testing.assert_frame_equal(univ.returns, original_returns)
 
-    # Rejected weekend-active re-fetch must leave periods_per_year untouched
-    weekend_dates = pd.date_range("2026-01-05", periods=7, freq="D")
-    weekend_prices = pd.DataFrame(
-        {"SPY": np.linspace(100.0, 106.0, len(weekend_dates))},
-        index=weekend_dates,
+
+def test_universe_init_rejects_extra_metadata_and_fees_keys() -> None:
+    """P1-3: Unknown/extra keys in metadata or fees (ghost tickers/groups) must raise ValueError."""
+    with pytest.raises(ValueError, match="unknown|extra"):
+        Universe(
+            ["SPY", "IVV"],
+            {"SPY": "core", "IVV": "core", "Z": "ghost"},
+            {"SPY": 0.0004, "IVV": 0.0004},
+        )
+
+    with pytest.raises(ValueError, match="unknown|extra"):
+        Universe(
+            ["SPY", "IVV"],
+            {"SPY": "core", "IVV": "core"},
+            {"SPY": 0.0004, "IVV": 0.0004, "Z": 0.001},
+        )
+
+
+def test_yfinance_provider_retries_transient_empty_nan_and_network_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P2-6: YFinanceProvider retries transient empty/all-NaN/network errors and fails fast on programming errors."""
+    from flowportfolio.core.data import YFinanceProvider
+
+    dates = pd.bdate_range("2026-01-05", periods=5)
+    valid_df = pd.DataFrame({"Close": [100.0, 101.0, 102.0, 103.0, 104.0]}, index=dates)
+    all_nan_df = pd.DataFrame({"Close": [np.nan] * 5}, index=dates)
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(
+        "flowportfolio.core.data.time.sleep", lambda s: sleeps.append(s)
     )
-    with pytest.raises(ValueError, match="weekend|weekday exchange"):
-        univ.fetch_data(data_provider=_InMemoryProvider(weekend_prices))
-    assert univ.periods_per_year == 52
+
+    provider = YFinanceProvider()
+
+    # 1. Empty DataFrame on attempts 1-2, valid on attempt 3 -> succeeds
+    responses_empty = [pd.DataFrame(), pd.DataFrame(), valid_df]
+    with patch("yfinance.download", side_effect=responses_empty) as mock_dl:
+        out = provider.fetch(["SPY"])
+        assert len(out) == 5
+        assert mock_dl.call_count == 3
+
+    # 2. All-NaN DataFrame on attempt 1, valid on attempt 2 -> succeeds
+    responses_nan = [all_nan_df, valid_df]
+    with patch("yfinance.download", side_effect=responses_nan) as mock_dl:
+        out = provider.fetch(["SPY"])
+        assert len(out) == 5
+        assert mock_dl.call_count == 2
+
+    # 3. ConnectionError on attempt 1, valid on attempt 2 -> succeeds
+    responses_net = [ConnectionError("transient"), valid_df]
+    with patch("yfinance.download", side_effect=responses_net) as mock_dl:
+        out = provider.fetch(["SPY"])
+        assert len(out) == 5
+        assert mock_dl.call_count == 2
+
+    # 4. Persistent empty DataFrame -> retries 3 times then raises ValueError
+    with (
+        patch("yfinance.download", return_value=pd.DataFrame()) as mock_dl,
+        pytest.raises(ValueError, match="empty DataFrame"),
+    ):
+        provider.fetch(["SPY"])
+    assert mock_dl.call_count == 3
+
+    # 5. Deterministic programming error (TypeError) -> fails fast without retry or sleep
+    sleeps.clear()
+    with (
+        patch("yfinance.download", side_effect=TypeError("bad arg")) as mock_dl,
+        pytest.raises(TypeError, match="bad arg"),
+    ):
+        provider.fetch(["SPY"])
+    assert mock_dl.call_count == 1
+    assert sleeps == []
 
 
 # ---------------------------------------------------------------------------

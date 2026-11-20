@@ -150,7 +150,11 @@ class ConstraintBuilder:
             raise TypeError("universe.tickers must be a list.")
         self._holding_period: float = _validate_holding_period(holding_period)
         self._universe = universe
-        self._valid_groups: set[str] = set(universe.metadata.values())
+        self._valid_groups: set[str] = {
+            str(universe.metadata[t])
+            for t in universe.tickers
+            if t in universe.metadata
+        }
         self._constraints: list[str] = []
         self._max_turnover: float | None = None
         self._previous_weights: dict[str, float] | None = None
@@ -433,11 +437,6 @@ class ConstraintBuilder:
                 groups[ticker] = [val] if isinstance(val, str) else list(val)
             else:
                 groups[ticker] = []
-
-        # Include any remaining metadata tickers
-        for ticker, val in raw_metadata.items():
-            if ticker not in groups:
-                groups[ticker] = [val] if isinstance(val, str) else list(val)
 
         management_fees: dict[str, float] | None = None
         fees = getattr(self._universe, "fees", None)
