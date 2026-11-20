@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import math
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import numpy as np
@@ -63,6 +63,120 @@ def _align_returns_strict(
             "Portfolio returns index is not aligned with universe.returns index."
         )
     return universe_returns.loc[port_index]
+
+
+def _sub_portfolios(port_obj: Any) -> list[Any]:
+    """Return constituent single-period folds for a MultiPeriodPortfolio, else ``[port_obj]``."""
+    children = getattr(port_obj, "portfolios", None)
+    if isinstance(children, list) and len(children) > 0:
+        return list(children)
+    return [port_obj]
+
+
+def _has_positive_numeric_attr(obj: Any, attr: str) -> bool:
+    """Return True if ``getattr(obj, attr)`` contains any strictly positive numeric value."""
+    val = getattr(obj, attr, None)
+    if val is None or isinstance(val, bool):
+        return False
+    if isinstance(val, (int, float, np.number)):
+        f = float(val)
+        return math.isfinite(f) and abs(f) > 0.0
+    if isinstance(val, dict):
+        return any(
+            isinstance(v, (int, float, np.number))
+            and not isinstance(v, bool)
+            and math.isfinite(float(v))
+            and abs(float(v)) > 0.0
+            for v in val.values()
+        )
+    try:
+        arr = np.asarray(val, dtype=float)
+        return bool(np.any(np.isfinite(arr) & (np.abs(arr) > 0.0)))
+    except (TypeError, ValueError):
+        return False
+
+
+def _sub_portfolio_has_fees(sub: Any) -> bool:
+    """Return True if a single-period portfolio already deducts management fees."""
+    return _has_positive_numeric_attr(sub, "total_fee") or _has_positive_numeric_attr(
+        sub, "management_fees"
+    )
+
+
+def _portfolio_has_embedded_costs(port_obj: Any) -> bool:
+    """Return True if an OOS portfolio already carries embedded transaction costs."""
+    return any(
+        _has_positive_numeric_attr(sub, "total_cost")
+        or _has_positive_numeric_attr(sub, "transaction_costs")
+        for sub in _sub_portfolios(port_obj)
+    )
+
+
+def _extract_portfolio_weights_dict(
+    sub: Any, fallback_columns: Sequence[str]
+) -> dict[str, float] | None:
+    """Extract a ``{ticker: weight}`` mapping from a single-period portfolio."""
+    raw = getattr(sub, "weights_dict", None)
+    if isinstance(raw, dict) and len(raw) > 0:
+        return {str(k): float(v) for k, v in raw.items()}
+
+    weights = getattr(sub, "weights", None)
+    if weights is None:
+        return None
+    w_arr = np.asarray(weights, dtype=float)
+    if w_arr.ndim != 1 or len(w_arr) == 0:
+        return None
+    assets = getattr(sub, "assets", None)
+    if assets is None or len(assets) != len(w_arr):
+        assets = getattr(sub, "assets_names", None)
+    if assets is None or len(assets) != len(w_arr):
+        assets = fallback_columns if len(fallback_columns) == len(w_arr) else None
+    if assets is None:
+        return None
+    return {str(a): float(w) for a, w in zip(assets, w_arr, strict=True)}
+
+
+def _extract_entry_weights(
+    port_obj: Any, fallback_columns: Sequence[str]
+) -> dict[str, float] | None:
+    """Extract Fold-0 initial weights for an OOS portfolio path."""
+    subs = _sub_portfolios(port_obj)
+    if not subs:
+        return None
+    return _extract_portfolio_weights_dict(subs[0], fallback_columns)
+
+
+def _compute_transition_drag_for_weights(
+    current_weights: dict[str, float],
+    target_weights: dict[str, float],
+    *,
+    tickers: Sequence[str],
+    brokerage_bps: float,
+    slippage_bps: float,
+    portfolio_value: float | None,
+    brokerage_flat: float,
+    min_trade_weight: float,
+) -> float:
+    """Compute one-off portfolio transition drag for ``current_weights -> target_weights``."""
+    total_bps_rate = (float(brokerage_bps) + float(slippage_bps)) / 10_000.0
+    total_drag = 0.0
+    for ticker in tickers:
+        gross_traded = abs(
+            float(target_weights.get(ticker, 0.0))
+            - float(current_weights.get(ticker, 0.0))
+        )
+        var_cost = gross_traded * total_bps_rate
+        flat_cost = (
+            float(brokerage_flat) / float(portfolio_value)
+            if (
+                float(brokerage_flat) > 0.0
+                and portfolio_value is not None
+                and gross_traded > float(min_trade_weight)
+            )
+            else 0.0
+        )
+        total_drag += var_cost + flat_cost
+    return total_drag
 
 
 def _extract_portfolio_eval_settings(
@@ -121,23 +235,95 @@ def _extract_portfolio_metrics(port_obj: Any) -> dict[str, float]:
         }
 
 
+def _build_net_oos_returns(
+    port_obj: Any,
+    *,
+    annual_fees: dict[str, float],
+    ann_factor: float,
+    fallback_columns: Sequence[str],
+) -> tuple[np.ndarray, bool]:
+    """Return OOS returns with symmetric period-scaled fees deducted from fee-free folds."""
+    has_universe_fees = any(float(v) > 0.0 for v in annual_fees.values())
+    subs = _sub_portfolios(port_obj)
+    applied_fees = False
+    slices: list[np.ndarray] = []
+
+    for sub in subs:
+        sub_rets = np.asarray(sub.returns, dtype=float).copy()
+        if has_universe_fees and not _sub_portfolio_has_fees(sub):
+            sub_weights = _extract_portfolio_weights_dict(sub, fallback_columns)
+            if sub_weights:
+                fee_drag = sum(
+                    abs(w) * float(annual_fees.get(asset, 0.0)) / float(ann_factor)
+                    for asset, w in sub_weights.items()
+                )
+                if fee_drag > 0.0:
+                    sub_rets -= fee_drag
+                    applied_fees = True
+        slices.append(sub_rets)
+
+    net_returns = (
+        np.concatenate(slices)
+        if slices
+        else np.asarray(port_obj.returns, dtype=float).copy()
+    )
+    if applied_fees:
+        label = getattr(port_obj, "tag", None) or getattr(port_obj, "name", "unnamed")
+        logger.warning(
+            "Applied symmetric period-scaled universe management fees to fee-free OOS "
+            "portfolio '%s' so hold and rebalance scenarios are compared net of fees.",
+            label,
+        )
+    return net_returns, applied_fees
+
+
 def _evaluate_portfolio_with_drag(
     port_obj: Any,
     *,
     transition_drag: float,
     default_annualization: float,
+    annual_fees: dict[str, float] | None = None,
+    fallback_columns: Sequence[str] = (),
+    check_embedded_costs: bool = False,
 ) -> dict[str, float]:
-    """Evaluate portfolio metrics, optionally deducting one-off period-0 transition drag."""
-    if transition_drag <= 0.0:
-        return _extract_portfolio_metrics(port_obj)
-
+    """Evaluate portfolio metrics with symmetric fees and guarded period-0 transition drag."""
     port_rfr, ann_factor, compounded = _extract_portfolio_eval_settings(
         port_obj, default_annualization
     )
-    net_returns = np.asarray(port_obj.returns, dtype=float).copy()
+    effective_drag = float(transition_drag)
+    if (
+        check_embedded_costs
+        and effective_drag > 0.0
+        and _portfolio_has_embedded_costs(port_obj)
+    ):
+        label = getattr(port_obj, "tag", None) or getattr(port_obj, "name", "unnamed")
+        logger.warning(
+            "Skipping external transition drag (%.6f) for OOS portfolio '%s' because "
+            "it already embeds transaction_costs; avoiding double-counting.",
+            effective_drag,
+            label,
+        )
+        effective_drag = 0.0
+
+    applied_fees = False
+    if annual_fees:
+        net_returns, applied_fees = _build_net_oos_returns(
+            port_obj,
+            annual_fees=annual_fees,
+            ann_factor=ann_factor,
+            fallback_columns=fallback_columns,
+        )
+    else:
+        net_returns = np.asarray(port_obj.returns, dtype=float).copy()
+
+    if not applied_fees and effective_drag <= 0.0:
+        return _extract_portfolio_metrics(port_obj)
+
     if len(net_returns) == 0:
         raise ValueError("Portfolio has an empty return stream.")
-    net_returns[0] -= float(transition_drag)
+    if effective_drag > 0.0:
+        net_returns[0] -= effective_drag
+
     net_port = Portfolio(
         X=net_returns[:, None],
         weights=np.array([1.0], dtype=float),
@@ -157,17 +343,20 @@ def evaluate_rebalance_benefit(
     annual_fees: dict[str, float] | None = None,
     periods_per_year: float = 252.0,
     transition_drag: float = 0.0,
+    transition_cost_fn: Callable[[dict[str, float]], float] | None = None,
 ) -> dict[str, dict[str, float]]:
     """Compare buy-and-hold vs. rebalance performance without look-ahead bias.
 
     When ``oos_portfolios`` are supplied, the ``"rebalance"`` scenario reflects
     the realized out-of-sample ``Portfolio`` / ``MultiPeriodPortfolio`` return
-    stream (net of optional one-off ``transition_drag``) rather than back-projecting
-    terminal ``target_weights`` over the OOS window. The ``"hold"`` scenario is
-    evaluated over the strictly aligned OOS dates using ``weight_drift=True`` and
-    period-scaled management fees.
+    stream with symmetric period-scaled management fees (applied only to
+    fee-free folds) and path-aligned day-0 entry transition drag (skipped when
+    the OOS portfolio already embeds ``transaction_costs``). The ``"hold"``
+    scenario is evaluated over the strictly aligned OOS dates using
+    ``weight_drift=True`` and period-scaled management fees.
     """
     fees_map = annual_fees or {}
+    columns = [str(c) for c in universe_returns.columns]
     period_fees_vector = np.array(
         [
             float(fees_map.get(col, 0.0)) / float(periods_per_year)
@@ -192,9 +381,16 @@ def evaluate_rebalance_benefit(
             port_rfr, ann_factor, compounded = _extract_portfolio_eval_settings(
                 p, periods_per_year
             )
+            hold_fees_vector = np.array(
+                [
+                    float(fees_map.get(col, 0.0)) / float(ann_factor)
+                    for col in universe_returns.columns
+                ],
+                dtype=float,
+            )
             hold_kwargs: dict[str, Any] = {
                 "weight_drift": True,
-                "management_fees": period_fees_vector,
+                "management_fees": hold_fees_vector,
                 "annualization_factor": ann_factor,
                 "compounded": compounded,
             }
@@ -206,11 +402,25 @@ def evaluate_rebalance_benefit(
                 **hold_kwargs,
             )
             hold_list.append(_extract_portfolio_metrics(hold_port))
+
+            if transition_cost_fn is not None:
+                entry_w = _extract_entry_weights(p, columns)
+                path_drag = (
+                    transition_cost_fn(entry_w)
+                    if entry_w is not None
+                    else float(transition_drag)
+                )
+            else:
+                path_drag = float(transition_drag)
+
             reb_list.append(
                 _evaluate_portfolio_with_drag(
                     p,
-                    transition_drag=transition_drag,
+                    transition_drag=path_drag,
                     default_annualization=periods_per_year,
+                    annual_fees=fees_map,
+                    fallback_columns=columns,
+                    check_embedded_costs=True,
                 )
             )
 
@@ -244,11 +454,16 @@ def evaluate_rebalance_benefit(
         weights=target_weight_vector,
         **ptf_kwargs,
     )
+    static_drag = (
+        transition_cost_fn(target_weights)
+        if transition_cost_fn is not None
+        else float(transition_drag)
+    )
     return {
         "hold": _extract_portfolio_metrics(hold_portfolio),
         "rebalance": _evaluate_portfolio_with_drag(
             rebalance_portfolio,
-            transition_drag=transition_drag,
+            transition_drag=static_drag,
             default_annualization=periods_per_year,
         ),
     }
@@ -536,23 +751,29 @@ class PortfolioDeltaEngine:
                 "evaluating target_weights over full universe.returns is an in-sample projection."
             )
 
-        transition_drag = 0.0
+        self._validate_bps(brokerage_bps, "brokerage_bps")
+        self._validate_bps(slippage_bps, "slippage_bps")
+        self._validate_bps(brokerage_flat, "brokerage_flat")
+        self._validate_bps(min_trade_weight, "min_trade_weight")
+
+        transition_cost_fn: Callable[[dict[str, float]], float] | None = None
         if brokerage_bps != 0.0 or slippage_bps != 0.0 or brokerage_flat != 0.0:
-            fric_df = self.calculate_net_friction(
-                brokerage_bps=brokerage_bps,
-                slippage_bps=slippage_bps,
-                portfolio_value=portfolio_value,
-                brokerage_flat=brokerage_flat,
-                min_trade_weight=min_trade_weight,
-            )
-            transition_drag = float(
-                fric_df[fric_df["ticker"] == "TOTAL"]["transaction_cost"].iloc[0]
-            )
-        else:
-            self._validate_bps(brokerage_bps, "brokerage_bps")
-            self._validate_bps(slippage_bps, "slippage_bps")
-            self._validate_bps(brokerage_flat, "brokerage_flat")
-            self._validate_bps(min_trade_weight, "min_trade_weight")
+            self._validate_portfolio_value(portfolio_value, brokerage_flat)
+            tickers = list(self._universe.tickers)
+
+            def _path_drag(entry_weights: dict[str, float]) -> float:
+                return _compute_transition_drag_for_weights(
+                    self._current_weights,
+                    entry_weights,
+                    tickers=tickers,
+                    brokerage_bps=brokerage_bps,
+                    slippage_bps=slippage_bps,
+                    portfolio_value=portfolio_value,
+                    brokerage_flat=brokerage_flat,
+                    min_trade_weight=min_trade_weight,
+                )
+
+            transition_cost_fn = _path_drag
 
         fees_map = getattr(self._universe, "fees", None) or {}
         periods_per_year = _resolve_periods_per_year(self._universe)
@@ -564,7 +785,7 @@ class PortfolioDeltaEngine:
             oos_portfolios=matched,
             annual_fees=fees_map,
             periods_per_year=periods_per_year,
-            transition_drag=transition_drag,
+            transition_cost_fn=transition_cost_fn,
         )
 
     @staticmethod
@@ -576,6 +797,23 @@ class PortfolioDeltaEngine:
             or value < 0
         ):
             raise ValueError(f"{name} must be non-negative; got {value}.")
+
+    @staticmethod
+    def _validate_portfolio_value(
+        portfolio_value: float | None, brokerage_flat: float
+    ) -> None:
+        if portfolio_value is not None and (
+            not isinstance(portfolio_value, (int, float))
+            or isinstance(portfolio_value, bool)
+            or not np.isfinite(portfolio_value)
+            or portfolio_value <= 0
+        ):
+            raise ValueError("portfolio_value must be a positive finite number.")
+
+        if brokerage_flat > 0.0 and portfolio_value is None:
+            raise ValueError(
+                "portfolio_value must be provided when brokerage_flat > 0."
+            )
 
     def calculate_net_friction(
         self,
@@ -631,19 +869,7 @@ class PortfolioDeltaEngine:
         self._validate_bps(slippage_bps, "slippage_bps")
         self._validate_bps(brokerage_flat, "brokerage_flat")
         self._validate_bps(min_trade_weight, "min_trade_weight")
-
-        if portfolio_value is not None and (
-            not isinstance(portfolio_value, (int, float))
-            or isinstance(portfolio_value, bool)
-            or not np.isfinite(portfolio_value)
-            or portfolio_value <= 0
-        ):
-            raise ValueError("portfolio_value must be a positive finite number.")
-
-        if brokerage_flat > 0.0 and portfolio_value is None:
-            raise ValueError(
-                "portfolio_value must be provided when brokerage_flat > 0."
-            )
+        self._validate_portfolio_value(portfolio_value, brokerage_flat)
 
         fees = self._universe.fees
         total_bps = brokerage_bps + slippage_bps

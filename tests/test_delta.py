@@ -232,15 +232,19 @@ def test_calculate_rebalance_delta_multipath_window_alignment() -> None:
     )
     u._returns = returns
 
+    fees_vec = np.array([0.001 / 252.0, 0.002 / 252.0])
     # Distinct realized OOS portfolios (different weights from target_weights!)
-    p1 = Portfolio(X=returns.iloc[:15], weights=[0.9, 0.1], tag="CPCV")
-    p2 = Portfolio(X=returns.iloc[15:], weights=[0.2, 0.8], tag="CPCV")
+    p1 = Portfolio(
+        X=returns.iloc[:15], weights=[0.9, 0.1], management_fees=fees_vec, tag="CPCV"
+    )
+    p2 = Portfolio(
+        X=returns.iloc[15:], weights=[0.2, 0.8], management_fees=fees_vec, tag="CPCV"
+    )
     pop = Population([p1, p2])
 
     engine = PortfolioDeltaEngine(u, {"SPY": 0.7, "TLT": 0.3}, {"SPY": 0.5, "TLT": 0.5})
     res = engine.calculate_rebalance_delta(pop, strategy_tag="CPCV")
 
-    fees_vec = np.array([0.001 / 252.0, 0.002 / 252.0])
     h1 = Portfolio(
         X=returns.iloc[:15],
         weights=[0.7, 0.3],
@@ -579,3 +583,207 @@ def test_delta_module_free_of_mock_name() -> None:
     """F-10: flowportfolio/delta.py must contain zero _mock_name branches."""
     source = inspect.getsource(delta_module)
     assert "_mock_name" not in source
+
+
+# ---------------------------------------------------------------------------
+# Cycle 15 (P1-4 & P1-5): Fee Symmetry, Fold-0 Transition Drag & Double-Count Guard
+# ---------------------------------------------------------------------------
+
+
+def test_rebalance_delta_enforces_fee_symmetry_without_double_charging(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """P1-4: Fee-free OOS portfolios deduct symmetric period-scaled fees; fee-bearing ones are never double-charged."""
+    import logging
+
+    rng = np.random.default_rng(31)
+    idx = pd.bdate_range("2025-01-02", periods=60)
+    rets = pd.DataFrame(
+        {"A": rng.normal(0.0008, 0.01, 60), "B": rng.normal(0.0004, 0.01, 60)},
+        index=idx,
+    )
+    fees = {"A": 0.010, "B": 0.020}
+    mf_vec = np.array([fees["A"] / 252.0, fees["B"] / 252.0])
+
+    u = Universe(["A", "B"], {"A": "eq", "B": "eq"}, fees)
+    u._returns = rets
+    w = {"A": 0.6, "B": 0.4}
+    eng = PortfolioDeltaEngine(u, current_weights=w, target_weights=w)
+
+    # 1. Fee-free OOS portfolio (e.g., plain MeanRisk without ConstraintBuilder)
+    gross_fold1 = Portfolio(
+        X=rets.iloc[:30], weights=[0.6, 0.4], weight_drift=True, tag="Gross"
+    )
+    gross_fold2 = Portfolio(
+        X=rets.iloc[30:], weights=[0.6, 0.4], weight_drift=True, tag="Gross"
+    )
+    gross_mpp = MultiPeriodPortfolio(portfolios=[gross_fold1, gross_fold2], tag="Gross")
+    # Exact fee-bearing oracle over the same folds
+    net_fold1 = Portfolio(
+        X=rets.iloc[:30],
+        weights=[0.6, 0.4],
+        weight_drift=True,
+        management_fees=mf_vec,
+        tag="Net",
+    )
+    net_fold2 = Portfolio(
+        X=rets.iloc[30:],
+        weights=[0.6, 0.4],
+        weight_drift=True,
+        management_fees=mf_vec,
+        tag="Net",
+    )
+    net_mpp = MultiPeriodPortfolio(portfolios=[net_fold1, net_fold2], tag="Net")
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="flowportfolio.delta"):
+        res_gross = eng.calculate_rebalance_delta(
+            Population([gross_mpp]), strategy_tag="Gross"
+        )
+    assert any("management fees" in rec.message.lower() for rec in caplog.records)
+    assert res_gross["rebalance"]["sharpe"] < float(gross_mpp.annualized_sharpe_ratio)
+    assert res_gross["rebalance"]["sharpe"] == pytest.approx(
+        float(net_mpp.annualized_sharpe_ratio), rel=1e-9, abs=1e-12
+    )
+    assert res_gross["rebalance"]["cvar"] == pytest.approx(
+        float(net_mpp.cvar), rel=1e-9, abs=1e-12
+    )
+    assert res_gross["rebalance"]["max_drawdown"] == pytest.approx(
+        float(net_mpp.max_drawdown), rel=1e-9, abs=1e-12
+    )
+
+    # Single-period identical-weights symmetry check: hold == rebalance (zero bias)
+    gross_single = Portfolio(X=rets, weights=[0.6, 0.4], weight_drift=True, tag="Same")
+    res_sym = eng.calculate_rebalance_delta(
+        Population([gross_single]), strategy_tag="Same"
+    )
+    assert res_sym["rebalance"]["sharpe"] == pytest.approx(
+        res_sym["hold"]["sharpe"], rel=1e-9, abs=1e-12
+    )
+
+    # 2. Already fee-bearing OOS portfolio must NOT be charged fees a second time
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="flowportfolio.delta"):
+        res_net = eng.calculate_rebalance_delta(
+            Population([net_mpp]), strategy_tag="Net"
+        )
+    assert not any("management fees" in rec.message.lower() for rec in caplog.records)
+    assert res_net["rebalance"]["sharpe"] == pytest.approx(
+        float(net_mpp.annualized_sharpe_ratio), rel=1e-9, abs=1e-12
+    )
+    assert res_net["rebalance"]["cvar"] == pytest.approx(
+        float(net_mpp.cvar), rel=1e-9, abs=1e-12
+    )
+
+
+def test_rebalance_delta_transition_drag_uses_fold0_trade_not_terminal_target() -> None:
+    """P1-5a: OOS day-0 transition drag must reflect current->fold0 trade, not current->terminal target_weights."""
+    rng = np.random.default_rng(44)
+    idx = pd.bdate_range("2025-01-02", periods=60)
+    rets = pd.DataFrame(
+        {"A": rng.normal(0.001, 0.01, 60), "B": rng.normal(0.0005, 0.01, 60)},
+        index=idx,
+    )
+    # Fold 0 holds [0.9, 0.1]; Fold 1 holds [0.2, 0.8]; live terminal target is [0.1, 0.9]
+    f0 = Portfolio(X=rets.iloc[:30], weights=[0.9, 0.1], tag="Strat")
+    f1 = Portfolio(X=rets.iloc[30:], weights=[0.2, 0.8], tag="Strat")
+    mpp = MultiPeriodPortfolio(portfolios=[f0, f1], tag="Strat")
+    pop = Population([mpp])
+
+    u = Universe(["A", "B"], {"A": "eq", "B": "eq"}, {"A": 0.0, "B": 0.0})
+    u._returns = rets
+
+    # Case 1: current_weights == fold0_weights -> zero entry trade -> zero day-0 drag
+    eng_zero_entry = PortfolioDeltaEngine(
+        u,
+        current_weights={"A": 0.9, "B": 0.1},
+        target_weights={"A": 0.1, "B": 0.9},
+    )
+    res_gross = eng_zero_entry.calculate_rebalance_delta(pop, strategy_tag="Strat")
+    res_with_bps = eng_zero_entry.calculate_rebalance_delta(
+        pop,
+        strategy_tag="Strat",
+        brokerage_bps=50.0,
+        slippage_bps=25.0,
+        brokerage_flat=50.0,
+        portfolio_value=10_000.0,
+    )
+    assert res_with_bps["rebalance"]["sharpe"] == pytest.approx(
+        res_gross["rebalance"]["sharpe"], rel=0, abs=1e-12
+    )
+
+    # Case 2: current_weights = [0.5, 0.5] -> entry trade to fold0 [0.9, 0.1] has L1=0.8 (not 0.8 to target [0.1,0.9] — use asymmetric [0.7, 0.3])
+    eng_asym = PortfolioDeltaEngine(
+        u,
+        current_weights={"A": 0.7, "B": 0.3},
+        target_weights={"A": 0.1, "B": 0.9},
+    )
+    # L1(current->fold0) = |0.9-0.7| + |0.1-0.3| = 0.4; L1(current->target) = 1.2 (3x larger!)
+    res_asym = eng_asym.calculate_rebalance_delta(
+        pop, strategy_tag="Strat", brokerage_bps=50.0, slippage_bps=50.0
+    )
+    expected_drag = 0.4 * 100.0 / 10_000.0  # 0.004
+    expected_series = np.asarray(mpp.returns, dtype=float).copy()
+    expected_series[0] -= expected_drag
+    expected_port = Portfolio(
+        X=expected_series[:, None], weights=np.array([1.0]), annualization_factor=252.0
+    )
+    assert res_asym["rebalance"]["sharpe"] == pytest.approx(
+        float(expected_port.annualized_sharpe_ratio), rel=1e-9, abs=1e-12
+    )
+
+
+def test_rebalance_delta_skips_transition_drag_when_oos_already_embeds_transaction_costs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """P1-5b: OOS portfolios carrying embedded transaction_costs must not be double-charged external drag."""
+    import logging
+
+    rng = np.random.default_rng(51)
+    idx = pd.bdate_range("2025-01-02", periods=60)
+    rets = pd.DataFrame(
+        {"A": rng.normal(0.001, 0.01, 60), "B": rng.normal(0.0005, 0.01, 60)},
+        index=idx,
+    )
+    f0 = Portfolio(
+        X=rets.iloc[:30],
+        weights=[0.8, 0.2],
+        transaction_costs=0.0,
+        tag="Costed",
+    )
+    f1 = Portfolio(
+        X=rets.iloc[30:],
+        weights=[0.2, 0.8],
+        previous_weights=np.array([0.8, 0.2]),
+        transaction_costs=0.001 / 30.0,
+        tag="Costed",
+    )
+    assert float(f1.total_cost) > 0.0
+    mpp = MultiPeriodPortfolio(portfolios=[f0, f1], tag="Costed")
+    pop = Population([mpp])
+
+    u = Universe(["A", "B"], {"A": "eq", "B": "eq"}, {"A": 0.0, "B": 0.0})
+    u._returns = rets
+    eng = PortfolioDeltaEngine(
+        u,
+        current_weights={"A": 0.2, "B": 0.8},
+        target_weights={"A": 0.8, "B": 0.2},
+    )
+
+    res_no_extra = eng.calculate_rebalance_delta(pop, strategy_tag="Costed")
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="flowportfolio.delta"):
+        res_with_extra = eng.calculate_rebalance_delta(
+            pop,
+            strategy_tag="Costed",
+            brokerage_bps=50.0,
+            slippage_bps=25.0,
+        )
+
+    assert any("double-counting" in rec.message.lower() for rec in caplog.records)
+    assert res_with_extra["rebalance"]["sharpe"] == pytest.approx(
+        res_no_extra["rebalance"]["sharpe"], rel=0, abs=1e-12
+    )
+    assert res_with_extra["rebalance"]["cvar"] == pytest.approx(
+        res_no_extra["rebalance"]["cvar"], rel=0, abs=1e-12
+    )

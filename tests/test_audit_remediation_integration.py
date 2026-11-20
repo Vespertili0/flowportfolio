@@ -163,17 +163,24 @@ def test_holiday_ffill_and_truncation_warning(caplog: pytest.LogCaptureFixture) 
 
 
 def test_real_skfolio_reporting_and_delta() -> None:
-    """Tearsheet unrolls real folds with real tickers and delta preserves realized OOS metrics."""
+    """Tearsheet unrolls real folds with real tickers and delta preserves fee-symmetric OOS metrics."""
     universe = _fetched_universe(n_days=500)
+    spec = ConstraintBuilder(universe).build()
 
-    mean_risk = StrategyBuilder().set_optimizer(MeanRisk()).build_pipeline()
-    hrp = StrategyBuilder().set_optimizer(HierarchicalRiskParity()).build_pipeline()
+    mean_risk_net = (
+        StrategyBuilder(constraints=spec).set_optimizer(MeanRisk()).build_pipeline()
+    )
+    hrp_gross = (
+        StrategyBuilder().set_optimizer(HierarchicalRiskParity()).build_pipeline()
+    )
 
     engine = PortfolioExperimentEngine(universe, n_jobs=1)
-    engine.add_strategy("MeanRisk", mean_risk, {"optimizer__l1_coef": [0.0, 0.0005]})
     engine.add_strategy(
-        "HRP",
-        hrp,
+        "MeanRiskNet", mean_risk_net, {"optimizer__l1_coef": [0.0, 0.0005]}
+    )
+    engine.add_strategy(
+        "HRPGross",
+        hrp_gross,
         {"optimizer__risk_measure": [RiskMeasure.VARIANCE, RiskMeasure.CVAR]},
     )
 
@@ -185,9 +192,10 @@ def test_real_skfolio_reporting_and_delta() -> None:
     assert isinstance(population, Population)
     assert all(isinstance(p, MultiPeriodPortfolio) for p in population)
 
-    selected_port = next(p for p in population if p.tag == "MeanRisk")
-    assert len(selected_port.portfolios) > 1
-    assert len(selected_port.returns_df) < len(universe.returns)
+    selected_net = next(p for p in population if p.tag == "MeanRiskNet")
+    selected_gross = next(p for p in population if p.tag == "HRPGross")
+    assert len(selected_net.portfolios) > 1
+    assert len(selected_net.returns_df) < len(universe.returns)
 
     reporter = Reporter(result)
     markdown = reporter.to_markdown_artifact()
@@ -199,22 +207,31 @@ def test_real_skfolio_reporting_and_delta() -> None:
 
     figs = reporter.get_plotly_figures()
     traces_by_name = {t.name: t for t in figs["cvar_boxplot"].data}
-    assert len(traces_by_name["MeanRisk"].y) == len(selected_port.portfolios)
+    assert len(traces_by_name["MeanRiskNet"].y) == len(selected_net.portfolios)
 
     current_weights = {"SPY": 0.70, "TLT": 0.10, "GLD": 0.10, "QQQ": 0.10}
-    target_weights = result.live_weights["MeanRisk"]
+    target_weights = result.live_weights["MeanRiskNet"]
     delta_engine = PortfolioDeltaEngine(
         universe, current_weights=current_weights, target_weights=target_weights
     )
-    delta = delta_engine.calculate_rebalance_delta(
-        population=population, strategy_tag="MeanRisk"
+    # 1. Fee-bearing strategy built with ConstraintBuilder matches selected_net directly (no double fee)
+    delta_net = delta_engine.calculate_rebalance_delta(
+        population=population, strategy_tag="MeanRiskNet"
     )
-    assert delta["rebalance"]["sharpe"] == pytest.approx(
-        float(selected_port.annualized_sharpe_ratio), rel=1e-9, abs=1e-9
+    assert delta_net["rebalance"]["sharpe"] == pytest.approx(
+        float(selected_net.annualized_sharpe_ratio), rel=1e-9, abs=1e-9
     )
-    assert delta["rebalance"]["cvar"] == pytest.approx(
-        float(selected_port.cvar), rel=1e-9, abs=1e-9
+    assert delta_net["rebalance"]["cvar"] == pytest.approx(
+        float(selected_net.cvar), rel=1e-9, abs=1e-9
     )
-    assert delta["rebalance"]["max_drawdown"] == pytest.approx(
-        float(selected_port.max_drawdown), rel=1e-9, abs=1e-9
+    assert delta_net["rebalance"]["max_drawdown"] == pytest.approx(
+        float(selected_net.max_drawdown), rel=1e-9, abs=1e-9
+    )
+
+    # 2. Fee-free strategy built without ConstraintBuilder gets symmetric 50 bps/yr fee deduction
+    delta_gross = delta_engine.calculate_rebalance_delta(
+        population=population, strategy_tag="HRPGross"
+    )
+    assert delta_gross["rebalance"]["sharpe"] < float(
+        selected_gross.annualized_sharpe_ratio
     )
