@@ -2,26 +2,24 @@
 
 These tests deliberately use real skfolio estimators, real ``Portfolio`` and
 ``MultiPeriodPortfolio`` objects, and synthetic daily price data. The only
-test doubles are a stub data provider (no network access) and a ``Portfolio``
-spy used to observe the evaluation window in ``PortfolioDeltaEngine``.
+test double is a stub data provider (no network access).
 """
 
 from __future__ import annotations
 
 import logging
-from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
 import pytest
 from skfolio import Population, RiskMeasure
 from skfolio.optimization import HierarchicalRiskParity, MeanRisk
-from skfolio.portfolio import MultiPeriodPortfolio, Portfolio
+from skfolio.portfolio import MultiPeriodPortfolio
 from skfolio.pre_selection import DropCorrelated
 from sklearn import config_context
 
 from flowportfolio.core.constraints import ConstraintBuilder
-from flowportfolio.core.experiment import PortfolioExperimentEngine
+from flowportfolio.core.experiment import ExperimentResult, PortfolioExperimentEngine
 from flowportfolio.core.reporting import Reporter
 from flowportfolio.core.universe import Universe
 from flowportfolio.delta import PortfolioDeltaEngine
@@ -165,7 +163,7 @@ def test_holiday_ffill_and_truncation_warning(caplog: pytest.LogCaptureFixture) 
 
 
 def test_real_skfolio_reporting_and_delta() -> None:
-    """Tearsheet shows real tickers and the delta engine uses the out-of-sample window."""
+    """Tearsheet unrolls real folds with real tickers and delta preserves realized OOS metrics."""
     universe = _fetched_universe(n_days=500)
 
     mean_risk = StrategyBuilder().set_optimizer(MeanRisk()).build_pipeline()
@@ -179,27 +177,44 @@ def test_real_skfolio_reporting_and_delta() -> None:
         {"optimizer__risk_measure": [RiskMeasure.VARIANCE, RiskMeasure.CVAR]},
     )
 
-    population = engine.run_robustness_test(
-        cv_type="walk_forward", train_size=100, test_size=25
+    result = engine.run_robustness_test(
+        cv_type="walk_forward", train_size=100, test_size=25, return_result=True
     )
-
+    assert isinstance(result, ExperimentResult)
+    population = result.population
     assert isinstance(population, Population)
     assert all(isinstance(p, MultiPeriodPortfolio) for p in population)
 
-    markdown = Reporter(population).to_markdown_artifact()
+    selected_port = next(p for p in population if p.tag == "MeanRisk")
+    assert len(selected_port.portfolios) > 1
+    assert len(selected_port.returns_df) < len(universe.returns)
+
+    reporter = Reporter(result)
+    markdown = reporter.to_markdown_artifact()
     holdings_line = next(
         line for line in markdown.splitlines() if "Top 5 Holdings" in line
     )
     assert "Asset_0" not in holdings_line
     assert any(ticker in holdings_line for ticker in TICKERS)
 
-    weights = dict.fromkeys(TICKERS, 0.25)
-    delta_engine = PortfolioDeltaEngine(
-        universe, current_weights=weights, target_weights=weights
-    )
-    with patch("flowportfolio.delta.Portfolio", wraps=Portfolio) as portfolio_spy:
-        delta_engine.calculate_rebalance_delta(population=population)
+    figs = reporter.get_plotly_figures()
+    traces_by_name = {t.name: t for t in figs["cvar_boxplot"].data}
+    assert len(traces_by_name["MeanRisk"].y) == len(selected_port.portfolios)
 
-    evaluated = portfolio_spy.call_args_list[0].kwargs["X"]
-    assert len(evaluated) == len(population[0].returns_df)
-    assert len(evaluated) < len(universe.returns)
+    current_weights = {"SPY": 0.70, "TLT": 0.10, "GLD": 0.10, "QQQ": 0.10}
+    target_weights = result.live_weights["MeanRisk"]
+    delta_engine = PortfolioDeltaEngine(
+        universe, current_weights=current_weights, target_weights=target_weights
+    )
+    delta = delta_engine.calculate_rebalance_delta(
+        population=population, strategy_tag="MeanRisk"
+    )
+    assert delta["rebalance"]["sharpe"] == pytest.approx(
+        float(selected_port.annualized_sharpe_ratio), rel=1e-9, abs=1e-9
+    )
+    assert delta["rebalance"]["cvar"] == pytest.approx(
+        float(selected_port.cvar), rel=1e-9, abs=1e-9
+    )
+    assert delta["rebalance"]["max_drawdown"] == pytest.approx(
+        float(selected_port.max_drawdown), rel=1e-9, abs=1e-9
+    )

@@ -7,53 +7,117 @@ plotting capabilities.
 
 from __future__ import annotations
 
+import collections
 import copy
-import logging
+import math
 from datetime import UTC, datetime
+from typing import Any
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from skfolio import Population, RatioMeasure, RiskMeasure
 
-logger = logging.getLogger(__name__)
+from flowportfolio.core.experiment import ExperimentResult
+
+
+def _unpack_population_and_live_weights(
+    population: Population | ExperimentResult,
+    live_weights: dict[str, dict[str, float]] | None,
+) -> tuple[Population, dict[str, dict[str, float]]]:
+    """Resolve a ``Population`` and merged live-weights mapping from inputs."""
+    result_lw: dict[str, dict[str, float]] | None = None
+    if isinstance(population, ExperimentResult):
+        pop = population.population
+        result_lw = population.live_weights
+    else:
+        pop = population
+
+    if not isinstance(pop, Population):
+        raise TypeError("population must be a skfolio.Population instance.")
+    if live_weights is not None and not isinstance(live_weights, dict):
+        raise TypeError(
+            "live_weights must be a dict mapping strategy tags to weight dicts or None."
+        )
+
+    merged: dict[str, dict[str, float]] = {}
+    pop_latest = getattr(pop, "latest_weights_by_tag", None)
+    if isinstance(pop_latest, dict):
+        merged.update(pop_latest)
+    if isinstance(result_lw, dict):
+        merged.update(result_lw)
+    if live_weights is not None:
+        merged.update(live_weights)
+    return pop, merged
 
 
 def _get_portfolio_metric(p: object, annualized_attr: str, raw_attr: str) -> object:
-    """Return annualized metric on real skfolio objects, falling back to raw_attr on mocks."""
-    if not hasattr(p, "_mock_name"):
+    """Return annualized metric when available, falling back to raw_attr without warnings."""
+    with np.errstate(divide="ignore", invalid="ignore"):
         ann_val = getattr(p, annualized_attr, None)
-        if isinstance(ann_val, (int, float, np.number)):
+        if isinstance(ann_val, (int, float, np.number)) and not isinstance(
+            ann_val, bool
+        ):
             return float(ann_val)
-    return getattr(p, raw_attr, None)
+        return getattr(p, raw_attr, None)
+
+
+def _safe_getattr(p: object, attr: str) -> Any:
+    """Read a portfolio attribute while suppressing divide-by-zero numpy warnings."""
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return getattr(p, attr, None)
+
+
+def _finite_cvar_ratio(p: object) -> float | None:
+    """Extract a portfolio's CVaR ratio only when it is a finite real number."""
+    val = _safe_getattr(p, "cvar_ratio")
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        f_val = float(val)
+    except (ValueError, TypeError):
+        return None
+    return f_val if math.isfinite(f_val) else None
 
 
 class Reporter:
     """Visual tearsheet generator for evaluated strategies.
 
-    Consumes a :class:`Population` of portfolios (typically output by
+    Consumes a :class:`Population` or :class:`ExperimentResult` of portfolios
+    (typically output by
     :meth:`flowportfolio.core.experiment.PortfolioExperimentEngine.run_robustness_test`)
     and generates a standardised three-panel visual tearsheet comparing them
     against a baseline.
 
     Parameters
     ----------
-    population : Population
-        The population of portfolios to analyse.
+    population : Population or ExperimentResult
+        The population of portfolios (or immutable :class:`ExperimentResult`) to
+        analyse.
+    live_weights : dict[str, dict[str, float]] or None, optional
+        Optional explicit mapping of strategy tag to live terminal weights.
+        Takes precedence over ``ExperimentResult.live_weights`` and historical
+        Fold-N OOS weights.
 
     Raises
     ------
     TypeError
-        If the provided ``population`` is not a ``skfolio.Population`` instance.
+        If ``population`` is not a ``skfolio.Population`` or
+        ``ExperimentResult``, or if ``live_weights`` is not a dict or None.
     """
 
-    def __init__(self, population: Population) -> None:
-        if not isinstance(population, Population):
-            raise TypeError("population must be a skfolio.Population instance.")
-        self._population = population
+    def __init__(
+        self,
+        population: Population | ExperimentResult,
+        *,
+        live_weights: dict[str, dict[str, float]] | None = None,
+    ) -> None:
+        self._population, self._live_weights = _unpack_population_and_live_weights(
+            population, live_weights
+        )
 
     @staticmethod
-    def _unroll_portfolios(portfolios) -> Population:
+    def _unroll_portfolios(portfolios: Any) -> Population:
         """Unroll MultiPeriodPortfolios into constituent single-period Portfolios with inherited tags."""
         unrolled = []
         for p in portfolios:
@@ -75,7 +139,12 @@ class Reporter:
                 unrolled.append(p)
         return Population(unrolled)
 
-    def generate_tearsheet(self, baseline_tag: str = "Baseline") -> None:
+    def generate_tearsheet(
+        self,
+        baseline_tag: str = "Baseline",
+        *,
+        unroll_folds: bool = True,
+    ) -> None:
         """Generate and display the standardised tearsheet plots.
 
         Executes and displays three comparative plots:
@@ -89,13 +158,20 @@ class Reporter:
             The tag representing the baseline strategy, ensuring it is always
             included in the visual comparisons even if its metric distribution
             is narrow.
-        """
-        try:
-            figures = self.get_plotly_figures(baseline_tag=baseline_tag)
-        except ValueError as e:
-            logger.warning("Failed to generate plot in Tearsheet: %s", e)
-            return
+        unroll_folds : bool, default True
+            When ``True``, unrolls ``MultiPeriodPortfolio`` folds into
+            per-fold observations so boxplots and distributions reflect the
+            full out-of-sample fold distribution.
 
+        Raises
+        ------
+        ValueError
+            If the population contains no tagged portfolios or no finite CVaR
+            ratios.
+        """
+        figures = self.get_plotly_figures(
+            baseline_tag=baseline_tag, unroll_folds=unroll_folds
+        )
         for fig in figures.values():
             fig.show()
 
@@ -103,6 +179,8 @@ class Reporter:
         self,
         stress_tag: str,
         baseline_tag: str,
+        *,
+        unroll_folds: bool = False,
     ) -> None:
         """Generate comparative risk plots for stress vs baseline portfolios.
 
@@ -110,21 +188,15 @@ class Reporter:
         1. Boxplot of CVaR comparing stress scenarios against the baseline.
         2. Distribution plot of Max Drawdown comparing stress vs baseline.
 
-        Tags are set by the PortfolioExperimentEngine when assembling the
-        Population. The stress_tag typically corresponds to portfolios
-        generated using a SyntheticData (VineCopula) prior.
-
         Parameters
         ----------
         stress_tag : str
             Tag value identifying stress-scenario portfolios in the Population.
         baseline_tag : str
             Tag value identifying baseline portfolios in the Population.
-
-        Returns
-        -------
-        None
-            Renders plots directly via .show() for interactive environments.
+        unroll_folds : bool, default False
+            When ``False`` (default), evaluates full uncensored multi-period
+            trajectories. When ``True``, unrolls constituent fold portfolios.
 
         Raises
         ------
@@ -149,26 +221,37 @@ class Reporter:
                 f"Tag '{baseline_tag}' matched no portfolios in the population."
             )
 
-        combined = Population([*stress_raw, *baseline_raw])
+        combined_items = [*stress_raw, *baseline_raw]
+        combined = (
+            self._unroll_portfolios(combined_items)
+            if unroll_folds
+            else Population(combined_items)
+        )
 
-        fig1 = combined.boxplot_measure(
-            measure=RiskMeasure.CVAR,
-            tag_list=[stress_tag, baseline_tag],
-        )
-        fig1.update_layout(title=f"CVaR Distribution: {stress_tag} vs {baseline_tag}")
-        fig1.show()
+        with np.errstate(divide="ignore", invalid="ignore"):
+            fig1 = combined.boxplot_measure(
+                measure=RiskMeasure.CVAR,
+                tag_list=[stress_tag, baseline_tag],
+            )
+            fig1.update_layout(
+                title=f"CVaR Distribution: {stress_tag} vs {baseline_tag}"
+            )
+            fig1.show()
 
-        fig2 = combined.plot_distribution(
-            measure_list=[RiskMeasure.MAX_DRAWDOWN],
-            tag_list=[stress_tag, baseline_tag],
-        )
-        fig2.update_layout(
-            title=f"Max Drawdown Distribution: {stress_tag} vs {baseline_tag}"
-        )
-        fig2.show()
+            fig2 = combined.plot_distribution(
+                measure_list=[RiskMeasure.MAX_DRAWDOWN],
+                tag_list=[stress_tag, baseline_tag],
+            )
+            fig2.update_layout(
+                title=f"Max Drawdown Distribution: {stress_tag} vs {baseline_tag}"
+            )
+            fig2.show()
 
     def get_plotly_figures(
-        self, baseline_tag: str = "Baseline"
+        self,
+        baseline_tag: str = "Baseline",
+        *,
+        unroll_folds: bool = True,
     ) -> dict[str, go.Figure]:
         """Generate Plotly figures for strategy comparison without displaying them.
 
@@ -178,6 +261,11 @@ class Reporter:
             The tag representing the baseline strategy, ensuring it is always
             included in the visual comparisons even if its metric distribution
             is narrow.
+        unroll_folds : bool, default True
+            When ``True`` (default), unrolls ``MultiPeriodPortfolio`` folds
+            into single-period fold portfolios so boxplots and distributions
+            display the complete fold distribution. Set ``False`` to plot
+            aggregate multi-period trajectory metrics.
 
         Returns
         -------
@@ -188,7 +276,8 @@ class Reporter:
         Raises
         ------
         ValueError
-            If the population contains no tagged portfolios.
+            If the population contains no tagged portfolios or no finite CVaR
+            ratios.
         """
         tag_list = self._unique_tags()
         if not tag_list:
@@ -200,27 +289,29 @@ class Reporter:
         if baseline_tag not in tag_list and baseline_tag in valid_population_tags:
             tag_list.insert(0, baseline_tag)
 
-        if hasattr(self._population, "_mock_name"):
-            plot_population = self._unroll_portfolios(self._population)
-        else:
-            plot_population = Population(list(self._population))
-
-        fig1 = plot_population.boxplot_measure(
-            measure=RatioMeasure.CVAR_RATIO,
-            tag_list=tag_list,
+        plot_population = (
+            self._unroll_portfolios(self._population)
+            if unroll_folds
+            else Population(list(self._population))
         )
 
-        fig2 = plot_population.plot_distribution(
-            measure_list=[RatioMeasure.AVERAGE_DRAWDOWN_RATIO],
-            tag_list=tag_list,
-        )
+        with np.errstate(divide="ignore", invalid="ignore"):
+            fig1 = plot_population.boxplot_measure(
+                measure=RatioMeasure.CVAR_RATIO,
+                tag_list=tag_list,
+            )
 
-        best_tag = self._best_tag_by_median_cvar(tag_list)
+            fig2 = plot_population.plot_distribution(
+                measure_list=[RatioMeasure.AVERAGE_DRAWDOWN_RATIO],
+                tag_list=tag_list,
+            )
 
-        best_portfolios = self._unroll_portfolios(
-            [p for p in self._population if getattr(p, "tag", None) == best_tag]
-        )
-        fig3 = best_portfolios.plot_composition()
+            best_tag = self._best_tag_by_median_cvar(tag_list)
+
+            best_portfolios = self._unroll_portfolios(
+                [p for p in self._population if getattr(p, "tag", None) == best_tag]
+            )
+            fig3 = best_portfolios.plot_composition()
 
         return {
             "cvar_boxplot": fig1,
@@ -228,41 +319,85 @@ class Reporter:
             "best_composition": fig3,
         }
 
+    @staticmethod
+    def _format_metric(val: object) -> str:
+        """Format a numeric or nullable portfolio metric for Markdown tables."""
+        if val is None or isinstance(val, bool):
+            return "N/A"
+        try:
+            f_val = float(val)  # type: ignore[arg-type]
+        except (ValueError, TypeError):
+            return str(val)
+        if math.isnan(f_val):
+            return "nan"
+        if not math.isfinite(f_val):
+            return "N/A"
+        return f"{f_val:.4f}"
+
+    @staticmethod
+    def _extract_asset_weights(
+        target_port: object,
+        live_tag_weights: dict[str, float] | None,
+    ) -> list[tuple[str, float]] | None:
+        """Extract finite ``(asset, weight)`` pairs from live weights or a portfolio."""
+
+        def _is_valid_weight(w: object) -> bool:
+            if w is None or isinstance(w, bool):
+                return False
+            try:
+                return math.isfinite(float(w))  # type: ignore[arg-type]
+            except (ValueError, TypeError):
+                return False
+
+        weights_dict: object = (
+            live_tag_weights
+            if isinstance(live_tag_weights, dict) and len(live_tag_weights) > 0
+            else getattr(target_port, "weights_dict", None)
+        )
+        if isinstance(weights_dict, dict) and len(weights_dict) > 0:
+            return [
+                (str(asset), float(w))
+                for asset, w in weights_dict.items()
+                if _is_valid_weight(w)
+            ]
+
+        weights = getattr(target_port, "weights", None)
+        if weights is None or len(weights) == 0:
+            return None
+
+        assets_candidate = getattr(target_port, "assets_names", None)
+        if not isinstance(assets_candidate, (list, tuple, np.ndarray, pd.Index)):
+            assets_candidate = getattr(target_port, "assets", None)
+        assets = (
+            assets_candidate
+            if assets_candidate is not None and len(assets_candidate) == len(weights)
+            else [f"Asset_{i}" for i in range(len(weights))]
+        )
+        return [
+            (str(asset), float(w))
+            for asset, w in zip(assets, weights, strict=True)
+            if _is_valid_weight(w)
+        ]
+
     def _generate_metrics_table(self) -> str:
         """Generate a Markdown table of performance metrics for the population."""
-
-        def _fmt(val: object) -> str:
-            if val is None:
-                return "N/A"
-
-            if isinstance(val, (int, float, np.number)):
-                if np.isnan(val):
-                    return "nan"
-                return f"{float(val):.4f}"
-            try:
-                f_val = float(val)  # type: ignore[arg-type]
-                if np.isnan(f_val):
-                    return "nan"
-                return f"{f_val:.4f}"
-            except (ValueError, TypeError):
-                return str(val)
-
         metrics = []
         for p in self._population:
+            tag = getattr(p, "tag", None)
             metrics.append(
                 {
                     "Strategy": getattr(p, "name", "N/A") or "N/A",
-                    "Tag": getattr(p, "tag", None)
-                    if getattr(p, "tag", None)
-                    else "N/A",
-                    "Sharpe": _fmt(
+                    "Tag": tag if tag else "N/A",
+                    "Sharpe": self._format_metric(
                         _get_portfolio_metric(
                             p, "annualized_sharpe_ratio", "sharpe_ratio"
                         )
                     ),
-                    "CVaR": _fmt(getattr(p, "cvar", None)),
-                    "Max Drawdown": _fmt(getattr(p, "max_drawdown", None)),
-                    "Sortino": _fmt(
+                    "CVaR": self._format_metric(_safe_getattr(p, "cvar")),
+                    "Max Drawdown": self._format_metric(
+                        _safe_getattr(p, "max_drawdown")
+                    ),
+                    "Sortino": self._format_metric(
                         _get_portfolio_metric(
                             p, "annualized_sortino_ratio", "sortino_ratio"
                         )
@@ -289,7 +424,7 @@ class Reporter:
         return table_md
 
     def _get_best_strategy_and_holdings(self) -> tuple[str, str]:
-        """Identify the best strategy by median CVaR Ratio and format its top 5 holdings."""
+        """Identify the best strategy by median finite CVaR Ratio and format its top 5 holdings."""
         tag_list = self._unique_tags()
         if not tag_list:
             return "N/A (No tagged portfolios)", "N/A"
@@ -300,13 +435,11 @@ class Reporter:
             p for p in self._population if getattr(p, "tag", None) == best_tag
         ]
 
-        def _get_cvar_ratio(p: object) -> float:
-            val = getattr(p, "cvar_ratio", None)
-            if val is not None and not np.isnan(val):
-                return float(val)
-            return float("-inf")
+        def _score_portfolio(p: object) -> float:
+            ratio = _finite_cvar_ratio(p)
+            return ratio if ratio is not None else float("-inf")
 
-        best_portfolio = max(best_portfolios, key=_get_cvar_ratio)
+        best_portfolio = max(best_portfolios, key=_score_portfolio)
 
         # Resolve the terminal single-period portfolio of a MultiPeriodPortfolio
         target_port = best_portfolio
@@ -315,56 +448,17 @@ class Reporter:
             if isinstance(portfolios, list) and len(portfolios) > 0:
                 target_port = portfolios[-1]
 
-        def _is_valid_weight(w: object) -> bool:
-            if w is None:
-                return False
-            try:
-                return not np.isnan(float(w))  # type: ignore[arg-type]
-            except (ValueError, TypeError):
-                return False
-
-        pop_latest_map = getattr(self._population, "latest_weights_by_tag", None)
-        latest_weights_dict = (
-            pop_latest_map.get(best_tag) if isinstance(pop_latest_map, dict) else None
+        asset_weights = self._extract_asset_weights(
+            target_port, self._live_weights.get(best_tag)
         )
-        if not (isinstance(latest_weights_dict, dict) and len(latest_weights_dict) > 0):
-            latest_weights_dict = getattr(best_portfolio, "latest_weights_dict", None)
-
-        weights_dict: object
-        if isinstance(latest_weights_dict, dict) and len(latest_weights_dict) > 0:
-            weights_dict = latest_weights_dict
-        else:
-            weights_dict = getattr(target_port, "weights_dict", None)
-
-        if isinstance(weights_dict, dict) and len(weights_dict) > 0:
-            asset_weights = [
-                (str(asset), float(w))
-                for asset, w in weights_dict.items()
-                if _is_valid_weight(w)
-            ]
-        else:
-            weights = getattr(target_port, "weights", None)
-            assets_candidate = getattr(target_port, "assets_names", None)
-            if not isinstance(assets_candidate, (list, tuple, np.ndarray, pd.Index)):
-                assets_candidate = getattr(target_port, "assets", None)
-            assets = assets_candidate
-            if weights is None or len(weights) == 0:
-                return best_tag, "N/A (No weights available)"
-            if assets is None or len(assets) != len(weights):
-                assets = [f"Asset_{i}" for i in range(len(weights))]
-            asset_weights = [
-                (str(aw[0]), float(aw[1]))
-                for aw in zip(assets, weights)
-                if _is_valid_weight(aw[1])
-            ]
-
+        if asset_weights is None:
+            return best_tag, "N/A (No weights available)"
         if not asset_weights:
-            top_holdings = "N/A (All weights zero or NaN)"
-        else:
-            asset_weights.sort(key=lambda x: abs(x[1]), reverse=True)
-            top_5 = asset_weights[:5]
-            top_holdings = ", ".join(f"{asset!s} ({w:.2%})" for asset, w in top_5)
+            return best_tag, "N/A (All weights zero or NaN)"
 
+        asset_weights.sort(key=lambda x: abs(x[1]), reverse=True)
+        top_5 = asset_weights[:5]
+        top_holdings = ", ".join(f"{asset!s} ({w:.2%})" for asset, w in top_5)
         return best_tag, top_holdings
 
     def to_markdown_artifact(self, baseline_tag: str = "Baseline") -> str:
@@ -381,8 +475,8 @@ class Reporter:
         str
             A formatted Markdown string containing an ISO8601 UTC timestamp,
             a metrics table (Sharpe, CVaR, Max Drawdown, Sortino), and analysis
-            identifying the best strategy by median CVaR Ratio and its top 5
-            holdings.
+            identifying the best strategy by median finite CVaR Ratio and its
+            top 5 holdings.
 
         Raises
         ------
@@ -402,10 +496,9 @@ class Reporter:
         ]
         if baseline_portfolios:
             baseline_cvar_ratios: list[float] = [
-                float(val)
+                ratio
                 for p in baseline_portfolios
-                if (val := getattr(p, "cvar_ratio", None)) is not None
-                and not np.isnan(float(val))
+                if (ratio := _finite_cvar_ratio(p)) is not None
             ]
             if baseline_cvar_ratios:
                 baseline_median_cvar = float(np.median(baseline_cvar_ratios))
@@ -441,16 +534,14 @@ class Reporter:
         )
 
     def _best_tag_by_median_cvar(self, tag_list: list[str]) -> str:
-        import collections
-
-        def _collect_cvar_by_tag(iterable) -> dict[str, list[float]]:
+        def _collect_cvar_by_tag(iterable: Any) -> dict[str, list[float]]:
             mapping: dict[str, list[float]] = collections.defaultdict(list)
             for p in iterable:
                 tag = getattr(p, "tag", None)
                 if tag is not None and tag in tag_list:
-                    cvar_ratio = getattr(p, "cvar_ratio", None)
-                    if cvar_ratio is not None and not np.isnan(float(cvar_ratio)):
-                        mapping[tag].append(float(cvar_ratio))
+                    ratio = _finite_cvar_ratio(p)
+                    if ratio is not None:
+                        mapping[tag].append(ratio)
             return mapping
 
         tag_to_cvar = _collect_cvar_by_tag(self._population)
@@ -461,7 +552,9 @@ class Reporter:
 
         valid_tags = list(tag_to_cvar.keys())
         if not valid_tags:
-            raise ValueError("No portfolios with matching tags found in population.")
+            raise ValueError(
+                "No portfolios with finite CVaR ratio and matching tags found in population."
+            )
 
         def safe_median(tag: str) -> float:
             cvar_ratios = tag_to_cvar[tag]
@@ -498,9 +591,9 @@ class Reporter:
                     "sortino": _get_portfolio_metric(
                         p, "annualized_sortino_ratio", "sortino_ratio"
                     ),
-                    "cvar": getattr(p, "cvar", None),
-                    "max_drawdown": getattr(p, "max_drawdown", None),
-                    "cvar_ratio": getattr(p, "cvar_ratio", None),
+                    "cvar": _safe_getattr(p, "cvar"),
+                    "max_drawdown": _safe_getattr(p, "max_drawdown"),
+                    "cvar_ratio": _safe_getattr(p, "cvar_ratio"),
                     "mean_return": _get_portfolio_metric(p, "annualized_mean", "mean"),
                 }
             )
