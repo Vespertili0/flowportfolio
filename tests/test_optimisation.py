@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import math
 import warnings
 
 import numpy as np
@@ -183,9 +184,9 @@ def test_grid_search_cv_sanitizes_degenerate_cvar_zero_and_sharpe_inf_folds() ->
     # Fold 0 alt: strictly positive constant returns -> raw Sharpe = +inf, raw CVaR ratio = -1.0
     X_pos_const = pd.DataFrame(
         {
-            "A": [0.005] * 20,
+            "A": [0.002] * 20,
             "B": [0.002] * 20,
-            "C": [0.001] * 20,
+            "C": [0.002] * 20,
         }
     )
     # Fold 0 alt: all zeros -> raw CVaR ratio = NaN, raw Sharpe = NaN
@@ -276,7 +277,7 @@ def test_make_safe_scorer_stateless_helper() -> None:
     X_vol = _sample_returns(n_obs=30, seed=99)
     assert safe_cvar(m, X_vol) == pytest.approx(raw_cvar(m, X_vol), rel=0, abs=1e-15)
 
-    # Zero-loss fold with CVaR <= 0: finite positive pred.mean, no warnings
+    # Zero-loss fold with CVaR <= 0: finite positive ratio-unit score (not raw daily mean ~0.004), no warnings
     X_cvar0 = pd.DataFrame(
         {
             "A": [0.005] * 19 + [0.0],
@@ -284,20 +285,21 @@ def test_make_safe_scorer_stateless_helper() -> None:
             "C": [0.001] * 19 + [0.0],
         }
     )
-    expected_mean = float(m.predict(X_cvar0).mean)
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
         s_cvar = safe_cvar(m, X_cvar0)
     assert [x for x in w if issubclass(x.category, RuntimeWarning)] == []
-    assert s_cvar == pytest.approx(expected_mean, rel=0, abs=1e-15)
+    assert math.isfinite(s_cvar)
+    assert s_cvar > float(m.predict(X_cvar0).mean) * 10.0
 
-    # Constant positive fold with Sharpe = +inf: finite positive pred.mean, no warnings
+    # Constant positive fold with Sharpe = +inf: finite positive ratio-unit score, no warnings
     X_pos = pd.DataFrame({"A": [0.005] * 20, "B": [0.002] * 20, "C": [0.001] * 20})
     with warnings.catch_warnings(record=True) as w2:
         warnings.simplefilter("always")
         s_sh = safe_sharpe(m, X_pos)
     assert [x for x in w2 if issubclass(x.category, RuntimeWarning)] == []
-    assert s_sh == pytest.approx(float(m.predict(X_pos).mean), rel=0, abs=1e-15)
+    assert math.isfinite(s_sh)
+    assert s_sh > float(m.predict(X_pos).mean) * 10.0
 
     # All-zero fold: 0.0, no warnings
     X_zero = pd.DataFrame({"A": [0.0] * 20, "B": [0.0] * 20, "C": [0.0] * 20})
@@ -312,6 +314,44 @@ def test_make_safe_scorer_stateless_helper() -> None:
     safe_inf = _make_safe_scorer(lambda est, X: float("inf"))
     assert safe_nan(m, X_vol) == 0.0
     assert safe_inf(m, X_vol) == 0.0
+
+
+def test_safe_scorer_negative_cvar_all_gains_fold_outranks_normal_fold() -> None:
+    """P2-1: All-positive-gains folds (negative CVaR) must score in ratio units and outrank modest losing-tail folds."""
+    from flowportfolio.core.optimisation import _make_safe_scorer
+
+    rng = np.random.default_rng(42)
+    X_train = _sample_returns(n_obs=60, seed=11)
+    m = MeanRisk().fit(X_train)
+    safe_cvar = _make_safe_scorer(make_scorer(RatioMeasure.CVAR_RATIO))
+
+    # All-positive gains fold -> CVaR < 0 (raw cvar_ratio would be negative!)
+    X_all_gains = pd.DataFrame(
+        {
+            "A": rng.uniform(0.0005, 0.0035, 25),
+            "B": rng.uniform(0.0005, 0.0035, 25),
+            "C": rng.uniform(0.0005, 0.0035, 25),
+        }
+    )
+    assert float(m.predict(X_all_gains).cvar) < 0.0
+
+    # Modest normal fold with positive CVaR > 0 and finite positive cvar_ratio (~0.10)
+    X_modest = pd.DataFrame(
+        {
+            "A": rng.normal(0.001, 0.01, 25),
+            "B": rng.normal(0.001, 0.01, 25),
+            "C": rng.normal(0.001, 0.01, 25),
+        }
+    )
+    normal_score = safe_cvar(m, X_modest)
+    all_gains_score = safe_cvar(m, X_all_gains)
+
+    assert normal_score > 0.0
+    assert all_gains_score > normal_score
+
+    # Strictly higher-mean all-positive fold (same dispersion) must score higher
+    X_higher_gains = X_all_gains + 0.002
+    assert safe_cvar(m, X_higher_gains) > all_gains_score
 
 
 def test_set_previous_weights_chain_mock_free_cycle_safe_and_defensive_copy() -> None:

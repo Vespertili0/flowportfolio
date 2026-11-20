@@ -12,6 +12,7 @@ from sklearn.model_selection import GridSearchCV
 from sklearn.pipeline import Pipeline
 
 _RISK_DENOM_EPS: float = 1e-12
+_RATIO_RISK_FLOOR: float = 1e-4
 _RATIO_RISK_ATTRS: dict[str, str] = {
     "CVaR Ratio": "cvar",
     "CDaR Ratio": "cdar",
@@ -61,16 +62,34 @@ class _SafeScorer:
         self.scoring = scoring
 
     @staticmethod
-    def _degenerate_fallback(pred: Any) -> float:
-        mean_val = getattr(pred, "mean", None)
-        if mean_val is not None:
-            try:
-                m = float(mean_val)
-                if math.isfinite(m):
-                    return m
-            except (TypeError, ValueError):
-                pass
-        return 0.0
+    def _read_finite_float(
+        obj: Any, attr: str, *, default: float | None = 0.0
+    ) -> float | None:
+        raw = getattr(obj, attr, None)
+        if raw is None:
+            return default
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            return default
+        return val if math.isfinite(val) else default
+
+    @classmethod
+    def _risk_is_degenerate(cls, pred: Any, risk_attr: str) -> bool:
+        if getattr(pred, risk_attr, None) is None:
+            return False
+        risk = cls._read_finite_float(pred, risk_attr, default=None)
+        return risk is None or risk <= _RISK_DENOM_EPS
+
+    @classmethod
+    def _degenerate_fallback(cls, pred: Any) -> float:
+        """Score zero-/negative-risk folds in dimensionless ratio units."""
+        m = cls._read_finite_float(pred, "mean", default=None)
+        if m is None:
+            return 0.0
+        rfr = cls._read_finite_float(pred, "risk_free_rate", default=0.0) or 0.0
+        std = cls._read_finite_float(pred, "standard_deviation", default=0.0) or 0.0
+        return (m - rfr) / max(max(std, 0.0), _RATIO_RISK_FLOOR)
 
     def _eval_raw(self, estimator: Any, X: Any, y: Any) -> float:
         if self.scoring is None:
@@ -83,32 +102,29 @@ class _SafeScorer:
             else float(self.scoring(estimator, X, y))
         )
 
+    def _eval_ratio_with_fallback(
+        self, estimator: Any, X: Any, y: Any, risk_attr: str
+    ) -> float:
+        pred = estimator.predict(X) if hasattr(estimator, "predict") else None
+        if pred is not None and self._risk_is_degenerate(pred, risk_attr):
+            return self._degenerate_fallback(pred)
+        raw = self._eval_raw(estimator, X, y)
+        if math.isfinite(raw):
+            return raw
+        return self._degenerate_fallback(pred) if pred is not None else 0.0
+
     def __call__(self, estimator: Any, X: Any, y: Any = None) -> float:
         with np.errstate(divide="ignore", invalid="ignore"):
             if self.scoring is None:
-                pred = estimator.predict(X) if hasattr(estimator, "predict") else None
-                raw = self._eval_raw(estimator, X, y)
-                if math.isfinite(raw):
-                    return raw
-                return self._degenerate_fallback(pred) if pred is not None else 0.0
+                return self._eval_ratio_with_fallback(
+                    estimator, X, y, "standard_deviation"
+                )
 
             score_func = getattr(self.scoring, "_score_func", None)
             score_name = getattr(score_func, "__name__", "")
             risk_attr = _RATIO_RISK_ATTRS.get(score_name)
             if risk_attr is not None and hasattr(estimator, "predict"):
-                pred = estimator.predict(X)
-                risk_val = getattr(pred, risk_attr, None)
-                if risk_val is not None:
-                    try:
-                        r = float(risk_val)
-                    except (TypeError, ValueError):
-                        r = float("nan")
-                    if not math.isfinite(r) or r <= _RISK_DENOM_EPS:
-                        return self._degenerate_fallback(pred)
-                raw = self._eval_raw(estimator, X, y)
-                if math.isfinite(raw):
-                    return raw
-                return self._degenerate_fallback(pred)
+                return self._eval_ratio_with_fallback(estimator, X, y, risk_attr)
 
             raw = self._eval_raw(estimator, X, y)
             return raw if math.isfinite(raw) else 0.0

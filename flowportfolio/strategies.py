@@ -222,13 +222,10 @@ def _resolve_fee_vector(
                 [float(management_fees.get(str(c), 0.0)) for c in feature_names],
                 dtype=float,
             )
-        if len(management_fees) != n_assets:
-            raise ValueError(
-                f"management_fees dict length ({len(management_fees)}) does not match "
-                f"number of columns in X ({n_assets}). Pass a DataFrame or a "
-                "management_fees mapping matching X's column count."
-            )
-        return np.array([float(v) for v in management_fees.values()], dtype=float)
+        raise ValueError(
+            "management_fees dict requires a pandas DataFrame or fitted feature names "
+            "to align per-asset fees unambiguously without guessing column order."
+        )
     arr = np.asarray(management_fees, dtype=float)
     if arr.ndim != 1 or len(arr) != n_assets:
         raise ValueError(

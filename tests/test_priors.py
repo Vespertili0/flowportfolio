@@ -739,3 +739,44 @@ def test_build_synthetic_prior_deterministic_validation_and_unseeded_warning(
         p_unseeded = synth.build_synthetic_prior(n_samples=150, random_state=None)
     assert isinstance(p_unseeded, SyntheticData)
     assert any("non-deterministic" in rec.message for rec in caplog.records)
+
+
+def test_nested_prior_excess_return_detection_prevents_double_counting(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """P2-9a: _prior_uses_excess_returns recursively detects nested EquilibriumMu priors."""
+    from skfolio.moments import EmpiricalMu, EquilibriumMu
+    from skfolio.prior import EmpiricalPrior, EntropyPooling
+
+    from flowportfolio.priors import _prior_uses_excess_returns
+
+    nested_excess = EntropyPooling(
+        prior_estimator=EmpiricalPrior(mu_estimator=EquilibriumMu())
+    )
+    nested_total = EntropyPooling(
+        prior_estimator=EmpiricalPrior(mu_estimator=EmpiricalMu())
+    )
+    ep_default = EntropyPooling()
+    nested_bl = BlackLitterman(
+        prior_estimator=EmpiricalPrior(mu_estimator=EquilibriumMu()),
+        views=["WIN == 0.0004"],
+    )
+
+    assert _prior_uses_excess_returns(None) is True
+    assert _prior_uses_excess_returns(nested_excess) is True
+    assert _prior_uses_excess_returns(nested_total) is False
+    assert _prior_uses_excess_returns(ep_default) is False
+    # Nested BlackLitterman already converts excess -> total via its own risk_free_rate
+    assert _prior_uses_excess_returns(nested_bl) is False
+
+    u = _o2_universe(n_obs=60)
+    synth = PriorSynthesiser(u)
+    synth.add_market_view("WIN == 0.1008", confidence=1.0)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="flowportfolio.priors"):
+        bl = synth.build_black_litterman_prior(
+            risk_free_rate=0.0504,
+            prior_estimator=nested_excess,
+        )
+    assert bl.risk_free_rate == pytest.approx(0.0504 / 252.0, abs=1e-12)
+    assert not any("double-counting" in rec.message for rec in caplog.records)

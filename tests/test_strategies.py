@@ -607,7 +607,12 @@ def test_build_pipeline_wraps_pre_selection_for_fee_and_cost_dicts() -> None:
 
 
 def test_fee_aware_nco_ndarray_fit_predict_parity_and_validation() -> None:
-    """F-07: _FeeAwareNCO handles np.ndarray consistently with DataFrame and validates lengths."""
+    """F-07 & P2-9b: _FeeAwareNCO rejects ambiguous dict fees on raw ndarray, matches positional array fees, and preserves fitted DataFrame feature names."""
+    from skfolio.cluster import HierarchicalClustering, LinkageMethod
+    from skfolio.distance import PearsonDistance
+
+    from flowportfolio.strategies import _FeeAwareNCO
+
     X_df = _correlated_core_returns(n_obs=120)
     X_arr = X_df.to_numpy()
     fees = {
@@ -617,10 +622,17 @@ def test_fee_aware_nco_ndarray_fit_predict_parity_and_validation() -> None:
         "S1": 0.0003,
         "S2": 0.0005,
     }
-    builder = StrategyBuilder(constraints=ConstraintSpec(management_fees=fees))
+    fee_arr = np.array([fees[c] for c in X_df.columns], dtype=float)
+    builder_dict = StrategyBuilder(constraints=ConstraintSpec(management_fees=fees))
 
-    nco_df = builder.build_nco(MeanRisk(), MeanRisk(), clusterer="ward")
-    nco_arr = builder.build_nco(MeanRisk(), MeanRisk(), clusterer="ward")
+    nco_df = builder_dict.build_nco(MeanRisk(), MeanRisk(), clusterer="ward")
+    nco_arr = _FeeAwareNCO(
+        inner_estimator=MeanRisk(),
+        outer_estimator=MeanRisk(),
+        distance_estimator=PearsonDistance(),
+        clustering_estimator=HierarchicalClustering(linkage_method=LinkageMethod.WARD),
+        portfolio_params={"management_fees": fee_arr},
+    )
 
     nco_df.fit(X_df)
     nco_arr.fit(X_arr)
@@ -636,9 +648,18 @@ def test_fee_aware_nco_ndarray_fit_predict_parity_and_validation() -> None:
         port_df_on_arr.returns, port_df.returns, rtol=0, atol=1e-6
     )
 
-    # Mismatched fee dict width vs ndarray columns raises ValueError
+    # Raw unlabeled ndarray with dict management_fees must fail instead of guessing insertion order
+    nco_dict_raw = builder_dict.build_nco(MeanRisk(), MeanRisk(), clusterer="ward")
+    with pytest.raises(ValueError, match="DataFrame|feature names"):
+        nco_dict_raw.fit(X_arr)
+
+    # Mismatched fee array width vs ndarray columns raises ValueError
     bad_arr = X_arr[:, :3]
-    nco_bad = builder.build_nco(MeanRisk(), MeanRisk(), clusterer="ward")
+    nco_bad = _FeeAwareNCO(
+        inner_estimator=MeanRisk(),
+        outer_estimator=MeanRisk(),
+        portfolio_params={"management_fees": fee_arr},
+    )
     with pytest.raises(ValueError, match="management_fees"):
         nco_bad.fit(bad_arr)
 
@@ -694,15 +715,21 @@ def test_subtract_management_fees_stateless_helper() -> None:
     # Original DataFrame must remain unmutated
     assert df["A"].iloc[0] == 0.01
 
-    arr_net = _subtract_management_fees(df.to_numpy(), fees)
+    arr_net = _subtract_management_fees(df.to_numpy(), fees, feature_names=["A", "B"])
     assert isinstance(arr_net, np.ndarray)
     np.testing.assert_allclose(arr_net, df_net.to_numpy(), atol=1e-15)
+
+    arr_pos = _subtract_management_fees(df.to_numpy(), np.array([0.001, 0.002]))
+    np.testing.assert_allclose(arr_pos, df_net.to_numpy(), atol=1e-15)
 
     scalar_net = _subtract_management_fees(df.to_numpy(), 0.001)
     np.testing.assert_allclose(scalar_net, df.to_numpy() - 0.001, atol=1e-15)
 
     with pytest.raises(ValueError, match="management_fees"):
-        _subtract_management_fees(np.zeros((5, 3)), fees)
+        _subtract_management_fees(df.to_numpy(), fees)
+
+    with pytest.raises(ValueError, match="management_fees"):
+        _subtract_management_fees(np.zeros((5, 3)), np.array([0.001, 0.002]))
 
 
 def test_build_nco_kmeans_deterministic_default_and_adaptive_metadata() -> None:

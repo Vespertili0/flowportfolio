@@ -248,12 +248,30 @@ def _compute_group_divisors(
     return {g: n for g, n in counts.items() if n > 1 and g not in valid_tickers}
 
 
-def _prior_uses_excess_returns(prior_estimator: BasePrior | None) -> bool:
+def _prior_uses_excess_returns(
+    prior_estimator: BasePrior | None,
+    _visited: set[int] | None = None,
+) -> bool:
     """Return True if prior_estimator estimates excess returns (skfolio EquilibriumMu convention)."""
     if prior_estimator is None:
         return True
+    visited = _visited if _visited is not None else set()
+    obj_id = id(prior_estimator)
+    if obj_id in visited:
+        return False
+    visited.add(obj_id)
+
+    if isinstance(prior_estimator, BlackLitterman):
+        return False
+
     mu_est = getattr(prior_estimator, "mu_estimator", None)
-    return isinstance(mu_est, EquilibriumMu)
+    if mu_est is not None:
+        return isinstance(mu_est, EquilibriumMu)
+
+    nested_prior = getattr(prior_estimator, "prior_estimator", None)
+    if nested_prior is not None:
+        return _prior_uses_excess_returns(nested_prior, _visited=visited)
+    return False
 
 
 def _format_bl_equality_view(
