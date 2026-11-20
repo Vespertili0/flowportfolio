@@ -503,3 +503,95 @@ def test_persistence_module_free_of_mock_name_and_slots_monkey_patch() -> None:
     source = inspect.getsource(persistence_module)
     assert "_mock_name" not in source
     assert "latest_weights_dict" not in source
+
+
+# ---------------------------------------------------------------------------
+# Cycle 16 (P2-3, P2-4, P2-5): Reserved Columns, Collision-Free Exports & UTC
+# ---------------------------------------------------------------------------
+
+
+def test_calculate_trajectory_history_preserves_reserved_metadata_columns_on_ticker_collision(
+    manager: PersistenceManager, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """P2-3: Tickers named 'tag', 'portfolio_name', or 'timestamp' must not overwrite trajectory metadata."""
+    import logging
+
+    snapshot = {
+        "timestamp": "2026-01-01T00:00:00+00:00",
+        "portfolios": [
+            {
+                "name": "StratOne",
+                "tag": "S1",
+                "weights": {
+                    "AAPL": 0.25,
+                    "tag": 0.25,
+                    "portfolio_name": 0.25,
+                    "timestamp": 0.25,
+                },
+            }
+        ],
+    }
+    (tmp_path / "rebalance_2026_W01.json").write_text(
+        json.dumps(snapshot), encoding="utf-8"
+    )
+
+    with caplog.at_level(logging.WARNING, logger="flowportfolio.persistence"):
+        df = manager.calculate_trajectory_history(str(tmp_path))
+
+    assert isinstance(df.index, pd.DatetimeIndex)
+    assert df.index[0] == pd.Timestamp("2026-01-01T00:00:00+00:00")
+    assert df["portfolio_name"].iloc[0] == "StratOne"
+    assert df["tag"].iloc[0] == "S1"
+    assert df["AAPL"].iloc[0] == pytest.approx(0.25)
+    assert df["weight_tag"].iloc[0] == pytest.approx(0.25)
+    assert df["weight_portfolio_name"].iloc[0] == pytest.approx(0.25)
+    assert df["weight_timestamp"].iloc[0] == pytest.approx(0.25)
+    assert any("reserved" in rec.message.lower() for rec in caplog.records)
+
+
+def test_export_gitops_artifact_same_second_exports_do_not_collide(
+    manager: PersistenceManager,
+    dummy_population: Population,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P2-4: Back-to-back default exports within the same second/timestamp must produce distinct files."""
+    frozen = datetime(2026, 8, 12, 10, 15, 0, 123456, tzinfo=UTC)
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            return frozen
+
+    monkeypatch.setattr(persistence_module, "datetime", _FrozenDatetime)
+
+    path1 = Path(manager.export_gitops_artifact(dummy_population, str(tmp_path)))
+    path2 = Path(manager.export_gitops_artifact(dummy_population, str(tmp_path)))
+
+    assert path1 != path2
+    assert path1.exists() and path2.exists()
+    assert len(list(tmp_path.glob("rebalance_*.json"))) == 2
+
+    df = manager.calculate_trajectory_history(str(tmp_path))
+    assert len(df) == 4  # 2 snapshots x 2 portfolios
+
+
+@pytest.mark.parametrize(
+    "naive_ts",
+    ["2026-01-01T09:00:00", "2026-01-01 09:00:00.123456", "2026-01-01"],
+)
+def test_calculate_trajectory_history_rejects_timezone_naive_timestamps(
+    manager: PersistenceManager, tmp_path: Path, naive_ts: str
+) -> None:
+    """P2-5: Naive timestamps without 'Z' or UTC offset must raise ValueError instead of assuming UTC."""
+    (tmp_path / "rebalance_2026_W01.json").write_text(
+        json.dumps(
+            {
+                "timestamp": naive_ts,
+                "portfolios": [{"name": "p1", "tag": "S1", "weights": {"A": 1.0}}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="timezone|naive|UTC"):
+        manager.calculate_trajectory_history(str(tmp_path))

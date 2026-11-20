@@ -6,6 +6,7 @@ import math
 import numbers
 import os
 import tempfile
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,57 @@ from skfolio import Population
 from flowportfolio.core.experiment import ExperimentResult
 
 logger = logging.getLogger(__name__)
+
+_TRAJECTORY_RESERVED_COLS: frozenset[str] = frozenset(
+    {"timestamp", "portfolio_name", "tag"}
+)
+
+
+def _validate_tz_aware_iso_timestamp(timestamp_str: str, source_file: Path) -> str:
+    """Ensure ISO-8601 timestamp includes explicit timezone/UTC info (reject naive)."""
+    stripped = timestamp_str.strip()
+    try:
+        dt = datetime.fromisoformat(stripped)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid ISO-8601 timestamp in snapshot file '{source_file}': {exc}"
+        ) from exc
+    if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
+        raise ValueError(
+            f"Timezone-naive timestamp is not allowed (explicit 'Z' or UTC offset required) "
+            f"in snapshot file '{source_file}': {stripped!r}"
+        )
+    return stripped
+
+
+def _build_trajectory_record(
+    ts: pd.Timestamp,
+    p_data: dict[str, Any],
+    warned_collisions: set[str],
+) -> dict[str, Any]:
+    """Build a single trajectory row while namespacing reserved-column ticker collisions."""
+    record: dict[str, Any] = {
+        "timestamp": ts,
+        "portfolio_name": p_data.get("name"),
+        "tag": p_data.get("tag"),
+    }
+    weights = p_data.get("weights")
+    if isinstance(weights, dict):
+        for key, val in weights.items():
+            col_name = str(key)
+            if col_name in _TRAJECTORY_RESERVED_COLS:
+                safe_col = f"weight_{col_name}"
+                if col_name not in warned_collisions:
+                    logger.warning(
+                        "Weight ticker '%s' collides with reserved trajectory "
+                        "metadata column; storing under '%s'.",
+                        col_name,
+                        safe_col,
+                    )
+                    warned_collisions.add(col_name)
+                col_name = safe_col
+            record[col_name] = val
+    return record
 
 
 def _unpack_population_and_live_weights(
@@ -266,10 +318,11 @@ class PersistenceManager:
     ) -> str:
         """Export a Git-Ops artifact for the portfolio population.
 
-        Generates a structured filename using the current ISO week (e.g.,
-        ``rebalance_2026_W33_20260812_101500.json``) unless a label is provided.
-        Saves the snapshot using :meth:`save_snapshot` and returns the absolute
-        path.
+        Generates a structured collision-resistant filename using the current
+        ISO week, UTC microsecond timestamp, and short random suffix (e.g.,
+        ``rebalance_2026_W33_20260812_101500_123456_a1b2c3.json``) unless a
+        label is provided. Saves the snapshot using :meth:`save_snapshot` and
+        returns the absolute path.
 
         Raises
         ------
@@ -299,8 +352,9 @@ class PersistenceManager:
         else:
             now = datetime.now(UTC)
             year, week, _ = now.isocalendar()
-            ts = now.strftime("%Y%m%d_%H%M%S")
-            filename = f"rebalance_{year}_W{week:02d}_{ts}.json"
+            ts = now.strftime("%Y%m%d_%H%M%S_%f")
+            suffix = uuid.uuid4().hex[:6]
+            filename = f"rebalance_{year}_W{week:02d}_{ts}_{suffix}.json"
 
         export_path = Path(export_dir) / filename
         resolved_export = self._validate_path(
@@ -323,8 +377,9 @@ class PersistenceManager:
         Scans all ``.json`` files in ``snapshot_dir`` matching the
         ``rebalance_*.json`` pattern (or ``*.json`` if
         ``include_custom_labels=True``), parses all timestamps strictly via
-        ISO-8601 UTC, and fills schema-evolved absent ticker weights with
-        explicit ``0.0``.
+        timezone-aware ISO-8601 UTC (rejecting naive timestamps), namespaces any
+        ticker weight key that collides with reserved metadata columns, and
+        fills schema-evolved absent ticker weights with explicit ``0.0``.
 
         Returns
         -------
@@ -336,8 +391,8 @@ class PersistenceManager:
         ------
         ValueError
             If path traversal / symlink escape is detected, if no matching
-            snapshot files are found, or if any snapshot has a missing or
-            unparseable ISO-8601 timestamp.
+            snapshot files are found, or if any snapshot has a missing,
+            timezone-naive, or unparseable ISO-8601 timestamp.
         FileNotFoundError
             If ``snapshot_dir`` does not exist.
         """
@@ -369,8 +424,9 @@ class PersistenceManager:
                 raise ValueError(
                     f"Missing or non-string timestamp in snapshot file: {file}"
                 )
+            validated_ts = _validate_tz_aware_iso_timestamp(timestamp_str, file)
             valid_files_data.append((file, data))
-            timestamps_to_parse.append(timestamp_str.strip())
+            timestamps_to_parse.append(validated_ts)
 
         try:
             parsed_index = pd.to_datetime(
@@ -382,20 +438,13 @@ class PersistenceManager:
             ) from e
 
         records: list[dict[str, Any]] = []
+        warned_collisions: set[str] = set()
         for (_file, data), ts in zip(valid_files_data, parsed_index, strict=True):
             portfolios = data.get("portfolios") or []
             for p_data in portfolios:
                 if not isinstance(p_data, dict):
                     continue
-                record: dict[str, Any] = {
-                    "timestamp": ts,
-                    "portfolio_name": p_data.get("name"),
-                    "tag": p_data.get("tag"),
-                }
-                weights = p_data.get("weights")
-                if isinstance(weights, dict):
-                    record.update(weights)
-                records.append(record)
+                records.append(_build_trajectory_record(ts, p_data, warned_collisions))
 
         if not records:
             return pd.DataFrame(
@@ -405,9 +454,7 @@ class PersistenceManager:
 
         df = pd.DataFrame(records)
         ticker_cols = [
-            col
-            for col in df.columns
-            if col not in ("timestamp", "portfolio_name", "tag")
+            col for col in df.columns if col not in _TRAJECTORY_RESERVED_COLS
         ]
         if ticker_cols:
             df[ticker_cols] = df[ticker_cols].fillna(0.0)
