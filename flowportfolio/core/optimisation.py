@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -171,12 +172,46 @@ def set_previous_weights_chain(
         set_previous_weights_chain(fallback, weights, visited)
 
 
+def _has_max_turnover_chain(opt: Any, _visited: set[int] | None = None) -> bool:
+    """Return True if ``opt``, its Pipeline steps, or any fallback configures ``max_turnover``."""
+    if opt is None:
+        return False
+    visited = _visited if _visited is not None else set()
+    if id(opt) in visited:
+        return False
+    visited.add(id(opt))
+
+    if isinstance(opt, Pipeline):
+        return any(
+            _has_max_turnover_chain(step, _visited=visited) for _, step in opt.steps
+        )
+    if getattr(opt, "max_turnover", None) is not None:
+        return True
+    fallback = getattr(opt, "fallback", None)
+    return (
+        _has_max_turnover_chain(fallback, _visited=visited)
+        if fallback is not None
+        else False
+    )
+
+
+def _neutral_equal_previous_weights(X: Any) -> Any:
+    """Build equal-weight baseline matching ``X`` columns to keep constrained inner CV feasible."""
+    if isinstance(X, pd.DataFrame) and X.shape[1] > 0:
+        w = 1.0 / float(X.shape[1])
+        return {str(col): w for col in X.columns}
+    if hasattr(X, "shape") and len(X.shape) > 1 and X.shape[1] > 0:
+        w = 1.0 / float(X.shape[1])
+        return np.full(X.shape[1], w, dtype=float)
+    return None
+
+
 class SkfolioGridSearchCV(BaseOptimization, GridSearchCV):
     """A wrapper for GridSearchCV that conforms to skfolio's BaseOptimization API.
 
     This ensures that when skfolio's cross_val_predict uses this search object,
     it exposes weights_ and predict correctly as an optimization estimator,
-    evaluates inner CV folds under the same ``previous_weights`` prior used for
+    isolates inner CV folds from future outer-terminal ``previous_weights`` when
     refitting, and sanitizes degenerate zero-risk ratio fold scores.
     """
 
@@ -195,6 +230,7 @@ class SkfolioGridSearchCV(BaseOptimization, GridSearchCV):
         return_train_score: bool = False,
         previous_weights: Any = None,
         portfolio_params: dict[str, Any] | None = None,
+        isolate_inner_previous_weights: bool = True,
         **kwargs: Any,
     ):
         GridSearchCV.__init__(
@@ -214,6 +250,7 @@ class SkfolioGridSearchCV(BaseOptimization, GridSearchCV):
         BaseOptimization.__init__(self, portfolio_params=portfolio_params)
         self.portfolio_params: dict[str, Any] | None = portfolio_params
         self.previous_weights = previous_weights
+        self.isolate_inner_previous_weights = isolate_inner_previous_weights
 
     def _get_target_optimizer(self, est: Any) -> Any:
         """Return the terminal optimiser of a Pipeline, or ``est`` itself."""
@@ -288,15 +325,30 @@ class SkfolioGridSearchCV(BaseOptimization, GridSearchCV):
     def fit(self, X: Any, y: Any = None, **fit_params: Any) -> SkfolioGridSearchCV:
         est_clone = clone(self.estimator) if self.estimator is not None else None
         effective_pw = _normalize_previous_weights(self.previous_weights, X)
-        if effective_pw is not None and est_clone is not None:
-            set_previous_weights_chain(est_clone, effective_pw)
+        safe_scorer = _make_safe_scorer(self.scoring)
+
+        if self.isolate_inner_previous_weights and est_clone is not None:
+            # Inner CV evaluates historical sub-windows using a causal neutral
+            # baseline so drifted terminal previous_weights (t_1) never leak into
+            # earlier inner folds; effective_pw is restored only on full-window refit.
+            inner_pw = (
+                _neutral_equal_previous_weights(X)
+                if _has_max_turnover_chain(est_clone)
+                else None
+            )
+            set_previous_weights_chain(est_clone, inner_pw)
+            run_delegate_refit = self.refit if isinstance(self.refit, str) else False
+        else:
+            if effective_pw is not None and est_clone is not None:
+                set_previous_weights_chain(est_clone, effective_pw)
+            run_delegate_refit = self.refit
 
         delegate = GridSearchCV(
             estimator=est_clone,
             param_grid=self.param_grid,
-            scoring=_make_safe_scorer(self.scoring),
+            scoring=safe_scorer,
             n_jobs=self.n_jobs,
-            refit=self.refit,
+            refit=run_delegate_refit,
             cv=self.cv,
             verbose=self.verbose,
             pre_dispatch=self.pre_dispatch,
@@ -305,6 +357,33 @@ class SkfolioGridSearchCV(BaseOptimization, GridSearchCV):
         )
         delegate.fit(X, y, **fit_params)
         _copy_fitted_attrs(delegate, self)
+
+        if self.isolate_inner_previous_weights and self.estimator is not None:
+            should_refit = False
+            if self.refit is True or callable(self.refit):
+                best_idx = (
+                    int(self.refit(delegate.cv_results_))
+                    if callable(self.refit)
+                    else int(np.argmin(delegate.cv_results_["rank_test_score"]))
+                )
+                self.best_index_ = best_idx
+                self.best_params_ = dict(delegate.cv_results_["params"][best_idx])
+                if "mean_test_score" in delegate.cv_results_:
+                    self.best_score_ = float(
+                        delegate.cv_results_["mean_test_score"][best_idx]
+                    )
+                should_refit = True
+            elif isinstance(self.refit, str) and hasattr(self, "best_params_"):
+                should_refit = True
+
+            if should_refit:
+                refit_est = clone(self.estimator).set_params(**self.best_params_)
+                if effective_pw is not None:
+                    set_previous_weights_chain(refit_est, effective_pw)
+                refit_start = time.perf_counter()
+                refit_est.fit(X, y, **fit_params)
+                self.refit_time_ = time.perf_counter() - refit_start
+                self.best_estimator_ = refit_est
 
         if not hasattr(self, "best_estimator_"):
             return self

@@ -53,9 +53,10 @@ class _DropFirstColSelector(BaseEstimator, TransformerMixin):
 def test_grid_search_cv_uses_consistent_previous_weights_in_inner_cv_and_refit_without_mutating_estimator() -> (
     None
 ):
-    """F-02: Inner CV folds and refit must use the same previous_weights without mutating self.estimator."""
+    """Sprint 5 (#1): Inner CV isolates future previous_weights; final refit enforces caller previous_weights without mutating estimator."""
     X = _sample_returns(n_obs=90, seed=7)
     concentrated_pw = {"A": 0.90, "B": 0.05, "C": 0.05}
+    neutral_eq = {"A": 1.0 / 3.0, "B": 1.0 / 3.0, "C": 1.0 / 3.0}
     observed_pw: list[object] = []
 
     class _RecordingMeanRisk(MeanRisk):
@@ -67,6 +68,8 @@ def test_grid_search_cv_uses_consistent_previous_weights_in_inner_cv_and_refit_w
             )
             return super().fit(X, y=y, **fit_params)
 
+    # 1. With max_turnover active: inner folds run against equal-weight baseline (no future leakage),
+    # while final refit (5th call) receives concentrated_pw.
     orig_estimator = _RecordingMeanRisk(max_turnover=0.05)
     assert orig_estimator.previous_weights is None
 
@@ -79,19 +82,51 @@ def test_grid_search_cv_uses_consistent_previous_weights_in_inner_cv_and_refit_w
     )
     gscv.fit(X)
 
-    # 2 candidates x 2 inner folds + 1 final refit = 5 fits
+    # 2 candidates x 2 inner folds = 4 inner fits + 1 final refit = 5 fits
     assert len(observed_pw) == 5
-    assert all(pw == concentrated_pw for pw in observed_pw)
+    for inner_pw in observed_pw[:-1]:
+        assert isinstance(inner_pw, dict)
+        for col, val in neutral_eq.items():
+            assert inner_pw[col] == pytest.approx(val, abs=1e-12)
+    assert observed_pw[-1] == concentrated_pw
+    # Final fitted weights honor concentrated_pw max_turnover bound
+    assert abs(float(gscv.weights_[0]) - 0.90) <= 0.05 + 1e-6
+
     # Caller's estimator hyperparameter must remain unmutated
     assert orig_estimator.previous_weights is None
     assert gscv.estimator is orig_estimator
     assert gscv.estimator.previous_weights is None
 
+    # 2. Without max_turnover (transaction_costs only): inner folds run with previous_weights=None
+    observed_tc_pw: list[object] = []
+
+    class _RecordingTCMeanRisk(MeanRisk):
+        def fit(self, X, y=None, **fit_params):
+            observed_tc_pw.append(
+                dict(self.previous_weights)
+                if isinstance(self.previous_weights, dict)
+                else self.previous_weights
+            )
+            return super().fit(X, y=y, **fit_params)
+
+    gscv_tc = SkfolioGridSearchCV(
+        estimator=_RecordingTCMeanRisk(transaction_costs=0.001),
+        param_grid={"l2_coef": [0.0, 0.1]},
+        cv=WalkForward(train_size=40, test_size=25),
+        scoring=make_scorer(RatioMeasure.CVAR_RATIO),
+        previous_weights=concentrated_pw,
+    )
+    gscv_tc.fit(X)
+    assert len(observed_tc_pw) == 5
+    assert all(pw is None for pw in observed_tc_pw[:-1])
+    assert observed_tc_pw[-1] == concentrated_pw
+
 
 def test_grid_search_cv_scores_match_concentrated_turnover_regime_oracle() -> None:
-    """F-02 (O3_CLONE_TURNOVER): CV scores must match direct evaluation under concentrated previous_weights."""
+    """Sprint 5 (#1): Inner CV scores match neutral-baseline oracle while final refit enforces concentrated_pw."""
     X = _sample_returns(n_obs=100, seed=11)
     concentrated_pw = {"A": 0.90, "B": 0.05, "C": 0.05}
+    neutral_eq = {col: 1.0 / 3.0 for col in X.columns}
     cv = WalkForward(train_size=50, test_size=25)
     scorer = make_scorer(RatioMeasure.CVAR_RATIO)
     l2_grid = [0.0, 0.05, 0.5]
@@ -108,7 +143,7 @@ def test_grid_search_cv_scores_match_concentrated_turnover_regime_oracle() -> No
     )
     gscv.fit(X)
 
-    # Direct analytical oracle: score every fold under concentrated_pw
+    # Analytical oracle: inner folds evaluate under leak-free neutral baseline weights
     expected_means: list[float] = []
     for l2 in l2_grid:
         fold_scores = []
@@ -117,7 +152,7 @@ def test_grid_search_cv_scores_match_concentrated_turnover_regime_oracle() -> No
                 objective_function=ObjectiveFunction.MAXIMIZE_RETURN,
                 max_turnover=0.05,
                 l2_coef=l2,
-                previous_weights=dict(concentrated_pw),
+                previous_weights=dict(neutral_eq),
             )
             m.fit(X.iloc[train_idx])
             fold_scores.append(float(scorer(m, X.iloc[test_idx])))
@@ -129,6 +164,8 @@ def test_grid_search_cv_scores_match_concentrated_turnover_regime_oracle() -> No
         rtol=0,
         atol=1e-8,
     )
+    # Final refit on full X enforces concentrated_pw (NOT neutral_eq)
+    assert abs(float(gscv.weights_[0]) - 0.90) <= 0.05 + 1e-6
 
 
 def test_grid_search_cv_normalizes_array_previous_weights_for_preselection_pipeline() -> (

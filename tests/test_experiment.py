@@ -836,3 +836,253 @@ def test_default_n_jobs_with_friction_emits_no_skfolio_parallel_warning(
         and "Parallel processing has been disabled" in str(w.message)
     ]
     assert parallel_warns == []
+
+
+# ---------------------------------------------------------------------------
+# Cycle 18 (Sprint 5): #4, #6c, N1, N4, M1, M2
+# ---------------------------------------------------------------------------
+
+
+def test_run_online_evaluation_with_calendar_freq_scales_tc_and_succeeds() -> None:
+    """Sprint 5 (#4): run_online_evaluation with freq='ME' infers monthly test size, handles burn-in warmup, and scales tc."""
+    from skfolio.moments import EWCovariance, EWMu
+    from skfolio.prior import EmpiricalPrior
+
+    from flowportfolio.core.constraints import ConstraintBuilder
+    from flowportfolio.strategies import StrategyBuilder
+
+    rng = np.random.default_rng(104)
+    dates = pd.bdate_range("2022-01-03", periods=320)
+    rets = pd.DataFrame(
+        {
+            "A": rng.normal(0.0008, 0.01, len(dates)),
+            "B": rng.normal(0.0004, 0.01, len(dates)),
+            "C": rng.normal(0.0003, 0.01, len(dates)),
+        },
+        index=dates,
+    )
+    u = Universe(
+        ["A", "B", "C"],
+        {"A": "core", "B": "core", "C": "sat"},
+        {"A": 0.0, "B": 0.0, "C": 0.0},
+    )
+    u._returns = rets
+
+    raw_tc = 0.005
+    spec = ConstraintBuilder(u).transaction_costs(raw_tc).build()
+    pipe = (
+        StrategyBuilder(constraints=spec)
+        .set_optimizer(
+            MeanRisk(
+                prior_estimator=EmpiricalPrior(
+                    mu_estimator=EWMu(), covariance_estimator=EWCovariance()
+                )
+            )
+        )
+        .build_pipeline()
+    )
+
+    eng = PortfolioExperimentEngine(u, n_jobs=1)
+    eng.add_strategy("OnlineFreq", pipe, {"optimizer__l2_coef": [0.0, 0.01]})
+    result = eng.run_online_evaluation(
+        burn_in_size=150, test_size=1, freq="ME", return_result=True
+    )
+    mpp = result.population[0]
+    assert len(mpp.portfolios) >= 3
+    # Fold >= 1 transaction_costs must be amortized by ~21 trading days per month, NOT 1.0
+    sub_tc = mpp.portfolios[1].transaction_costs
+    assert isinstance(sub_tc, (int, float, np.ndarray))
+    assert float(np.mean(sub_tc)) < raw_tc / 10.0
+    assert result.live_weights["OnlineFreq"]
+
+
+def test_resolve_outer_train_size_and_randomised_with_freq_and_offset() -> None:
+    """Sprint 5 (#6c): _resolve_outer_train_size infers true fold lengths for WalkForward(freq) and DateOffset."""
+    from skfolio.model_selection import MultipleRandomizedCV, WalkForward
+
+    rng = np.random.default_rng(106)
+    dates = pd.bdate_range("2022-01-03", periods=360)
+    rets = pd.DataFrame(
+        rng.normal(0.0005, 0.01, (360, 4)),
+        index=dates,
+        columns=["A", "B", "C", "D"],
+    )
+    u = Universe(
+        ["A", "B", "C", "D"],
+        {"A": "core", "B": "core", "C": "sat", "D": "sat"},
+        {"A": 0.0, "B": 0.0, "C": 0.0, "D": 0.0},
+    )
+    u._returns = rets
+
+    wf_freq = WalkForward(train_size=6, test_size=1, freq="ME")
+    mrcv_freq = MultipleRandomizedCV(
+        walk_forward=wf_freq,
+        n_subsamples=2,
+        asset_subset_size=3,
+        window_size=220,
+        random_state=0,
+    )
+    tr_len_freq = PortfolioExperimentEngine._resolve_outer_train_size(
+        "randomised", mrcv_freq, {"walk_forward": wf_freq}, len(rets), rets
+    )
+    assert tr_len_freq > 100
+
+    wf_offset = WalkForward(train_size=pd.DateOffset(months=6), test_size=1, freq="ME")
+    mrcv_offset = MultipleRandomizedCV(
+        walk_forward=wf_offset,
+        n_subsamples=2,
+        asset_subset_size=3,
+        window_size=220,
+        random_state=0,
+    )
+    tr_len_offset = PortfolioExperimentEngine._resolve_outer_train_size(
+        "randomised", mrcv_offset, {"walk_forward": wf_offset}, len(rets), rets
+    )
+    assert 100 <= tr_len_offset < 200
+
+    eng = PortfolioExperimentEngine(u, n_jobs=1)
+    eng.add_strategy("RandFreq", MeanRisk(), {"l2_coef": [0.0, 0.01]})
+    pop = eng.run_robustness_test(
+        cv_type="randomised",
+        walk_forward=wf_freq,
+        n_subsamples=2,
+        asset_subset_size=3,
+        window_size=220,
+        random_state=0,
+    )
+    assert len(pop) == 2
+
+
+def test_randomised_cv_with_turnover_and_tc_neutralizes_fold0_and_avoids_infeasible() -> (
+    None
+):
+    """Sprint 5 (N1): MultipleRandomizedCV with asset_subset_size < N and max_turnover+tc must not fail or charge Fold 0."""
+    from skfolio.model_selection import WalkForward
+
+    from flowportfolio.core.constraints import ConstraintBuilder
+    from flowportfolio.strategies import StrategyBuilder
+
+    rng = np.random.default_rng(111)
+    dates = pd.bdate_range("2022-01-03", periods=320)
+    cols = ["A", "B", "C", "D", "E", "F"]
+    rets = pd.DataFrame(rng.normal(0.0005, 0.01, (320, 6)), index=dates, columns=cols)
+    u = Universe(
+        cols,
+        {c: "core" for c in cols},
+        {c: 0.0 for c in cols},
+    )
+    u._returns = rets
+
+    cw = {c: 1.0 / 6.0 for c in cols}
+    spec = ConstraintBuilder(u).max_turnover(0.05, cw).transaction_costs(0.005).build()
+    pipe = StrategyBuilder(constraints=spec).set_optimizer(MeanRisk()).build_pipeline()
+
+    eng = PortfolioExperimentEngine(u, n_jobs=1)
+    eng.add_strategy("RandFriction", pipe, {"optimizer__l2_coef": [0.0, 0.01]})
+    pop = eng.run_robustness_test(
+        cv_type="randomised",
+        walk_forward=WalkForward(train_size=120, test_size=30),
+        n_subsamples=2,
+        asset_subset_size=3,
+        window_size=220,
+        random_state=0,
+    )
+    assert len(pop) == 2
+    for mpp in pop:
+        assert float(mpp.portfolios[0].total_cost) == pytest.approx(0.0, abs=1e-12)
+
+
+def test_combinatorial_cv_with_transaction_costs_emits_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Sprint 5 (N4): CombinatorialPurgedCV with positive transaction_costs emits a clear warning."""
+    import logging
+
+    from flowportfolio.core.constraints import ConstraintBuilder
+    from flowportfolio.strategies import StrategyBuilder
+
+    rng = np.random.default_rng(114)
+    dates = pd.bdate_range("2022-01-03", periods=200)
+    rets = pd.DataFrame(
+        rng.normal(0.0005, 0.01, (200, 3)),
+        index=dates,
+        columns=["A", "B", "C"],
+    )
+    u = Universe(
+        ["A", "B", "C"],
+        {"A": "core", "B": "core", "C": "sat"},
+        {"A": 0.0, "B": 0.0, "C": 0.0},
+    )
+    u._returns = rets
+    spec = ConstraintBuilder(u).transaction_costs(0.005).build()
+    pipe = StrategyBuilder(constraints=spec).set_optimizer(MeanRisk()).build_pipeline()
+
+    eng = PortfolioExperimentEngine(u, n_jobs=1)
+    eng.add_strategy("CPCV_TC", pipe, {"optimizer__l2_coef": [0.0]})
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="flowportfolio.core.experiment"):
+        eng.run_robustness_test(cv_type="combinatorial", n_folds=4, n_test_folds=2)
+    assert any(
+        "combinatorial" in rec.message.lower()
+        and "transaction_costs" in rec.message.lower()
+        for rec in caplog.records
+    )
+
+
+def test_run_robustness_test_explicit_inner_cv_freq_without_sizes_succeeds(
+    stub_universe: Universe,
+) -> None:
+    """Sprint 5 (M1): inner_cv_kwargs={'freq': 'ME'} without train_size/test_size strips freq for row counts."""
+    eng = PortfolioExperimentEngine(stub_universe, n_jobs=1)
+    eng.add_strategy("MR", MeanRisk(), {"l2_coef": [0.0, 0.01]})
+    pop = eng.run_robustness_test(
+        cv_type="walk_forward",
+        train_size=80,
+        test_size=20,
+        inner_cv_kwargs={"freq": "ME"},
+    )
+    assert len(pop) == 1
+
+
+def test_online_evaluation_all_positive_returns_prefers_high_return_candidate() -> None:
+    """Sprint 5 (M2): OnlineGridSearch handles zero/negative CVaR folds without inverted ranking."""
+    from skfolio.moments import EWCovariance, EWMu
+    from skfolio.prior import EmpiricalPrior
+
+    rng = np.random.default_rng(121)
+    dates = pd.bdate_range("2023-01-02", periods=160)
+    # SAFE_GAIN has strictly positive returns (negative CVaR -> negative raw CVAR_RATIO!)
+    # NOISY_LOW has lower mean + small occasional loss (tiny positive CVaR -> huge positive raw CVAR_RATIO!)
+    rets = pd.DataFrame(
+        {
+            "SAFE_GAIN": rng.uniform(0.0020, 0.0040, 160),
+            "NOISY_LOW": rng.uniform(-0.0005, 0.0020, 160),
+        },
+        index=dates,
+    )
+    u = Universe(
+        ["SAFE_GAIN", "NOISY_LOW"],
+        {"SAFE_GAIN": "core", "NOISY_LOW": "core"},
+        {"SAFE_GAIN": 0.0, "NOISY_LOW": 0.0},
+    )
+    u._returns = rets
+    est = MeanRisk(
+        prior_estimator=EmpiricalPrior(
+            mu_estimator=EWMu(), covariance_estimator=EWCovariance()
+        )
+    )
+    eng = PortfolioExperimentEngine(u, n_jobs=1)
+    # Put NOISY_LOW option first so ties or inverted scores pick it
+    eng.add_strategy(
+        "PosOn",
+        est,
+        {
+            "min_weights": [
+                {"SAFE_GAIN": 0.0, "NOISY_LOW": 1.0},
+                {"SAFE_GAIN": 1.0, "NOISY_LOW": 0.0},
+            ]
+        },
+    )
+    res = eng.run_online_evaluation(burn_in_size=80, test_size=20, return_result=True)
+    # Strictly dominant SAFE_GAIN (positive returns in [0.2%, 0.4%]/day) must beat NOISY_LOW ([-0.05%, 0.2%]/day)
+    assert res.live_weights["PosOn"]["SAFE_GAIN"] >= 0.99

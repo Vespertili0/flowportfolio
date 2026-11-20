@@ -16,7 +16,7 @@ from typing import Any, Literal, TypedDict, overload
 import numpy as np
 import pandas as pd
 from skfolio import Population
-from skfolio.measures import RatioMeasure
+from skfolio.measures import PerfMeasure, RatioMeasure, RiskMeasure
 from skfolio.metrics import make_scorer
 from skfolio.model_selection import (
     CombinatorialPurgedCV,
@@ -37,6 +37,56 @@ from flowportfolio.core.optimisation import set_previous_weights_chain
 from flowportfolio.core.protocols import UniverseProtocol
 
 logger = logging.getLogger(__name__)
+
+_ONLINE_RISK_DENOM_EPS: float = 1e-12
+_ONLINE_RATIO_RISK_FLOOR: float = 1e-4
+_CALENDAR_FREQ_KWARGS: tuple[str, ...] = (
+    "freq",
+    "freq_offset",
+    "previous",
+    "reduce_test",
+)
+_ONLINE_SAFE_SCORING: dict[str, Any] = {
+    "cvar_ratio": RatioMeasure.CVAR_RATIO,
+    "sharpe_ratio": RatioMeasure.SHARPE_RATIO,
+    "mean": PerfMeasure.MEAN,
+    "std": RiskMeasure.STANDARD_DEVIATION,
+    "cvar": RiskMeasure.CVAR,
+}
+
+
+def _online_safe_refit(cv_results: dict[str, Any]) -> int:
+    """Select the best OnlineGridSearch candidate with ratio-unit fallback for CVaR <= 0."""
+    cvar_ratios = np.asarray(cv_results["mean_score_cvar_ratio"], dtype=float)
+    sharpe_ratios = np.asarray(cv_results["mean_score_sharpe_ratio"], dtype=float)
+    neg_cvars = np.asarray(cv_results["mean_score_cvar"], dtype=float)
+    means = np.asarray(cv_results["mean_score_mean"], dtype=float)
+    neg_stds = np.asarray(cv_results["mean_score_std"], dtype=float)
+
+    scores = np.full(len(cvar_ratios), -np.inf, dtype=float)
+    for idx in range(len(cvar_ratios)):
+        raw_cvar = (
+            -float(neg_cvars[idx]) if math.isfinite(float(neg_cvars[idx])) else 0.0
+        )
+        raw_ratio = float(cvar_ratios[idx])
+        if raw_cvar > _ONLINE_RISK_DENOM_EPS and math.isfinite(raw_ratio):
+            scores[idx] = raw_ratio
+        else:
+            raw_mean = float(means[idx]) if math.isfinite(float(means[idx])) else None
+            raw_std = (
+                max(-float(neg_stds[idx]), 0.0)
+                if math.isfinite(float(neg_stds[idx]))
+                else 0.0
+            )
+            raw_sharpe = float(sharpe_ratios[idx])
+            if raw_mean is not None:
+                excess_mean = (
+                    raw_sharpe * raw_std
+                    if (raw_std > _ONLINE_RISK_DENOM_EPS and math.isfinite(raw_sharpe))
+                    else raw_mean
+                )
+                scores[idx] = excess_mean / max(raw_std, _ONLINE_RATIO_RISK_FLOOR)
+    return int(np.argmax(scores))
 
 
 class StrategyConfig(TypedDict):
@@ -173,6 +223,18 @@ def _has_transaction_costs(opt: Any) -> bool:
         return False
 
 
+def _has_chain_transaction_costs(opt: Any) -> bool:
+    """Return True if ``opt`` or any fallback configures strictly positive transaction costs."""
+    current = opt
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if _has_transaction_costs(current):
+            return True
+        current = getattr(current, "fallback", None)
+    return False
+
+
 def _has_rebalancing_friction(opt: Any) -> bool:
     """Return True if ``opt`` or any fallback has max_turnover or transaction_costs."""
     current = opt
@@ -260,7 +322,7 @@ def _reconcile_transaction_costs_horizon(
     outer_test_size: float,
 ) -> None:
     """Reconcile per-observation skfolio transaction costs with the outer evaluation fold horizon."""
-    if not _has_transaction_costs(target_opt) or outer_test_size <= 1.0:
+    if not _has_chain_transaction_costs(target_opt) or outer_test_size <= 1.0:
         return
 
     if holding_period is None and tc_from_spec:
@@ -563,8 +625,15 @@ class PortfolioExperimentEngine:
                 return max(1, int(n_samples * (n_folds - n_test_folds) / n_folds))
 
         base_cv = outer_kwargs.get("walk_forward")
+        if hasattr(outer_cv, "split"):
+            try:
+                splits = list(outer_cv.split(returns))
+                if splits:
+                    return max(1, min(len(split[0]) for split in splits))
+            except Exception:  # noqa: BLE001, S110
+                pass
         train_size = getattr(base_cv, "train_size", None)
-        if isinstance(train_size, int):
+        if isinstance(train_size, int) and getattr(base_cv, "freq", None) is None:
             return min(train_size, n_samples)
         return n_samples
 
@@ -670,6 +739,9 @@ class PortfolioExperimentEngine:
                 )
                 resolved_explicit_inner.setdefault("train_size", inner_train)
                 resolved_explicit_inner.setdefault("test_size", inner_test)
+                # Derived inner sizes are observation counts, not calendar periods
+                for freq_key in _CALENDAR_FREQ_KWARGS:
+                    resolved_explicit_inner.pop(freq_key, None)
             if cv_type == "combinatorial" and inner_type == "walk_forward":
                 inner_cv: Any = _GapAwareWalkForward(
                     reference_index=returns.index, **resolved_explicit_inner
@@ -688,7 +760,8 @@ class PortfolioExperimentEngine:
                 resolved_inner_kwargs["test_size"] = inner_test
                 if cv_kwargs.get("freq") is not None:
                     # inner_train and inner_test are observation row counts, not calendar periods
-                    resolved_inner_kwargs.pop("freq", None)
+                    for freq_key in _CALENDAR_FREQ_KWARGS:
+                        resolved_inner_kwargs.pop(freq_key, None)
 
                 inner_cv = self._resolve_cv_splitter(
                     "walk_forward", **resolved_inner_kwargs
@@ -745,7 +818,7 @@ class PortfolioExperimentEngine:
             # Fold 0 under BOTH max_turnover and transaction_costs.
             entry_params: dict[str, Any] | None = None
             if has_friction or user_previous_weights is not None:
-                if cv_type == "walk_forward":
+                if cv_type in ("walk_forward", "randomised"):
                     set_previous_weights_chain(est_clone, None)
                     entry_params = _build_entry_rebalancing_params(
                         est_clone, prefix="estimator__"
@@ -758,16 +831,31 @@ class PortfolioExperimentEngine:
                     )
                     set_previous_weights_chain(est_clone, baseline_pw)
 
-            if (
-                cv_type in ("combinatorial", "randomised")
+            if cv_type == "combinatorial":
+                if getattr(target_opt, "max_turnover", None) is not None:
+                    logger.warning(
+                        "Strategy '%s' configured with max_turnover under non-sequential cv_type='combinatorial'. "
+                        "Historical cross-validation evaluates turnover against equal baseline weights; "
+                        "live terminal refit enforces max_turnover against current physical weights.",
+                        name,
+                    )
+                if _has_chain_transaction_costs(target_opt):
+                    logger.warning(
+                        "Strategy '%s' configured with transaction_costs under non-sequential "
+                        "cv_type='combinatorial': independent CPCV folds enter from zero weights "
+                        "and pay full entry turnover cost on every fold. Use cv_type='walk_forward' "
+                        "for sequential cost simulation.",
+                        name,
+                    )
+            elif (
+                cv_type == "randomised"
                 and getattr(target_opt, "max_turnover", None) is not None
             ):
                 logger.warning(
-                    "Strategy '%s' configured with max_turnover under non-sequential cv_type='%s'. "
-                    "Historical cross-validation evaluates turnover against equal baseline weights; "
+                    "Strategy '%s' configured with max_turnover under cv_type='randomised'. "
+                    "Historical subsampled paths start with neutralized Fold-0 entry rebalancing; "
                     "live terminal refit enforces max_turnover against current physical weights.",
                     name,
-                    cv_type,
                 )
 
             # a. Hyperparameter search
@@ -882,6 +970,105 @@ class PortfolioExperimentEngine:
                     f"{sub_attr} '{type(sub_est).__name__}', which does not implement partial_fit()."
                 )
 
+    @staticmethod
+    def _resolve_online_schedule(
+        returns: pd.DataFrame,
+        burn_in_size: int | None,
+        cv_kwargs: dict[str, Any],
+        predict_kwargs: dict[str, Any],
+    ) -> tuple[int, int, float]:
+        """Resolve ``(burn_in_rows, predict_warmup, online_test_size)`` across row/freq modes."""
+        freq = predict_kwargs.get("freq")
+        if freq is None:
+            resolved_burn_in = (
+                int(burn_in_size)
+                if burn_in_size is not None
+                else int(cv_kwargs.get("warmup_size", cv_kwargs.get("train_size", 252)))
+            )
+            if resolved_burn_in >= len(returns):
+                raise ValueError(
+                    f"burn_in_size={resolved_burn_in} must be strictly less than total "
+                    f"observations ({len(returns)}) to allow out-of-sample evaluation."
+                )
+            return (
+                resolved_burn_in,
+                resolved_burn_in,
+                float(predict_kwargs.get("test_size", 1)),
+            )
+
+        wf_args = {
+            k: predict_kwargs[k]
+            for k in ("freq", "freq_offset", "previous", "purged_size", "reduce_test")
+            if k in predict_kwargs
+        }
+        pred_test = int(predict_kwargs.get("test_size", 1))
+
+        if burn_in_size is None and "warmup_size" in cv_kwargs:
+            predict_warmup = int(cv_kwargs["warmup_size"])
+            splits = list(
+                WalkForward(
+                    train_size=predict_warmup, test_size=pred_test, **wf_args
+                ).split(returns)
+            )
+            if not splits:
+                raise ValueError(
+                    f"warmup_size={predict_warmup} with freq={freq!r} produced no test splits."
+                )
+            resolved_burn_in = int(splits[0][0][-1]) + 1
+        else:
+            resolved_burn_in = (
+                int(burn_in_size)
+                if burn_in_size is not None
+                else int(cv_kwargs.get("train_size", 252))
+            )
+            if resolved_burn_in >= len(returns):
+                raise ValueError(
+                    f"burn_in_size={resolved_burn_in} must be strictly less than total "
+                    f"observations ({len(returns)}) to allow out-of-sample evaluation."
+                )
+            step_splits = list(
+                WalkForward(
+                    train_size=1,
+                    test_size=1,
+                    freq=wf_args["freq"],
+                    freq_offset=wf_args.get("freq_offset"),
+                    previous=bool(wf_args.get("previous", False)),
+                ).split(returns)
+            )
+            max_periods = max(1, len(step_splits))
+            lo, hi = 1, max_periods
+            best_k: int | None = None
+            splits = []
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                try:
+                    cand_splits = list(
+                        WalkForward(
+                            train_size=mid, test_size=pred_test, **wf_args
+                        ).split(returns)
+                    )
+                except ValueError:
+                    cand_splits = []
+                if not cand_splits:
+                    hi = mid - 1
+                    continue
+                if int(cand_splits[0][1][0]) >= resolved_burn_in:
+                    best_k = mid
+                    splits = cand_splits
+                    hi = mid - 1
+                else:
+                    lo = mid + 1
+            if best_k is None or not splits:
+                raise ValueError(
+                    f"burn_in_size={resolved_burn_in} leaves no calendar '{freq}' "
+                    "test periods in returns for online evaluation."
+                )
+            predict_warmup = best_k
+
+        test_lens = [len(te) for _tr, te in splits if len(te) > 0]
+        online_test_size = float(np.median(test_lens)) if test_lens else 1.0
+        return resolved_burn_in, predict_warmup, online_test_size
+
     @overload
     def run_online_evaluation(
         self,
@@ -972,46 +1159,6 @@ class PortfolioExperimentEngine:
         returns = self._universe.returns
         annualization_factor = _resolve_periods_per_year(self._universe)
 
-        if burn_in_size is None:
-            burn_in_size = int(
-                cv_kwargs.get("warmup_size", cv_kwargs.get("train_size", 252))
-            )
-
-        if burn_in_size >= len(returns):
-            raise ValueError(
-                f"burn_in_size={burn_in_size} must be strictly less than total "
-                f"observations ({len(returns)}) to allow out-of-sample evaluation."
-            )
-
-        burn_in_returns = returns.iloc[:burn_in_size]
-        post_burn_in_returns = returns.iloc[burn_in_size:]
-
-        purged = int(cv_kwargs.get("purged_size", 0))
-        if (
-            "train_size" in cv_kwargs
-            and "test_size" in cv_kwargs
-            and int(cv_kwargs["train_size"]) + int(cv_kwargs["test_size"]) + purged
-            <= burn_in_size
-        ):
-            inner_warmup = int(cv_kwargs["train_size"])
-            inner_test = int(cv_kwargs["test_size"])
-        elif burn_in_size - max(0, purged) <= 2:
-            inner_warmup, inner_test = 1, 1
-        else:
-            inner_warmup, inner_test = self._derive_inner_walk_forward_sizes(
-                burn_in_size, purged
-            )
-
-        online_search_keys = {
-            "freq",
-            "freq_offset",
-            "previous",
-            "reduce_test",
-        }
-        search_extra_kwargs = {
-            k: v for k, v in cv_kwargs.items() if k in online_search_keys
-        }
-
         online_predict_keys = {
             "test_size",
             "freq",
@@ -1024,7 +1171,30 @@ class PortfolioExperimentEngine:
         predict_kwargs = {
             k: v for k, v in cv_kwargs.items() if k in online_predict_keys
         }
-        online_test_size = float(predict_kwargs.get("test_size", 1))
+
+        burn_in_rows, predict_warmup, online_test_size = self._resolve_online_schedule(
+            returns, burn_in_size, cv_kwargs, predict_kwargs
+        )
+
+        burn_in_returns = returns.iloc[:burn_in_rows]
+        post_burn_in_returns = returns.iloc[burn_in_rows:]
+
+        purged = int(cv_kwargs.get("purged_size", 0))
+        if (
+            predict_kwargs.get("freq") is None
+            and "train_size" in cv_kwargs
+            and "test_size" in cv_kwargs
+            and int(cv_kwargs["train_size"]) + int(cv_kwargs["test_size"]) + purged
+            <= burn_in_rows
+        ):
+            inner_warmup = int(cv_kwargs["train_size"])
+            inner_test = int(cv_kwargs["test_size"])
+        elif burn_in_rows - max(0, purged) <= 2:
+            inner_warmup, inner_test = 1, 1
+        else:
+            inner_warmup, inner_test = self._derive_inner_walk_forward_sizes(
+                burn_in_rows, purged
+            )
 
         collected: list[Any] = []
         run_latest_weights: dict[str, dict[str, float]] = {}
@@ -1070,17 +1240,18 @@ class PortfolioExperimentEngine:
                 set_previous_weights_chain(est, baseline_pw)
                 entry_params = _build_entry_rebalancing_params(est, prefix="")
 
+            # inner_warmup and inner_test are observation row counts from burn_in_returns,
+            # so calendar freq/freq_offset/previous/reduce_test must NOT leak into OnlineGridSearch.
             search = OnlineGridSearch(
                 estimator=est,
                 param_grid=grid,
-                scoring=RatioMeasure.CVAR_RATIO,
+                scoring=_ONLINE_SAFE_SCORING,
                 warmup_size=inner_warmup,
                 test_size=inner_test,
                 purged_size=purged,
-                refit=True,
+                refit=_online_safe_refit,
                 n_jobs=1,
                 entry_rebalancing_params=entry_params,
-                **search_extra_kwargs,
             )
             search.fit(burn_in_returns)
             best_model = search.best_estimator_
@@ -1088,7 +1259,7 @@ class PortfolioExperimentEngine:
             portfolio = online_predict(
                 best_model,
                 returns,
-                warmup_size=burn_in_size,
+                warmup_size=predict_warmup,
                 portfolio_params={
                     "tag": name,
                     "annualization_factor": annualization_factor,
