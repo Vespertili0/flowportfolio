@@ -400,10 +400,11 @@ def test_calculate_rebalance_delta_deducts_transition_cost_drag() -> None:
         portfolio_value=10_000.0,
     )
 
-    # Exact transition drag = 1.2 * 75 / 10_000 + 2 * (50 / 10_000) = 0.009 + 0.010 = 0.019
+    # Exact one-off transition drag = 1.2 * 75 / 10_000 + 2 * (50 / 10_000) = 0.009 + 0.010 = 0.019
     expected_drag = 1.2 * 75.0 / 10_000.0 + 2.0 * (50.0 / 10_000.0)
-    net_series = np.asarray(oos.returns, dtype=float).copy()
-    net_series[0] -= expected_drag
+    net_series = np.asarray(oos.returns, dtype=float).copy() - expected_drag / len(
+        oos.returns
+    )
     expected_net_port = Portfolio(
         X=net_series[:, None],
         weights=np.array([1.0]),
@@ -414,8 +415,15 @@ def test_calculate_rebalance_delta_deducts_transition_cost_drag() -> None:
     assert res_net["rebalance"]["sharpe"] == pytest.approx(
         float(expected_net_port.annualized_sharpe_ratio), rel=0, abs=1e-12
     )
+    # One-off day-0 execution fee must NOT corrupt steady-state daily CVaR or max_drawdown (#5c)
     assert res_net["rebalance"]["cvar"] == pytest.approx(
-        float(expected_net_port.cvar), rel=0, abs=1e-12
+        res_gross["rebalance"]["cvar"], rel=0, abs=1e-12
+    )
+    assert res_net["rebalance"]["max_drawdown"] == pytest.approx(
+        res_gross["rebalance"]["max_drawdown"], rel=0, abs=1e-12
+    )
+    assert res_net["rebalance"]["entry_drag"] == pytest.approx(
+        expected_drag, rel=0, abs=1e-12
     )
 
 
@@ -677,14 +685,14 @@ def test_rebalance_delta_enforces_fee_symmetry_without_double_charging(
 
 
 def test_rebalance_delta_transition_drag_uses_fold0_trade_not_terminal_target() -> None:
-    """P1-5a: OOS day-0 transition drag must reflect current->fold0 trade, not current->terminal target_weights."""
+    """Sprint 5 (#5a & #5c): Charges Fold-0 entry drag from current->fold0 plus Fold-1..N recurring rebalance drags."""
     rng = np.random.default_rng(44)
     idx = pd.bdate_range("2025-01-02", periods=60)
     rets = pd.DataFrame(
         {"A": rng.normal(0.001, 0.01, 60), "B": rng.normal(0.0005, 0.01, 60)},
         index=idx,
     )
-    # Fold 0 holds [0.9, 0.1]; Fold 1 holds [0.2, 0.8]; live terminal target is [0.1, 0.9]
+    # Fold 0 holds [0.9, 0.1] (weight_drift=False); Fold 1 holds [0.2, 0.8]; live terminal target is [0.1, 0.9]
     f0 = Portfolio(X=rets.iloc[:30], weights=[0.9, 0.1], tag="Strat")
     f1 = Portfolio(X=rets.iloc[30:], weights=[0.2, 0.8], tag="Strat")
     mpp = MultiPeriodPortfolio(portfolios=[f0, f1], tag="Strat")
@@ -693,7 +701,7 @@ def test_rebalance_delta_transition_drag_uses_fold0_trade_not_terminal_target() 
     u = Universe(["A", "B"], {"A": "eq", "B": "eq"}, {"A": 0.0, "B": 0.0})
     u._returns = rets
 
-    # Case 1: current_weights == fold0_weights -> zero entry trade -> zero day-0 drag
+    # Case 1: current_weights == fold0_weights -> entry_drag == 0.0, while Fold 1 rebalance (L1=1.4) IS charged (#5a)
     eng_zero_entry = PortfolioDeltaEngine(
         u,
         current_weights={"A": 0.9, "B": 0.1},
@@ -708,35 +716,57 @@ def test_rebalance_delta_transition_drag_uses_fold0_trade_not_terminal_target() 
         brokerage_flat=50.0,
         portfolio_value=10_000.0,
     )
-    assert res_with_bps["rebalance"]["sharpe"] == pytest.approx(
-        res_gross["rebalance"]["sharpe"], rel=0, abs=1e-12
+    # Fold 1 rebalance: L1(|0.2-0.9|+|0.8-0.1|) = 1.4 @ 75 bps + 2 flat tickets ($100/$10k = 0.01) = 0.0205
+    expected_f1_drag = 1.4 * 75.0 / 10_000.0 + 2.0 * (50.0 / 10_000.0)
+    assert res_with_bps["rebalance"]["entry_drag"] == pytest.approx(0.0, abs=1e-12)
+    assert res_with_bps["rebalance"]["rebalance_drag"] == pytest.approx(
+        expected_f1_drag, abs=1e-12
     )
+    assert res_with_bps["rebalance"]["sharpe"] < res_gross["rebalance"]["sharpe"]
 
-    # Case 2: current_weights = [0.5, 0.5] -> entry trade to fold0 [0.9, 0.1] has L1=0.8 (not 0.8 to target [0.1,0.9] — use asymmetric [0.7, 0.3])
+    # Case 2: current_weights = [0.7, 0.3] -> entry_drag uses current->fold0 (L1=0.4), Fold 1 uses fold0->fold1 (L1=1.4)
     eng_asym = PortfolioDeltaEngine(
         u,
         current_weights={"A": 0.7, "B": 0.3},
         target_weights={"A": 0.1, "B": 0.9},
     )
-    # L1(current->fold0) = |0.9-0.7| + |0.1-0.3| = 0.4; L1(current->target) = 1.2 (3x larger!)
     res_asym = eng_asym.calculate_rebalance_delta(
         pop, strategy_tag="Strat", brokerage_bps=50.0, slippage_bps=50.0
     )
-    expected_drag = 0.4 * 100.0 / 10_000.0  # 0.004
-    expected_series = np.asarray(mpp.returns, dtype=float).copy()
-    expected_series[0] -= expected_drag
-    expected_port = Portfolio(
-        X=expected_series[:, None], weights=np.array([1.0]), annualization_factor=252.0
+    expected_entry_drag = 0.4 * 100.0 / 10_000.0  # 0.004
+    expected_reb_drag = 1.4 * 100.0 / 10_000.0  # 0.014
+    assert res_asym["rebalance"]["entry_drag"] == pytest.approx(
+        expected_entry_drag, abs=1e-12
+    )
+    assert res_asym["rebalance"]["rebalance_drag"] == pytest.approx(
+        expected_reb_drag, abs=1e-12
+    )
+
+    steady_series = np.concatenate(
+        [
+            np.asarray(f0.returns, dtype=float),
+            np.asarray(f1.returns, dtype=float) - expected_reb_drag / len(f1.returns),
+        ]
+    )
+    steady_port = Portfolio(
+        X=steady_series[:, None], weights=np.array([1.0]), annualization_factor=252.0
+    )
+    net_series = steady_series - expected_entry_drag / len(steady_series)
+    net_port = Portfolio(
+        X=net_series[:, None], weights=np.array([1.0]), annualization_factor=252.0
+    )
+    assert res_asym["rebalance"]["cvar"] == pytest.approx(
+        float(steady_port.cvar), rel=1e-9, abs=1e-12
     )
     assert res_asym["rebalance"]["sharpe"] == pytest.approx(
-        float(expected_port.annualized_sharpe_ratio), rel=1e-9, abs=1e-12
+        float(net_port.annualized_sharpe_ratio), rel=1e-9, abs=1e-12
     )
 
 
 def test_rebalance_delta_skips_transition_drag_when_oos_already_embeds_transaction_costs(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """P1-5b: OOS portfolios carrying embedded transaction_costs must not be double-charged external drag."""
+    """Sprint 5 (#5b): Skip external Fold-0 drag ONLY when Fold 0 itself embeds costs; charge Fold 0 when neutralized."""
     import logging
 
     rng = np.random.default_rng(51)
@@ -745,22 +775,25 @@ def test_rebalance_delta_skips_transition_drag_when_oos_already_embeds_transacti
         {"A": rng.normal(0.001, 0.01, 60), "B": rng.normal(0.0005, 0.01, 60)},
         index=idx,
     )
-    f0 = Portfolio(
+    # 1. Both Fold 0 and Fold 1 embed transaction costs -> external drag completely skipped with warning
+    f0_costed = Portfolio(
         X=rets.iloc[:30],
         weights=[0.8, 0.2],
-        transaction_costs=0.0,
-        tag="Costed",
+        previous_weights=np.array([0.5, 0.5]),
+        transaction_costs=0.001 / 30.0,
+        tag="AllCosted",
     )
-    f1 = Portfolio(
+    f1_costed = Portfolio(
         X=rets.iloc[30:],
         weights=[0.2, 0.8],
         previous_weights=np.array([0.8, 0.2]),
         transaction_costs=0.001 / 30.0,
-        tag="Costed",
+        tag="AllCosted",
     )
-    assert float(f1.total_cost) > 0.0
-    mpp = MultiPeriodPortfolio(portfolios=[f0, f1], tag="Costed")
-    pop = Population([mpp])
+    assert float(f0_costed.total_cost) > 0.0
+    assert float(f1_costed.total_cost) > 0.0
+    mpp_all = MultiPeriodPortfolio(portfolios=[f0_costed, f1_costed], tag="AllCosted")
+    pop_all = Population([mpp_all])
 
     u = Universe(["A", "B"], {"A": "eq", "B": "eq"}, {"A": 0.0, "B": 0.0})
     u._returns = rets
@@ -770,12 +803,12 @@ def test_rebalance_delta_skips_transition_drag_when_oos_already_embeds_transacti
         target_weights={"A": 0.8, "B": 0.2},
     )
 
-    res_no_extra = eng.calculate_rebalance_delta(pop, strategy_tag="Costed")
+    res_no_extra = eng.calculate_rebalance_delta(pop_all, strategy_tag="AllCosted")
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger="flowportfolio.delta"):
         res_with_extra = eng.calculate_rebalance_delta(
-            pop,
-            strategy_tag="Costed",
+            pop_all,
+            strategy_tag="AllCosted",
             brokerage_bps=50.0,
             slippage_bps=25.0,
         )
@@ -787,3 +820,69 @@ def test_rebalance_delta_skips_transition_drag_when_oos_already_embeds_transacti
     assert res_with_extra["rebalance"]["cvar"] == pytest.approx(
         res_no_extra["rebalance"]["cvar"], rel=0, abs=1e-12
     )
+
+    # 2. Neutralized Fold 0 (total_cost == 0.0 via entry_rebalancing_params) + costed Fold 1:
+    # Fold-0 entry drag from current_weights -> f0 IS charged, Fold 1 is NOT double-charged (#5b)
+    f0_neutral = Portfolio(
+        X=rets.iloc[:30],
+        weights=[0.8, 0.2],
+        transaction_costs=0.0,
+        tag="NeutralF0",
+    )
+    f1_paid = Portfolio(
+        X=rets.iloc[30:],
+        weights=[0.2, 0.8],
+        previous_weights=np.array([0.8, 0.2]),
+        transaction_costs=0.001 / 30.0,
+        tag="NeutralF0",
+    )
+    assert float(f0_neutral.total_cost) == 0.0
+    mpp_neutral = MultiPeriodPortfolio(
+        portfolios=[f0_neutral, f1_paid], tag="NeutralF0"
+    )
+    res_neutral_gross = eng.calculate_rebalance_delta(
+        Population([mpp_neutral]), strategy_tag="NeutralF0"
+    )
+    res_neutral_entry = eng.calculate_rebalance_delta(
+        Population([mpp_neutral]),
+        strategy_tag="NeutralF0",
+        brokerage_bps=50.0,
+        slippage_bps=25.0,
+    )
+    expected_entry = 1.2 * 75.0 / 10_000.0  # |0.8-0.2| + |0.2-0.8| = 1.2
+    assert res_neutral_entry["rebalance"]["entry_drag"] == pytest.approx(
+        expected_entry, abs=1e-12
+    )
+    assert res_neutral_entry["rebalance"]["rebalance_drag"] == pytest.approx(
+        0.0, abs=1e-12
+    )
+    assert (
+        res_neutral_entry["rebalance"]["sharpe"]
+        < res_neutral_gross["rebalance"]["sharpe"]
+    )
+
+
+def test_rebalance_delta_rejects_randomized_asset_subset_paths() -> None:
+    """Sprint 5 (N5): Strictly subsetted OOS paths (MultipleRandomizedCV) must raise ValueError."""
+    rng = np.random.default_rng(77)
+    idx = pd.bdate_range("2025-01-02", periods=60)
+    rets = pd.DataFrame(
+        rng.normal(0.0005, 0.01, (60, 4)),
+        index=idx,
+        columns=["A", "B", "C", "D"],
+    )
+    u = Universe(
+        ["A", "B", "C", "D"],
+        {"A": "core", "B": "core", "C": "sat", "D": "sat"},
+        {"A": 0.0, "B": 0.0, "C": 0.0, "D": 0.0},
+    )
+    u._returns = rets
+
+    # Subsetted portfolios (e.g., MultipleRandomizedCV with asset_subset_size=2)
+    p_sub = Portfolio(X=rets[["B", "C"]], weights=[0.5, 0.5], tag="RandSub")
+    pop = Population([MultiPeriodPortfolio(portfolios=[p_sub], tag="RandSub")])
+    cw = {"A": 0.25, "B": 0.25, "C": 0.25, "D": 0.25}
+    eng = PortfolioDeltaEngine(u, current_weights=cw, target_weights=cw)
+
+    with pytest.raises(ValueError, match="asset-subsampled"):
+        eng.calculate_rebalance_delta(pop, strategy_tag="RandSub")
