@@ -780,3 +780,34 @@ def test_nested_prior_excess_return_detection_prevents_double_counting(
         )
     assert bl.risk_free_rate == pytest.approx(0.0504 / 252.0, abs=1e-12)
     assert not any("double-counting" in rec.message for rec in caplog.records)
+
+
+def test_black_litterman_preserves_economic_risk_free_rate_across_clone() -> None:
+    """Sprint 5 (#6b): Economic risk_free_rate survives total-return suppression and sklearn clone."""
+    from sklearn.base import clone
+
+    u = _o2_universe(n_obs=60)
+    synth = PriorSynthesiser(u)
+    synth.add_market_view("WIN == 0.1008", confidence=0.8)
+
+    bl_excess = synth.build_black_litterman_prior(risk_free_rate=0.0504)
+    assert getattr(bl_excess, "portfolio_risk_free_rate", None) == pytest.approx(
+        0.0504 / 252.0, abs=1e-12
+    )
+    bl_excess_cloned = clone(bl_excess)
+    assert getattr(bl_excess_cloned, "portfolio_risk_free_rate", None) == pytest.approx(
+        0.0504 / 252.0, abs=1e-12
+    )
+
+    bl_total = synth.build_black_litterman_prior(
+        risk_free_rate=0.0504,
+        prior_estimator=EmpiricalPrior(),
+    )
+    assert bl_total.risk_free_rate == 0.0
+    assert getattr(bl_total, "portfolio_risk_free_rate", None) == pytest.approx(
+        0.0504 / 252.0, abs=1e-12
+    )
+    bl_total_cloned = clone(bl_total)
+    assert getattr(bl_total_cloned, "portfolio_risk_free_rate", None) == pytest.approx(
+        0.0504 / 252.0, abs=1e-12
+    )

@@ -75,7 +75,8 @@ def test_daily_fee_scaling_and_preselection() -> None:
     universe = _fetched_universe()
     current_weights = dict.fromkeys(TICKERS, 0.25)
 
-    spec = ConstraintBuilder(universe).max_turnover(0.20, current_weights).build()
+    # Use max_turnover=0.30 (> 0.25) so dropping an asset cleanly respects lb = 0.25 - 0.30 <= 0.
+    spec = ConstraintBuilder(universe).max_turnover(0.30, current_weights).build()
 
     assert spec.management_fees is not None
     assert spec.management_fees["SPY"] == pytest.approx(0.0050 / 252.0)

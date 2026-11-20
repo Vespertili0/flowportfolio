@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
 from collections.abc import Sequence
 from typing import Any
@@ -8,7 +9,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from skfolio.optimization import NestedClustersOptimization
-from skfolio.prior import BasePrior
+from skfolio.prior import BasePrior, BlackLitterman, EntropyPooling
 from sklearn.base import BaseEstimator, TransformerMixin, clone
 from sklearn.cluster import KMeans
 from sklearn.pipeline import Pipeline
@@ -22,6 +23,43 @@ _SIMPLE_SUM_CONSTRAINT_RE = re.compile(
     r"\s*(<=|>=|==)\s*"
     r"([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*$"
 )
+
+
+def _set_portfolio_param_default(opt: Any, key: str, value: Any) -> None:
+    """Populate ``opt.portfolio_params[key]`` if unset without mutating caller dicts."""
+    existing = dict(getattr(opt, "portfolio_params", None) or {})
+    existing.setdefault(key, value)
+    opt.portfolio_params = existing
+
+
+def _has_positive_tc(tc: Any) -> bool:
+    """Return True if ``tc`` contains any strictly positive transaction cost."""
+    if tc is None or isinstance(tc, bool):
+        return False
+    if isinstance(tc, (int, float)):
+        return float(tc) > 0.0
+    if isinstance(tc, dict):
+        return any(float(v) > 0.0 for v in tc.values())
+    try:
+        return bool(np.any(np.asarray(tc, dtype=float) > 0.0))
+    except (TypeError, ValueError):
+        return False
+
+
+def _extract_prior_risk_free_rate(prior: BasePrior | None) -> float:
+    """Return non-zero per-period economic risk_free_rate advertised by ``prior``."""
+    if prior is None:
+        return 0.0
+    for attr in ("portfolio_risk_free_rate", "risk_free_rate"):
+        raw = getattr(prior, attr, None)
+        if (
+            isinstance(raw, (int, float))
+            and not isinstance(raw, bool)
+            and math.isfinite(float(raw))
+            and float(raw) != 0.0
+        ):
+            return float(raw)
+    return 0.0
 
 
 def _safe_clone(estimator: Any) -> Any:
@@ -103,7 +141,7 @@ def _restore_feasible_subset(
     tuple[list[str], list[str]]
         ``(restored_columns, reasons)`` with columns ordered as in ``all_cols``.
     """
-    _, ubs = _effective_asset_bounds(
+    lbs, ubs = _effective_asset_bounds(
         all_cols,
         min_weights=min_weights,
         max_weights=max_weights,
@@ -113,6 +151,14 @@ def _restore_feasible_subset(
     all_cols_set = set(all_cols)
     surviving_set = {c for c in surviving if c in all_cols_set}
     reasons: list[str] = []
+
+    for col in all_cols:
+        if col not in surviving_set and lbs[col] > 1e-9:
+            surviving_set.add(col)
+            reasons.append(
+                f"Restored asset '{col}' because effective lower bound "
+                f"lb={lbs[col]:.4g} > 0."
+            )
 
     def _members_for_term(term: str) -> list[str]:
         if term in all_cols_set:
@@ -267,6 +313,18 @@ def _subtract_management_fees(
 class _SafePreSelectionTransformer(BaseEstimator, TransformerMixin):
     """Wrapper around pre-selection transformers preventing infeasible constraint subsets."""
 
+    _WRAPPER_PARAM_NAMES: frozenset[str] = frozenset(
+        {
+            "transformer",
+            "groups",
+            "linear_constraints",
+            "max_turnover",
+            "previous_weights",
+            "min_weights",
+            "max_weights",
+        }
+    )
+
     columns_keep_: np.ndarray | None
     selected_columns_: list[str] | None
     feature_names_in_: np.ndarray
@@ -289,6 +347,41 @@ class _SafePreSelectionTransformer(BaseEstimator, TransformerMixin):
         self.previous_weights = previous_weights
         self.min_weights = min_weights
         self.max_weights = max_weights
+
+    def get_params(self, deep: bool = True) -> dict[str, Any]:
+        params = super().get_params(deep=deep)
+        if (
+            deep
+            and self.transformer is not None
+            and hasattr(self.transformer, "get_params")
+        ):
+            for key, value in self.transformer.get_params(deep=True).items():
+                if key not in self._WRAPPER_PARAM_NAMES:
+                    params.setdefault(key, value)
+        return params
+
+    def set_params(self, **params: Any) -> _SafePreSelectionTransformer:
+        if not params:
+            return self
+        wrapper_params: dict[str, Any] = {}
+        forwarded_params: dict[str, Any] = {}
+        valid_inner = (
+            set(self.transformer.get_params(deep=True).keys())
+            if self.transformer is not None and hasattr(self.transformer, "get_params")
+            else set()
+        )
+        for key, value in params.items():
+            if key in self._WRAPPER_PARAM_NAMES or key.startswith("transformer__"):
+                wrapper_params[key] = value
+            elif key in valid_inner:
+                forwarded_params[key] = value
+            else:
+                wrapper_params[key] = value
+        if wrapper_params:
+            super().set_params(**wrapper_params)
+        if forwarded_params and self.transformer is not None:
+            self.transformer.set_params(**forwarded_params)
+        return self
 
     def fit(
         self, X: Any, y: Any = None, **fit_params: Any
@@ -692,18 +785,38 @@ class StrategyBuilder:
             opt.previous_weights = dict(self._previous_weights)
         if hasattr(opt, "max_turnover") and self._max_turnover is not None:
             opt.max_turnover = self._max_turnover
-        if hasattr(opt, "management_fees") and self._management_fees is not None:
-            opt.management_fees = dict(self._management_fees)
+        if self._management_fees is not None:
+            if hasattr(opt, "management_fees"):
+                opt.management_fees = dict(self._management_fees)
+            elif hasattr(opt, "portfolio_params"):
+                _set_portfolio_param_default(
+                    opt, "management_fees", dict(self._management_fees)
+                )
 
-        if include_prior and self.prior is not None and hasattr(opt, "prior_estimator"):
-            opt.prior_estimator = clone(self.prior)
+        if include_prior and self.prior is not None:
+            if hasattr(opt, "prior_estimator"):
+                opt.prior_estimator = clone(self.prior)
+            prior_rfr = _extract_prior_risk_free_rate(self.prior)
+            if prior_rfr != 0.0:
+                if hasattr(opt, "risk_free_rate"):
+                    if getattr(opt, "risk_free_rate", 0.0) == 0.0:
+                        opt.risk_free_rate = prior_rfr
+                elif hasattr(opt, "portfolio_params"):
+                    _set_portfolio_param_default(opt, "risk_free_rate", prior_rfr)
 
-        if hasattr(opt, "transaction_costs") and self._transaction_costs is not None:
-            opt.transaction_costs = (
-                dict(self._transaction_costs)
-                if isinstance(self._transaction_costs, dict)
-                else self._transaction_costs
-            )
+        if self._transaction_costs is not None:
+            if hasattr(opt, "transaction_costs"):
+                opt.transaction_costs = (
+                    dict(self._transaction_costs)
+                    if isinstance(self._transaction_costs, dict)
+                    else self._transaction_costs
+                )
+            elif _has_positive_tc(self._transaction_costs):
+                logger.warning(
+                    "Estimator '%s' does not support transaction_costs; "
+                    "transaction costs will be ignored by this estimator.",
+                    type(opt).__name__,
+                )
 
         if self._linear_constraints and not hasattr(opt, "linear_constraints"):
             logger.warning(
@@ -852,10 +965,22 @@ class StrategyBuilder:
         ------
         RuntimeError
             If no optimizer has been set via set_optimizer().
+        ValueError
+            If pre-selection steps are combined with view-based priors
+            (``BlackLitterman`` or ``EntropyPooling``).
         """
         if self._optimizer is None:
             raise RuntimeError(
                 "No optimizer set. Call set_optimizer() before build_pipeline()."
+            )
+
+        if self._pre_selection and isinstance(
+            self.prior, (BlackLitterman, EntropyPooling)
+        ):
+            raise ValueError(
+                "Pre-selection transformers cannot be combined with ticker/group "
+                "view priors (BlackLitterman, EntropyPooling) because dropping "
+                "referenced assets breaks view equations and distorts group weights."
             )
 
         cloned_optimizer = self._wire_from_raw(include_prior=True)
@@ -946,10 +1071,10 @@ class StrategyBuilder:
             If inner_estimator or outer_estimator is None.
         ValueError
             If clusterer is not one of the permitted values, if ``random_state``
-            is invalid, if linear group constraints or turnover limits have been
-            configured (they cannot be enforced inside isolated sub-clusters),
-            or if the prior is a ticker-level view prior (BlackLitterman or
-            EntropyPooling).
+            is invalid, if linear group constraints, turnover limits, or positive
+            transaction costs have been configured (they cannot be enforced inside
+            isolated sub-clusters), or if the prior is a ticker-level view prior
+            (BlackLitterman or EntropyPooling).
         """
         if inner_estimator is None:
             raise TypeError("inner_estimator must not be None.")
@@ -979,7 +1104,11 @@ class StrategyBuilder:
                 "inside isolated NestedClustersOptimization sub-clusters."
             )
 
-        from skfolio.prior import BlackLitterman, EntropyPooling
+        if _has_positive_tc(self._transaction_costs):
+            raise ValueError(
+                "Unsupported configuration: transaction costs cannot be enforced "
+                "consistently inside isolated NestedClustersOptimization sub-clusters."
+            )
 
         if self.prior is not None and isinstance(
             self.prior, (BlackLitterman, EntropyPooling)

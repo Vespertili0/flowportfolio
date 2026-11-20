@@ -7,6 +7,7 @@ import math
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
 from skfolio.distribution import VineCopula
 from skfolio.moments import (
@@ -26,6 +27,31 @@ from skfolio.prior import (
 from flowportfolio.core.protocols import UniverseProtocol
 
 logger = logging.getLogger(__name__)
+
+
+class _FlowPortfolioBlackLitterman(BlackLitterman):
+    """BlackLitterman prior retaining the economic per-period risk-free rate."""
+
+    def __init__(
+        self,
+        views: Any,
+        groups: Any = None,
+        prior_estimator: BasePrior | None = None,
+        tau: float = 0.05,
+        view_confidences: Any = None,
+        risk_free_rate: float = 0.0,
+        portfolio_risk_free_rate: float = 0.0,
+    ) -> None:
+        super().__init__(
+            views=views,
+            groups=groups,
+            prior_estimator=prior_estimator,
+            tau=tau,
+            view_confidences=view_confidences,
+            risk_free_rate=risk_free_rate,
+        )
+        self.portfolio_risk_free_rate = portfolio_risk_free_rate
+
 
 _NUM_PAT = r"(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
 _NUM_RE = re.compile(_NUM_PAT)
@@ -700,11 +726,12 @@ class PriorSynthesiser:
             "view_confidences": confidences,
             "groups": self._build_groups_mapping(),
             "risk_free_rate": bl_rfr_per_period,
+            "portfolio_risk_free_rate": rfr_annual / ppy,
         }
         if prior_estimator is not None:
             kwargs["prior_estimator"] = prior_estimator
 
-        return BlackLitterman(**kwargs)
+        return _FlowPortfolioBlackLitterman(**kwargs)  # type: ignore[arg-type]
 
     def build_synthetic_prior(
         self, n_samples: int = 5000, random_state: int | None = None

@@ -807,3 +807,181 @@ def test_custom_estimators_sklearn_clone_roundtrip() -> None:
     )
     nco_clone = clone(nco)
     assert nco_clone.portfolio_params == {"management_fees": {"A": 0.001}}
+
+
+# ---------------------------------------------------------------------------
+# Cycle 17 (Sprint 5): #2, #3, #6a, #6b, N2, N3
+# ---------------------------------------------------------------------------
+
+
+def test_restore_feasible_subset_restores_positive_lower_bounds() -> None:
+    """Sprint 5 (#2): Assets with positive effective lower bounds (min_weights / max_turnover) are always restored."""
+    from flowportfolio.strategies import _restore_feasible_subset
+
+    restored_mt, reasons_mt = _restore_feasible_subset(
+        surviving=["B", "C", "D", "E"],
+        all_cols=["A", "B", "C", "D", "E"],
+        previous_weights={"A": 0.20, "B": 0.20, "C": 0.20, "D": 0.20, "E": 0.20},
+        max_turnover=0.10,
+        max_weights=1.0,
+    )
+    assert "A" in restored_mt
+    assert len(reasons_mt) >= 1
+
+    restored_mw, reasons_mw = _restore_feasible_subset(
+        surviving=["B", "C"],
+        all_cols=["A", "B", "C"],
+        min_weights={"A": 0.15, "B": 0.0, "C": 0.0},
+        max_weights=1.0,
+    )
+    assert "A" in restored_mw
+    assert len(reasons_mw) >= 1
+
+
+def test_build_pipeline_rejects_pre_selection_with_view_priors() -> None:
+    """Sprint 5 (#3): build_pipeline fails fast when pre-selection is paired with BlackLitterman or EntropyPooling."""
+    from skfolio.pre_selection import DropCorrelated
+    from skfolio.prior import BlackLitterman, EntropyPooling
+
+    bl = BlackLitterman(views=["A == 0.001"], view_confidences=[0.8])
+    with pytest.raises(ValueError, match="view priors"):
+        (
+            StrategyBuilder(prior=bl)
+            .add_pre_selection(DropCorrelated())
+            .set_optimizer(MeanRisk())
+            .build_pipeline()
+        )
+
+    ep = EntropyPooling(mean_views=["A >= 0.001"])
+    with pytest.raises(ValueError, match="view priors"):
+        (
+            StrategyBuilder(prior=ep)
+            .add_pre_selection(DropCorrelated())
+            .set_optimizer(MeanRisk())
+            .build_pipeline()
+        )
+
+
+def test_build_nco_rejects_transaction_costs() -> None:
+    """Sprint 5 (#6a): build_nco must reject non-zero transaction_costs rather than silently dropping them."""
+    for bad_tc in (0.005, {"A": 0.005, "B": 0.0}):
+        spec = ConstraintSpec(transaction_costs=bad_tc)
+        with pytest.raises(ValueError, match="transaction costs"):
+            StrategyBuilder(constraints=spec).build_nco(MeanRisk(), MeanRisk())
+
+    ok_spec = ConstraintSpec(transaction_costs=0.0)
+    nco = StrategyBuilder(constraints=ok_spec).build_nco(MeanRisk(), MeanRisk())
+    assert isinstance(nco, NestedClustersOptimization)
+
+
+def test_strategy_builder_propagates_black_litterman_risk_free_rate() -> None:
+    """Sprint 5 (#6b): BL risk_free_rate must propagate to optimizer and predicted Portfolio."""
+    from flowportfolio.core.universe import Universe
+    from flowportfolio.priors import PriorSynthesiser
+
+    rng = np.random.default_rng(17)
+    idx = pd.bdate_range("2024-01-02", periods=60)
+    rets = pd.DataFrame(
+        rng.normal(0.0005, 0.01, (60, 3)),
+        index=idx,
+        columns=["A", "B", "C"],
+    )
+    u = Universe(
+        ["A", "B", "C"],
+        {"A": "core", "B": "core", "C": "sat"},
+        {"A": 0.0, "B": 0.0, "C": 0.0},
+    )
+    u._returns = rets
+    synth = PriorSynthesiser(u).add_market_view("A == 0.0504", confidence=0.8)
+
+    expected_rfr = 0.0504 / 252.0
+    for prior_est in (None, EmpiricalPrior()):
+        bl = synth.build_black_litterman_prior(
+            risk_free_rate=0.0504, prior_estimator=prior_est
+        )
+        pipe = StrategyBuilder(prior=bl).set_optimizer(MeanRisk()).build_pipeline()
+        pipe.fit(rets)
+        ptf = pipe.predict(rets)
+        assert pipe.steps[-1][1].risk_free_rate == pytest.approx(
+            expected_rfr, abs=1e-12
+        )
+        assert float(ptf.risk_free_rate) == pytest.approx(expected_rfr, abs=1e-12)
+
+        hrp_pipe = (
+            StrategyBuilder(prior=bl)
+            .set_optimizer(HierarchicalRiskParity())
+            .build_pipeline()
+        )
+        hrp_ptf = hrp_pipe.fit(rets).predict(rets)
+        assert float(hrp_ptf.risk_free_rate) == pytest.approx(expected_rfr, abs=1e-12)
+
+    # Explicit non-zero user optimizer risk_free_rate is preserved
+    bl_ex = synth.build_black_litterman_prior(risk_free_rate=0.0504)
+    explicit_rfr = 0.02 / 252.0
+    custom_pipe = (
+        StrategyBuilder(prior=bl_ex)
+        .set_optimizer(MeanRisk(risk_free_rate=explicit_rfr))
+        .build_pipeline()
+    )
+    assert custom_pipe.steps[-1][1].risk_free_rate == pytest.approx(
+        explicit_rfr, abs=1e-12
+    )
+
+
+def test_strategy_builder_injects_fees_via_portfolio_params_and_warns_tc(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Sprint 5 (N2): EqualWeighted/InverseVolatility receive fees via portfolio_params and warn on tc."""
+    import logging
+
+    from skfolio.optimization import EqualWeighted, InverseVolatility
+
+    rng = np.random.default_rng(23)
+    idx = pd.bdate_range("2024-01-02", periods=40)
+    rets = pd.DataFrame(
+        rng.normal(0.0005, 0.01, (40, 3)),
+        index=idx,
+        columns=["A", "B", "C"],
+    )
+    fees = {"A": 0.005 / 252.0, "B": 0.005 / 252.0, "C": 0.005 / 252.0}
+    spec = ConstraintSpec(management_fees=fees, transaction_costs=0.005)
+
+    for cls in (EqualWeighted, InverseVolatility):
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="flowportfolio.strategies"):
+            pipe = (
+                StrategyBuilder(constraints=spec).set_optimizer(cls()).build_pipeline()
+            )
+        ptf = pipe.fit(rets).predict(rets)
+        assert float(ptf.total_fee) > 0.0
+        assert any("transaction_costs" in rec.message for rec in caplog.records)
+
+
+def test_safe_pre_selection_forwards_wrapped_transformer_params_to_grid_search() -> (
+    None
+):
+    """Sprint 5 (N3): pre_0__<param> works identically with ConstraintSpec wrapping."""
+    from skfolio.pre_selection import DropCorrelated
+    from sklearn.model_selection import GridSearchCV
+
+    rng = np.random.default_rng(29)
+    idx = pd.bdate_range("2024-01-02", periods=60)
+    rets = pd.DataFrame(
+        rng.normal(0.0005, 0.01, (60, 3)),
+        index=idx,
+        columns=["A", "B", "C"],
+    )
+    spec = ConstraintSpec(management_fees={"A": 0.001, "B": 0.001, "C": 0.001})
+    pipe = (
+        StrategyBuilder(constraints=spec)
+        .add_pre_selection(DropCorrelated(threshold=0.95))
+        .set_optimizer(MeanRisk())
+        .build_pipeline()
+    )
+    assert pipe.get_params()["pre_0__threshold"] == pytest.approx(0.95)
+    pipe.set_params(pre_0__threshold=0.70)
+    assert pipe.steps[0][1].transformer.threshold == pytest.approx(0.70)
+
+    gs = GridSearchCV(pipe, param_grid={"pre_0__threshold": [0.7, 0.9]}, cv=2)
+    gs.fit(rets)
+    assert gs.best_params_["pre_0__threshold"] in (0.7, 0.9)
