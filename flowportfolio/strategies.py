@@ -549,6 +549,8 @@ class StrategyBuilder:
     _linear_constraints: list[str]
     _groups: dict[str, list[str]]
     _transaction_costs: dict[str, float] | float | None
+    _holding_period: float | None
+    _tc_from_spec: bool
 
     def _apply_constraints(self, value: list[str] | ConstraintSpec | None) -> None:
         if value is None:
@@ -559,6 +561,8 @@ class StrategyBuilder:
             self._max_turnover = None
             self._management_fees = None
             self._transaction_costs = None
+            self._holding_period = None
+            self._tc_from_spec = False
         elif isinstance(value, ConstraintSpec):
             self._constraints = value
             self._linear_constraints = list(value.linear_constraints)
@@ -579,6 +583,8 @@ class StrategyBuilder:
                 if isinstance(value.transaction_costs, dict)
                 else value.transaction_costs
             )
+            self._holding_period = value.holding_period
+            self._tc_from_spec = value.transaction_costs is not None
         elif isinstance(value, list):
             if not all(isinstance(c, str) for c in value):
                 raise TypeError("All constraints must be strings.")
@@ -589,6 +595,8 @@ class StrategyBuilder:
             self._max_turnover = None
             self._management_fees = None
             self._transaction_costs = None
+            self._holding_period = None
+            self._tc_from_spec = False
         else:
             raise TypeError("constraints must be a list or ConstraintSpec.")
 
@@ -893,7 +901,11 @@ class StrategyBuilder:
 
         steps.append(("optimizer", cloned_optimizer))
 
-        return Pipeline(steps)
+        pipeline = Pipeline(steps)
+        if self._tc_from_spec:
+            pipeline._flowportfolio_holding_period = self._holding_period
+            pipeline._flowportfolio_tc_from_spec = True
+        return pipeline
 
     def build_nco(
         self,

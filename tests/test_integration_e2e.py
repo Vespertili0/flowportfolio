@@ -284,3 +284,48 @@ def test_unmocked_pipeline_combinatorial(
         "drawdown_distribution",
         "best_composition",
     }
+
+
+def test_unmocked_pipeline_transaction_cost_horizon_and_default_n_jobs(
+    deterministic_universe: Universe,
+) -> None:
+    """P1-1, P1-2, P2-9d E2E: Default n_jobs=-1 with ConstraintBuilder costs charges cost*turnover per fold with zero warnings."""
+    raw_cost = 0.002
+    spec = ConstraintBuilder(deterministic_universe).transaction_costs(raw_cost).build()
+    pipe = (
+        StrategyBuilder(constraints=spec)
+        .set_optimizer(MeanRisk(objective_function=ObjectiveFunction.MAXIMIZE_UTILITY))
+        .build_pipeline()
+    )
+    engine = PortfolioExperimentEngine(deterministic_universe)  # default n_jobs=-1
+    engine.add_strategy("CostAware", pipe, {"optimizer__l2_coef": [0.0]})
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = engine.run_robustness_test(
+            cv_type="walk_forward",
+            train_size=120,
+            test_size=63,
+            return_result=True,
+        )
+
+    bad_warns = [
+        w
+        for w in caught
+        if issubclass(w.category, (RuntimeWarning, UserWarning))
+        and (
+            issubclass(w.category, RuntimeWarning)
+            or "Parallel processing has been disabled" in str(w.message)
+        )
+    ]
+    assert bad_warns == []
+
+    mpp = result.population[0]
+    assert isinstance(mpp, MultiPeriodPortfolio)
+    assert mpp.portfolios[0].annualization_factor == pytest.approx(252.0)
+    for prev_fold, fold in zip(mpp.portfolios[:-1], mpp.portfolios[1:], strict=True):
+        l1_turnover = float(np.sum(np.abs(fold.weights - prev_fold.ending_weights)))
+        integrated_cost = len(fold.returns) * float(fold.total_cost)
+        assert integrated_cost == pytest.approx(
+            raw_cost * l1_turnover, rel=1e-6, abs=1e-9
+        )

@@ -80,6 +80,7 @@ class ConstraintSpec:
     max_turnover: float | None = None
     management_fees: dict[str, float] | None = None
     transaction_costs: dict[str, float] | float | None = None
+    holding_period: float | None = None
 
     def __iter__(self) -> Iterator[str]:
         return iter(self.linear_constraints)
@@ -102,6 +103,7 @@ class ConstraintSpec:
                 and self.max_turnover == other.max_turnover
                 and self.management_fees == other.management_fees
                 and self.transaction_costs == other.transaction_costs
+                and self.holding_period == other.holding_period
             )
         if isinstance(other, list):
             return self.linear_constraints == other
@@ -119,12 +121,14 @@ class ConstraintBuilder:
     universe : UniverseProtocol
         The asset universe satisfying :class:`~flowportfolio.core.protocols.UniverseProtocol`
         from which group metadata and ticker lists are drawn.
-    holding_period : float, optional
+    holding_period : float | None, optional
         Expected holding horizon expressed in return periods matching
         ``universe.returns`` (e.g. ``21`` for monthly rebalancing on daily
-        returns, ``1`` for single-period or already-amortized costs). Used to
-        amortize proportional transaction costs in :meth:`transaction_costs`.
-        Default is ``1.0``.
+        returns, ``63`` for quarterly rebalancing). When provided, proportional
+        transaction costs in :meth:`transaction_costs` are divided by
+        ``holding_period``. When ``None`` (default), costs remain unamortized
+        in :class:`ConstraintSpec` so :class:`PortfolioExperimentEngine` can
+        reconcile them automatically to the outer evaluation ``test_size``.
 
     Raises
     ------
@@ -137,7 +141,7 @@ class ConstraintBuilder:
     """
 
     def __init__(
-        self, universe: UniverseProtocol, *, holding_period: float = 1.0
+        self, universe: UniverseProtocol, *, holding_period: float | None = None
     ) -> None:
         if not hasattr(universe, "tickers") or not hasattr(universe, "metadata"):
             raise TypeError(
@@ -148,7 +152,11 @@ class ConstraintBuilder:
             raise TypeError("universe.metadata must be a dictionary.")
         if not isinstance(universe.tickers, list):
             raise TypeError("universe.tickers must be a list.")
-        self._holding_period: float = _validate_holding_period(holding_period)
+        self._holding_period: float | None = (
+            _validate_holding_period(holding_period)
+            if holding_period is not None
+            else None
+        )
         self._universe = universe
         self._valid_groups: set[str] = {
             str(universe.metadata[t])
@@ -159,6 +167,7 @@ class ConstraintBuilder:
         self._max_turnover: float | None = None
         self._previous_weights: dict[str, float] | None = None
         self._transaction_costs: dict[str, float] | float | None = None
+        self._tc_holding_period: float | None = None
 
     def _validate_group_name(self, group_name: str) -> None:
         """Validate group identifier syntax and universe membership."""
@@ -294,11 +303,12 @@ class ConstraintBuilder:
             tickers not in the universe, or if ``holding_period`` is not
             strictly positive and finite.
         """
-        hp = (
+        explicit_hp = (
             self._holding_period
             if holding_period is None
             else _validate_holding_period(holding_period)
         )
+        hp = explicit_hp if explicit_hp is not None else 1.0
 
         if isinstance(costs, (int, float)) and not isinstance(costs, bool):
             cost_val = float(costs)
@@ -307,6 +317,7 @@ class ConstraintBuilder:
                     "Transaction costs must be a non-negative finite number."
                 )
             self._transaction_costs = cost_val / hp
+            self._tc_holding_period = explicit_hp
         elif isinstance(costs, dict):
             unknown_tickers = set(costs.keys()) - set(self._universe.tickers)
             if unknown_tickers:
@@ -327,6 +338,7 @@ class ConstraintBuilder:
                     )
                 cost_dict[ticker] = c_val / hp
             self._transaction_costs = cost_dict
+            self._tc_holding_period = explicit_hp
         else:
             raise TypeError(
                 "Transaction costs must be a float or a dictionary of floats."
@@ -464,6 +476,9 @@ class ConstraintBuilder:
                 if isinstance(self._transaction_costs, dict)
                 else self._transaction_costs
             ),
+            holding_period=(
+                self._tc_holding_period if self._transaction_costs is not None else None
+            ),
         )
 
     def reset(self) -> ConstraintBuilder:
@@ -483,4 +498,5 @@ class ConstraintBuilder:
         self._max_turnover = None
         self._previous_weights = None
         self._transaction_costs = None
+        self._tc_holding_period = None
         return self

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 from dataclasses import dataclass
 from typing import Any, Literal, TypedDict, overload
 
@@ -27,6 +28,10 @@ from skfolio.model_selection import (
 )
 from sklearn.base import BaseEstimator, clone
 
+from flowportfolio.core.constraints import (
+    _resolve_periods_per_year,
+    _validate_holding_period,
+)
 from flowportfolio.core.optimisation import SkfolioGridSearchCV as GridSearchCV
 from flowportfolio.core.optimisation import set_previous_weights_chain
 from flowportfolio.core.protocols import UniverseProtocol
@@ -36,7 +41,9 @@ logger = logging.getLogger(__name__)
 
 class StrategyConfig(TypedDict):
     estimator: BaseEstimator
-    grid: dict
+    grid: dict[str, Any]
+    holding_period: float | None
+    tc_from_spec: bool
 
 
 @dataclass(frozen=True)
@@ -210,6 +217,86 @@ def _build_entry_rebalancing_params(
     return params or None
 
 
+def _scale_transaction_costs_chain(
+    opt: Any, divisor: float, _visited: set[int] | None = None
+) -> None:
+    """Divide ``transaction_costs`` by ``divisor`` across a Pipeline, optimizer, and fallback chain."""
+    if opt is None or divisor <= 0.0:
+        return
+    visited = _visited if _visited is not None else set()
+    if id(opt) in visited:
+        return
+    visited.add(id(opt))
+
+    if hasattr(opt, "steps") and opt.steps:
+        for _step_name, step in opt.steps:
+            _scale_transaction_costs_chain(step, divisor, _visited=visited)
+        return
+
+    tc = getattr(opt, "transaction_costs", None)
+    if tc is not None:
+        if isinstance(tc, (int, float)) and not isinstance(tc, bool):
+            opt.transaction_costs = float(tc) / divisor
+        elif isinstance(tc, dict):
+            opt.transaction_costs = {k: float(v) / divisor for k, v in tc.items()}
+        else:
+            try:
+                opt.transaction_costs = np.asarray(tc, dtype=float) / divisor
+            except (TypeError, ValueError):
+                pass
+
+    fb = getattr(opt, "fallback", None)
+    if fb is not None:
+        _scale_transaction_costs_chain(fb, divisor, _visited=visited)
+
+
+def _reconcile_transaction_costs_horizon(
+    name: str,
+    est_clone: Any,
+    target_opt: Any,
+    *,
+    holding_period: float | None,
+    tc_from_spec: bool,
+    outer_test_size: float,
+) -> None:
+    """Reconcile per-observation skfolio transaction costs with the outer evaluation fold horizon."""
+    if not _has_transaction_costs(target_opt) or outer_test_size <= 1.0:
+        return
+
+    if holding_period is None and tc_from_spec:
+        _scale_transaction_costs_chain(est_clone, float(outer_test_size))
+        logger.info(
+            "Strategy '%s': amortized unamortized ConstraintBuilder transaction_costs "
+            "over outer evaluation horizon test_size=%g so cumulative fold cost equals "
+            "cost * turnover.",
+            name,
+            outer_test_size,
+        )
+    elif holding_period is not None:
+        rel_diff = abs(holding_period - outer_test_size) / max(
+            holding_period, outer_test_size
+        )
+        if rel_diff > 0.25:
+            logger.warning(
+                "Strategy '%s': configured transaction_costs holding_period=%g differs "
+                "from outer evaluation test_size=%g; skfolio charges transaction_costs "
+                "per observation, scaling cumulative fold cost by %.2fx.",
+                name,
+                holding_period,
+                outer_test_size,
+                outer_test_size / holding_period,
+            )
+    else:
+        logger.warning(
+            "Strategy '%s': raw estimator transaction_costs configured without an "
+            "explicit holding_period while outer evaluation test_size=%g; skfolio "
+            "charges transaction_costs per observation. Pass holding_period via "
+            "ConstraintBuilder or add_strategy() to avoid over-charging.",
+            name,
+            outer_test_size,
+        )
+
+
 def _extract_weights_dict(
     model: Any, fallback_columns: pd.Index
 ) -> dict[str, float] | None:
@@ -223,7 +310,7 @@ def _extract_weights_dict(
 
 
 def _extract_terminal_oos_weights(portfolio: Any) -> dict[str, float] | None:
-    """Extract the terminal OOS weights_dict from a Portfolio, MultiPeriodPortfolio, or Population."""
+    """Extract drifted terminal OOS weights (``ending_weights_dict``) from a Portfolio or Population."""
     ports_list = (
         list(portfolio)
         if type(portfolio).__name__ == "Population" or isinstance(portfolio, list)
@@ -232,11 +319,14 @@ def _extract_terminal_oos_weights(portfolio: Any) -> dict[str, float] | None:
     if not ports_list:
         return None
     last_p = ports_list[-1]
-    raw = (
-        getattr(last_p.portfolios[-1], "weights_dict", None)
+    terminal = (
+        last_p.portfolios[-1]
         if hasattr(last_p, "portfolios") and last_p.portfolios
-        else getattr(last_p, "weights_dict", None)
+        else last_p
     )
+    raw = getattr(terminal, "ending_weights_dict", None)
+    if not isinstance(raw, dict):
+        raw = getattr(terminal, "weights_dict", None)
     if isinstance(raw, dict):
         return {str(k): float(v) for k, v in raw.items()}
     return None
@@ -292,6 +382,8 @@ class PortfolioExperimentEngine:
         name: str,
         estimator: BaseEstimator,
         grid: dict[str, Any],
+        *,
+        holding_period: float | None = None,
     ) -> None:
         """Register a new strategy for benchmarking.
 
@@ -303,14 +395,20 @@ class PortfolioExperimentEngine:
             The scikit-learn compatible estimator or pipeline to be tuned.
         grid : dict
             The hyperparameter search grid for the estimator.
+        holding_period : float | None, optional
+            Explicit holding horizon (in return periods) already used to
+            amortize ``transaction_costs`` on ``estimator``. When omitted,
+            inherits metadata from ``StrategyBuilder`` / ``ConstraintSpec`` if
+            present.
 
         Raises
         ------
         TypeError
             If ``name`` is not a string, ``estimator`` is not a ``BaseEstimator``,
-            or ``grid`` is not a dictionary.
+            ``grid`` is not a dictionary, or ``holding_period`` is not numeric.
         ValueError
-            If ``name`` is empty or if the strategy name is already registered.
+            If ``name`` is empty, if the strategy name is already registered,
+            or if ``holding_period`` is not strictly positive and finite.
         """
         if not isinstance(name, str):
             raise TypeError("Strategy name must be a string.")
@@ -323,10 +421,51 @@ class PortfolioExperimentEngine:
         if name in self._strategies:
             raise ValueError(f"Strategy '{name}' is already registered.")
 
+        resolved_hp: float | None
+        if holding_period is not None:
+            resolved_hp = _validate_holding_period(holding_period)
+        else:
+            raw_hp = getattr(estimator, "_flowportfolio_holding_period", None)
+            resolved_hp = (
+                _validate_holding_period(raw_hp) if raw_hp is not None else None
+            )
+        tc_from_spec = bool(getattr(estimator, "_flowportfolio_tc_from_spec", False))
+
         self._strategies[name] = {
             "estimator": clone(estimator),
             "grid": dict(grid),
+            "holding_period": resolved_hp,
+            "tc_from_spec": tc_from_spec,
         }
+
+    @staticmethod
+    def _resolve_outer_test_size(
+        cv_type: str,
+        outer_cv: Any,
+        resolved_outer_kwargs: dict[str, Any],
+        returns: pd.DataFrame,
+    ) -> float:
+        """Resolve effective outer test fold length (in return observations)."""
+        if (
+            cv_type == "walk_forward"
+            and resolved_outer_kwargs.get("freq") is None
+            and "test_size" in resolved_outer_kwargs
+        ):
+            ts = float(resolved_outer_kwargs["test_size"])
+            if math.isfinite(ts) and ts >= 1.0:
+                return ts
+        try:
+            test_lens: list[int] = []
+            for _train_idx, test_idx in outer_cv.split(returns):
+                if isinstance(test_idx, list):
+                    test_lens.extend(len(t) for t in test_idx if len(t) > 0)
+                elif len(test_idx) > 0:
+                    test_lens.append(len(test_idx))
+            if test_lens:
+                return float(np.median(test_lens))
+        except (ValueError, TypeError, AttributeError) as exc:
+            logger.debug("Could not infer outer test size from splitter: %s", exc)
+        return 1.0
 
     def _resolve_cv_splitter(self, cv_type: str, **cv_kwargs):
         """Resolve a cv_type string to a skfolio CV splitter instance.
@@ -494,9 +633,6 @@ class PortfolioExperimentEngine:
             If ``cv_type`` is not one of the supported strings, or if
             ``universe.returns`` is unavailable.
         """
-        self._latest_weights = {}
-        self._last_result = None
-
         # 1. Resolve CV protocols
         resolved_outer_kwargs = dict(cv_kwargs)
         if cv_type == "walk_forward":
@@ -506,11 +642,15 @@ class PortfolioExperimentEngine:
 
         # 2. Extract returns (will raise ValueError if not fetched)
         returns = self._universe.returns
+        annualization_factor = _resolve_periods_per_year(self._universe)
 
         # Determine the size of the outer training window, which bounds the data
         # available to the inner hyperparameter search.
         outer_train = self._resolve_outer_train_size(
             cv_type, outer_cv, resolved_outer_kwargs, len(returns), returns
+        )
+        outer_test_size = self._resolve_outer_test_size(
+            cv_type, outer_cv, resolved_outer_kwargs, returns
         )
 
         if inner_cv_kwargs is not None:
@@ -576,8 +716,9 @@ class PortfolioExperimentEngine:
         if not self._strategies:
             raise RuntimeError("No strategies registered. Call add_strategy() first.")
 
-        # 3. Process each strategy
-        collected = []
+        # 3. Process each strategy using run-local accumulators (concurrency safe)
+        collected: list[Any] = []
+        run_latest_weights: dict[str, dict[str, float]] = {}
         equal_weights = {col: 1.0 / len(returns.columns) for col in returns.columns}
         for name, config in self._strategies.items():
             est_clone = clone(config["estimator"])
@@ -586,6 +727,15 @@ class PortfolioExperimentEngine:
                 if hasattr(est_clone, "steps") and est_clone.steps
                 else est_clone
             )
+            _reconcile_transaction_costs_horizon(
+                name,
+                est_clone,
+                target_opt,
+                holding_period=config["holding_period"],
+                tc_from_spec=config["tc_from_spec"],
+                outer_test_size=outer_test_size,
+            )
+
             user_previous_weights = copy.deepcopy(
                 getattr(target_opt, "previous_weights", None)
             )
@@ -631,10 +781,18 @@ class PortfolioExperimentEngine:
             )
 
             # b. Out-of-sample journey simulation
+            # skfolio disables parallel execution with a UserWarning whenever
+            # previous_weights / friction / entry_rebalancing_params are active.
+            effective_n_jobs = (
+                None if (has_friction or entry_params is not None) else self._n_jobs
+            )
             cv_predict_kwargs: dict[str, Any] = {
                 "cv": outer_cv,
-                "n_jobs": self._n_jobs,
-                "portfolio_params": {"tag": name},
+                "n_jobs": effective_n_jobs,
+                "portfolio_params": {
+                    "tag": name,
+                    "annualization_factor": annualization_factor,
+                },
             }
             if entry_params is not None:
                 cv_predict_kwargs["entry_rebalancing_params"] = entry_params
@@ -660,7 +818,7 @@ class PortfolioExperimentEngine:
                 live_search.fit(live_window)
                 live_w = _extract_weights_dict(live_search, live_window.columns)
                 if live_w is not None:
-                    self._latest_weights[name] = live_w
+                    run_latest_weights[name] = live_w
             except Exception:
                 logger.warning(
                     "Live terminal refit failed for strategy '%s'", name, exc_info=True
@@ -671,18 +829,26 @@ class PortfolioExperimentEngine:
             else:
                 collected.append(portfolio)
 
-        return self._finalize_run(collected, return_result=return_result)
+        return self._finalize_run(
+            collected, run_latest_weights, return_result=return_result
+        )
 
     def _finalize_run(
-        self, collected: list[Any], *, return_result: bool
+        self,
+        collected: list[Any],
+        run_latest_weights: dict[str, dict[str, float]],
+        *,
+        return_result: bool,
     ) -> Population | ExperimentResult:
         """Assemble Population, record immutable ExperimentResult, and return requested view."""
+        live_copy = {k: dict(v) for k, v in run_latest_weights.items()}
         pop = Population(collected)
         try:
-            pop.latest_weights_by_tag = self.latest_weights
+            pop.latest_weights_by_tag = {k: dict(v) for k, v in live_copy.items()}
         except AttributeError:
             pass
-        result = ExperimentResult(population=pop, live_weights=self.latest_weights)
+        result = ExperimentResult(population=pop, live_weights=live_copy)
+        self._latest_weights = live_copy
         self._last_result = result
         return result if return_result else pop
 
@@ -788,9 +954,6 @@ class PortfolioExperimentEngine:
         RuntimeError
             If no strategies have been registered via add_strategy().
         """
-        self._latest_weights = {}
-        self._last_result = None
-
         if not self._strategies:
             raise RuntimeError("No strategies registered. Call add_strategy() first.")
 
@@ -807,6 +970,7 @@ class PortfolioExperimentEngine:
             )
 
         returns = self._universe.returns
+        annualization_factor = _resolve_periods_per_year(self._universe)
 
         if burn_in_size is None:
             burn_in_size = int(
@@ -860,8 +1024,10 @@ class PortfolioExperimentEngine:
         predict_kwargs = {
             k: v for k, v in cv_kwargs.items() if k in online_predict_keys
         }
+        online_test_size = float(predict_kwargs.get("test_size", 1))
 
-        collected = []
+        collected: list[Any] = []
+        run_latest_weights: dict[str, dict[str, float]] = {}
         equal_weights = {col: 1.0 / len(returns.columns) for col in returns.columns}
         for name, config in self._strategies.items():
             est = clone(config["estimator"])
@@ -880,6 +1046,14 @@ class PortfolioExperimentEngine:
                 }
 
             self._validate_online_estimator(name, est)
+            _reconcile_transaction_costs_horizon(
+                name,
+                est,
+                est,
+                holding_period=config["holding_period"],
+                tc_from_spec=config["tc_from_spec"],
+                outer_test_size=online_test_size,
+            )
 
             user_previous_weights = copy.deepcopy(
                 getattr(est, "previous_weights", None)
@@ -915,7 +1089,10 @@ class PortfolioExperimentEngine:
                 best_model,
                 returns,
                 warmup_size=burn_in_size,
-                portfolio_params={"tag": name},
+                portfolio_params={
+                    "tag": name,
+                    "annualization_factor": annualization_factor,
+                },
                 entry_rebalancing_params=entry_params,
                 **predict_kwargs,
             )
@@ -934,9 +1111,9 @@ class PortfolioExperimentEngine:
                     live_model.partial_fit(post_burn_in_returns)
                 live_w = _extract_weights_dict(live_model, returns.columns)
                 if live_w is not None:
-                    self._latest_weights[name] = live_w
+                    run_latest_weights[name] = live_w
                 elif term_w is not None:
-                    self._latest_weights[name] = dict(term_w)
+                    run_latest_weights[name] = dict(term_w)
             except Exception:
                 logger.warning(
                     "Streaming live partial_fit failed for strategy '%s'",
@@ -944,11 +1121,13 @@ class PortfolioExperimentEngine:
                     exc_info=True,
                 )
                 if term_w is not None:
-                    self._latest_weights[name] = dict(term_w)
+                    run_latest_weights[name] = dict(term_w)
 
             if type(portfolio).__name__ == "Population" or isinstance(portfolio, list):
                 collected.extend(portfolio)
             else:
                 collected.append(portfolio)
 
-        return self._finalize_run(collected, return_result=return_result)
+        return self._finalize_run(
+            collected, run_latest_weights, return_result=return_result
+        )

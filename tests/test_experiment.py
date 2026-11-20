@@ -598,3 +598,241 @@ def test_experiment_module_free_of_mock_name_and_slots_monkey_patch() -> None:
     source = inspect.getsource(exp_module)
     assert "_mock_name" not in source
     assert "latest_weights_dict" not in source
+
+
+# ---------------------------------------------------------------------------
+# Cycle 14 (P1-1, P1-2, P2-7, P2-9c, P2-9d): Annualisation, Cost Horizon,
+# Drifted Refit Seeding, Concurrency Isolation & Friction n_jobs
+# ---------------------------------------------------------------------------
+
+
+def test_engine_forwards_universe_periods_per_year_as_annualization_factor() -> None:
+    """P1-1: Both run_robustness_test and run_online_evaluation forward periods_per_year as annualization_factor."""
+    import math
+
+    rng = np.random.default_rng(17)
+    dates = pd.date_range("2015-01-31", periods=96, freq="BME")
+    rets = pd.DataFrame(
+        rng.normal([0.006, 0.003, 0.004], [0.04, 0.02, 0.03], size=(96, 3)),
+        index=dates,
+        columns=["A", "B", "C"],
+    )
+
+    class _MonthlyProtocolUniverse:
+        def __init__(self) -> None:
+            self.tickers = ["A", "B", "C"]
+            self.metadata = {"A": "eq", "B": "fi", "C": "alt"}
+            self.fees = {"A": 0.001, "B": 0.001, "C": 0.001}
+            self.returns = rets
+            self.periods_per_year = 12
+
+    monthly_u = _MonthlyProtocolUniverse()
+
+    # 1. Batch walk-forward
+    eng_batch = PortfolioExperimentEngine(monthly_u, n_jobs=1)  # type: ignore[arg-type]
+    eng_batch.add_strategy("M", MeanRisk(), {"l2_coef": [0.0]})
+    pop_batch = eng_batch.run_robustness_test(
+        cv_type="walk_forward", train_size=36, test_size=12
+    )
+    mpp_batch = pop_batch[0]
+    assert mpp_batch.portfolios[0].annualization_factor == pytest.approx(12.0)
+    assert mpp_batch.annualized_sharpe_ratio == pytest.approx(
+        float(mpp_batch.sharpe_ratio) * math.sqrt(12.0), rel=1e-9, abs=1e-12
+    )
+
+    # 2. Online evaluation
+    eng_online = PortfolioExperimentEngine(monthly_u, n_jobs=1)  # type: ignore[arg-type]
+    eng_online.add_strategy(
+        "MOnline",
+        MeanRisk(
+            prior_estimator=EmpiricalPrior(
+                mu_estimator=EWMu(half_life=12),
+                covariance_estimator=EWCovariance(half_life=12),
+            )
+        ),
+        {"l2_coef": [0.0]},
+    )
+    pop_online = eng_online.run_online_evaluation(burn_in_size=36, test_size=12)
+    mpp_online = pop_online[0]
+    assert mpp_online.portfolios[0].annualization_factor == pytest.approx(12.0)
+    assert mpp_online.annualized_sharpe_ratio == pytest.approx(
+        float(mpp_online.sharpe_ratio) * math.sqrt(12.0), rel=1e-9, abs=1e-12
+    )
+
+
+def test_transaction_costs_reconciled_to_outer_test_size_and_mismatch_warned(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """P1-2: Default unamortized ConstraintBuilder transaction_costs scale by outer test_size so fold cost == cost * turnover."""
+    import logging
+
+    from flowportfolio.core.constraints import ConstraintBuilder
+    from flowportfolio.strategies import StrategyBuilder
+
+    rng = np.random.default_rng(99)
+    n_obs = 320
+    dates = pd.bdate_range("2024-01-02", periods=n_obs)
+    # Regime shift at index 120: Fold 0 trains on [0:120] (A wins), Fold 2 trains on [126:246] (B wins)
+    r_a = np.concatenate([rng.normal(0.005, 0.01, 120), rng.normal(-0.005, 0.01, 200)])
+    r_b = np.concatenate([rng.normal(-0.005, 0.01, 120), rng.normal(0.005, 0.01, 200)])
+    r_c = rng.normal(0.0005, 0.008, n_obs)
+    rets = pd.DataFrame({"A": r_a, "B": r_b, "C": r_c}, index=dates)
+
+    u = Universe(
+        ["A", "B", "C"],
+        {"A": "eq", "B": "eq", "C": "fi"},
+        {"A": 0.0, "B": 0.0, "C": 0.0},
+    )
+    u._returns = rets
+    u._prices = 100.0 * (1.0 + rets).cumprod()
+
+    raw_cost = 0.001
+    # 1. Default ConstraintBuilder (no explicit holding_period) -> reconciled to test_size=63
+    spec_default = ConstraintBuilder(u).transaction_costs(raw_cost).build()
+    pipe_default = (
+        StrategyBuilder(constraints=spec_default)
+        .set_optimizer(MeanRisk(objective_function=ObjectiveFunction.MAXIMIZE_UTILITY))
+        .build_pipeline()
+    )
+
+    eng = PortfolioExperimentEngine(u, n_jobs=1)
+    eng.add_strategy("DefaultTC", pipe_default, {"optimizer__l2_coef": [0.0]})
+    pop = eng.run_robustness_test(cv_type="walk_forward", train_size=120, test_size=63)
+    mpp = pop[0]
+    assert len(mpp.portfolios) >= 2
+    assert mpp.portfolios[0].total_cost == pytest.approx(0.0, abs=1e-12)
+
+    checked_turnover = False
+    for prev_fold, fold in zip(mpp.portfolios[:-1], mpp.portfolios[1:], strict=True):
+        l1_turnover = float(np.sum(np.abs(fold.weights - prev_fold.ending_weights)))
+        if l1_turnover > 1e-3:
+            checked_turnover = True
+            integrated_cost = len(fold.returns) * float(fold.total_cost)
+            assert integrated_cost == pytest.approx(
+                raw_cost * l1_turnover, rel=1e-6, abs=1e-9
+            )
+    assert checked_turnover
+
+    # 2. Explicit holding_period=1 with test_size=63 -> respects user setting AND logs mismatch warning
+    spec_explicit = (
+        ConstraintBuilder(u, holding_period=1.0).transaction_costs(raw_cost).build()
+    )
+    pipe_explicit = (
+        StrategyBuilder(constraints=spec_explicit)
+        .set_optimizer(MeanRisk(objective_function=ObjectiveFunction.MAXIMIZE_UTILITY))
+        .build_pipeline()
+    )
+    eng_warn = PortfolioExperimentEngine(u, n_jobs=1)
+    eng_warn.add_strategy("ExplicitTC", pipe_explicit, {"optimizer__l2_coef": [0.0]})
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="flowportfolio.core.experiment"):
+        eng_warn.run_robustness_test(
+            cv_type="walk_forward", train_size=120, test_size=63
+        )
+    assert any("holding_period" in rec.message for rec in caplog.records)
+
+
+def test_extract_terminal_oos_weights_uses_drifted_ending_weights_dict() -> None:
+    """P2-7: _extract_terminal_oos_weights must prefer drifted ending_weights_dict over starting weights_dict."""
+    from skfolio import MultiPeriodPortfolio, Portfolio
+
+    from flowportfolio.core.experiment import _extract_terminal_oos_weights
+
+    dates = pd.bdate_range("2025-01-02", periods=10)
+    X = pd.DataFrame({"A": [0.05] * 10, "B": [-0.02] * 10}, index=dates)
+    p_drifted = Portfolio(X=X, weights=np.array([0.5, 0.5]), weight_drift=True)
+    mpp = MultiPeriodPortfolio(portfolios=[p_drifted], name="drifted", tag="D")
+
+    extracted = _extract_terminal_oos_weights(mpp)
+    assert extracted is not None
+    assert extracted["A"] == pytest.approx(
+        p_drifted.ending_weights_dict["A"], rel=0, abs=1e-12
+    )
+    assert extracted["B"] == pytest.approx(
+        p_drifted.ending_weights_dict["B"], rel=0, abs=1e-12
+    )
+    assert extracted["A"] > 0.60
+
+
+def test_engine_run_local_state_preserves_prior_results_on_failure_and_concurrency(
+    stub_universe: Universe,
+) -> None:
+    """P2-9c: Failed runs do not clobber prior latest_weights, and concurrent runs return isolated ExperimentResults."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    eng = PortfolioExperimentEngine(stub_universe, n_jobs=1)
+    eng.add_strategy("S", MeanRisk(), {"l2_coef": [0.0]})
+
+    first = eng.run_robustness_test(
+        cv_type="walk_forward", train_size=60, test_size=20, return_result=True
+    )
+    # Invalid cv_type must fail WITHOUT wiping prior latest_weights / last_result
+    with pytest.raises(ValueError, match="Unknown cv_type"):
+        eng.run_robustness_test(cv_type="bogus")
+    assert eng.latest_weights == first.live_weights
+    assert eng.last_result == first
+
+    # Independent oracles for two distinct train_size configurations
+    eng_o1 = PortfolioExperimentEngine(stub_universe, n_jobs=1)
+    eng_o1.add_strategy("S", MeanRisk(), {"l2_coef": [0.0]})
+    oracle_60 = eng_o1.run_robustness_test(
+        cv_type="walk_forward", train_size=60, test_size=20, return_result=True
+    )
+    eng_o2 = PortfolioExperimentEngine(stub_universe, n_jobs=1)
+    eng_o2.add_strategy("S", MeanRisk(), {"l2_coef": [0.0]})
+    oracle_100 = eng_o2.run_robustness_test(
+        cv_type="walk_forward", train_size=100, test_size=20, return_result=True
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f1 = pool.submit(
+            eng.run_robustness_test,
+            cv_type="walk_forward",
+            train_size=60,
+            test_size=20,
+            return_result=True,
+        )
+        f2 = pool.submit(
+            eng.run_robustness_test,
+            cv_type="walk_forward",
+            train_size=100,
+            test_size=20,
+            return_result=True,
+        )
+        r1 = f1.result()
+        r2 = f2.result()
+
+    for col in stub_universe.tickers:
+        assert r1.live_weights["S"][col] == pytest.approx(
+            oracle_60.live_weights["S"][col], abs=1e-12
+        )
+        assert r2.live_weights["S"][col] == pytest.approx(
+            oracle_100.live_weights["S"][col], abs=1e-12
+        )
+
+
+def test_default_n_jobs_with_friction_emits_no_skfolio_parallel_warning(
+    stub_universe: Universe,
+) -> None:
+    """P2-9d: Default n_jobs=-1 with rebalancing friction must not trigger skfolio's parallel-disabled UserWarning."""
+    import warnings
+
+    from flowportfolio.core.constraints import ConstraintBuilder
+    from flowportfolio.strategies import StrategyBuilder
+
+    spec = ConstraintBuilder(stub_universe).transaction_costs(0.001).build()
+    pipe = StrategyBuilder(constraints=spec).set_optimizer(MeanRisk()).build_pipeline()
+    eng = PortfolioExperimentEngine(stub_universe)  # default n_jobs=-1
+    eng.add_strategy("FrictionStrat", pipe, {"optimizer__l2_coef": [0.0]})
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        eng.run_robustness_test(cv_type="walk_forward", train_size=60, test_size=20)
+
+    parallel_warns = [
+        w
+        for w in caught
+        if issubclass(w.category, UserWarning)
+        and "Parallel processing has been disabled" in str(w.message)
+    ]
+    assert parallel_warns == []
