@@ -320,43 +320,72 @@ def _reconcile_transaction_costs_horizon(
     holding_period: float | None,
     tc_from_spec: bool,
     outer_test_size: float,
+    inner_test_size: float | None = None,
 ) -> None:
-    """Reconcile per-observation skfolio transaction costs with the outer evaluation fold horizon."""
-    if not _has_chain_transaction_costs(target_opt) or outer_test_size <= 1.0:
+    """Reconcile per-observation skfolio transaction costs with outer and inner CV fold horizons."""
+    if not _has_chain_transaction_costs(target_opt):
         return
 
-    if holding_period is None and tc_from_spec:
-        _scale_transaction_costs_chain(est_clone, float(outer_test_size))
-        logger.info(
-            "Strategy '%s': amortized unamortized ConstraintBuilder transaction_costs "
-            "over outer evaluation horizon test_size=%g so cumulative fold cost equals "
-            "cost * turnover.",
-            name,
-            outer_test_size,
-        )
-    elif holding_period is not None:
-        rel_diff = abs(holding_period - outer_test_size) / max(
-            holding_period, outer_test_size
-        )
-        if rel_diff > 0.25:
-            logger.warning(
-                "Strategy '%s': configured transaction_costs holding_period=%g differs "
-                "from outer evaluation test_size=%g; skfolio charges transaction_costs "
-                "per observation, scaling cumulative fold cost by %.2fx.",
+    effective_hp: float | None = None
+    if outer_test_size > 1.0:
+        if holding_period is None and tc_from_spec:
+            _scale_transaction_costs_chain(est_clone, float(outer_test_size))
+            effective_hp = float(outer_test_size)
+            logger.info(
+                "Strategy '%s': amortized unamortized ConstraintBuilder transaction_costs "
+                "over outer evaluation horizon test_size=%g so cumulative fold cost equals "
+                "cost * turnover.",
                 name,
-                holding_period,
                 outer_test_size,
-                outer_test_size / holding_period,
             )
-    else:
-        logger.warning(
-            "Strategy '%s': raw estimator transaction_costs configured without an "
-            "explicit holding_period while outer evaluation test_size=%g; skfolio "
-            "charges transaction_costs per observation. Pass holding_period via "
-            "ConstraintBuilder or add_strategy() to avoid over-charging.",
-            name,
-            outer_test_size,
+        elif holding_period is not None:
+            effective_hp = float(holding_period)
+            rel_diff = abs(holding_period - outer_test_size) / max(
+                holding_period, outer_test_size
+            )
+            if rel_diff > 0.25:
+                logger.warning(
+                    "Strategy '%s': configured transaction_costs holding_period=%g differs "
+                    "from outer evaluation test_size=%g; skfolio charges transaction_costs "
+                    "per observation, scaling cumulative fold cost by %.2fx.",
+                    name,
+                    holding_period,
+                    outer_test_size,
+                    outer_test_size / holding_period,
+                )
+        else:
+            logger.warning(
+                "Strategy '%s': raw estimator transaction_costs configured without an "
+                "explicit holding_period while outer evaluation test_size=%g; skfolio "
+                "charges transaction_costs per observation. Pass holding_period via "
+                "ConstraintBuilder or add_strategy() to avoid over-charging.",
+                name,
+                outer_test_size,
+            )
+    elif holding_period is not None:
+        effective_hp = float(holding_period)
+    elif tc_from_spec:
+        effective_hp = 1.0
+
+    if (
+        inner_test_size is not None
+        and inner_test_size >= 1.0
+        and effective_hp is not None
+        and effective_hp > 0.0
+    ):
+        inner_rel_diff = abs(inner_test_size - effective_hp) / max(
+            inner_test_size, effective_hp
         )
+        if inner_rel_diff > 0.25:
+            logger.warning(
+                "Strategy '%s': inner CV test_size=%g diverges from effective "
+                "transaction_costs holding horizon=%g; inner hyperparameter tuning "
+                "scales cumulative fold cost by %.2fx relative to outer evaluation.",
+                name,
+                inner_test_size,
+                effective_hp,
+                inner_test_size / effective_hp,
+            )
 
 
 def _extract_weights_dict(
@@ -789,6 +818,19 @@ class PortfolioExperimentEngine:
         if not self._strategies:
             raise RuntimeError("No strategies registered. Call add_strategy() first.")
 
+        inner_test_size: float | None = None
+        raw_inner_ts = getattr(inner_cv, "test_size", None)
+        if (
+            isinstance(raw_inner_ts, (int, float))
+            and not isinstance(raw_inner_ts, bool)
+            and getattr(inner_cv, "freq", None) is None
+        ):
+            inner_test_size = float(raw_inner_ts)
+        else:
+            inner_test_size = self._resolve_outer_test_size(
+                "walk_forward", inner_cv, {}, returns
+            )
+
         # 3. Process each strategy using run-local accumulators (concurrency safe)
         collected: list[Any] = []
         run_latest_weights: dict[str, dict[str, float]] = {}
@@ -807,6 +849,7 @@ class PortfolioExperimentEngine:
                 holding_period=config["holding_period"],
                 tc_from_spec=config["tc_from_spec"],
                 outer_test_size=outer_test_size,
+                inner_test_size=inner_test_size,
             )
 
             user_previous_weights = copy.deepcopy(
@@ -1223,6 +1266,7 @@ class PortfolioExperimentEngine:
                 holding_period=config["holding_period"],
                 tc_from_spec=config["tc_from_spec"],
                 outer_test_size=online_test_size,
+                inner_test_size=float(inner_test),
             )
 
             user_previous_weights = copy.deepcopy(

@@ -274,6 +274,36 @@ class SkfolioGridSearchCV(BaseOptimization, GridSearchCV):
         )
 
     @staticmethod
+    def _as_optional_float(value: Any) -> float | None:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            f_val = float(value)
+            if math.isfinite(f_val):
+                return f_val
+        return None
+
+    @property
+    def risk_free_rate(self) -> float:
+        """Per-period risk-free rate inherited from fitted or wrapped optimiser."""
+        candidates: list[Any] = [getattr(self, "_fitted_risk_free_rate_", None)]
+        if isinstance(self.portfolio_params, dict):
+            candidates.append(self.portfolio_params.get("risk_free_rate"))
+        inner = self._get_target_optimizer(self.estimator)
+        if inner is not None:
+            candidates.append(getattr(inner, "risk_free_rate", None))
+            inner_pp = getattr(inner, "portfolio_params", None)
+            if isinstance(inner_pp, dict):
+                candidates.append(inner_pp.get("risk_free_rate"))
+        for candidate in candidates:
+            resolved = self._as_optional_float(candidate)
+            if resolved is not None:
+                return resolved
+        return 0.0
+
+    @risk_free_rate.setter
+    def risk_free_rate(self, value: float) -> None:
+        self._fitted_risk_free_rate_ = float(value)
+
+    @staticmethod
     def _expand_weights_to_input(
         X: Any, best_estimator: Any, inner: Any, raw_weights: Any
     ) -> tuple[Any, Any]:

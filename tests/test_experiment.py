@@ -1086,3 +1086,115 @@ def test_online_evaluation_all_positive_returns_prefers_high_return_candidate() 
     res = eng.run_online_evaluation(burn_in_size=80, test_size=20, return_result=True)
     # Strictly dominant SAFE_GAIN (positive returns in [0.2%, 0.4%]/day) must beat NOISY_LOW ([-0.05%, 0.2%]/day)
     assert res.live_weights["PosOn"]["SAFE_GAIN"] >= 0.99
+
+
+def test_black_litterman_risk_free_rate_propagates_to_outer_multi_period_portfolio() -> (
+    None
+):
+    """Sprint 5 (#6b gap): BL risk_free_rate propagates to outer MultiPeriodPortfolio Sharpe in run_robustness_test."""
+    from skfolio import Portfolio
+    from skfolio.optimization import HierarchicalRiskParity
+    from skfolio.prior import EmpiricalPrior
+
+    from flowportfolio.priors import PriorSynthesiser
+    from flowportfolio.strategies import StrategyBuilder
+
+    rng = np.random.default_rng(131)
+    dates = pd.bdate_range("2022-01-03", periods=240)
+    rets = pd.DataFrame(
+        rng.normal(0.0005, 0.01, (240, 3)),
+        index=dates,
+        columns=["A", "B", "C"],
+    )
+    u = Universe(
+        ["A", "B", "C"],
+        {"A": "core", "B": "core", "C": "sat"},
+        {"A": 0.0, "B": 0.0, "C": 0.0},
+    )
+    u._returns = rets
+    rfr_ann = 0.0504
+    expected_rfr = rfr_ann / 252.0
+
+    ps = PriorSynthesiser(u).add_market_view("A == 0.0504", confidence=0.8)
+    bl_excess = ps.build_black_litterman_prior(risk_free_rate=rfr_ann)
+    bl_total = ps.build_black_litterman_prior(
+        risk_free_rate=rfr_ann, prior_estimator=EmpiricalPrior()
+    )
+
+    eng = PortfolioExperimentEngine(u, n_jobs=1)
+    eng.add_strategy(
+        "BL_MR",
+        StrategyBuilder(prior=bl_excess)
+        .set_optimizer(MeanRisk(objective_function=ObjectiveFunction.MAXIMIZE_RATIO))
+        .build_pipeline(),
+        {"optimizer__l2_coef": [0.0]},
+    )
+    eng.add_strategy(
+        "BL_HRP",
+        StrategyBuilder(prior=bl_total)
+        .set_optimizer(HierarchicalRiskParity())
+        .build_pipeline(),
+        {},
+    )
+    pop = eng.run_robustness_test(cv_type="walk_forward", train_size=120, test_size=60)
+    for mpp in pop:
+        assert float(mpp.risk_free_rate) == pytest.approx(expected_rfr, abs=1e-12)
+        oracle = Portfolio(
+            X=mpp.returns[:, None],
+            weights=[1.0],
+            risk_free_rate=expected_rfr,
+            annualization_factor=252.0,
+        )
+        assert float(mpp.annualized_sharpe_ratio) == pytest.approx(
+            float(oracle.annualized_sharpe_ratio), rel=1e-9, abs=1e-12
+        )
+
+
+def test_reconcile_transaction_costs_warns_when_inner_test_diverges_from_outer_horizon(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Sprint 5 (plan gap): Warn when inner CV test_size diverges substantially from effective transaction cost horizon."""
+    import logging
+
+    from flowportfolio.core.constraints import ConstraintBuilder
+    from flowportfolio.strategies import StrategyBuilder
+
+    rng = np.random.default_rng(141)
+    dates = pd.bdate_range("2022-01-03", periods=220)
+    rets = pd.DataFrame(
+        rng.normal(0.0005, 0.01, (220, 3)),
+        index=dates,
+        columns=["A", "B", "C"],
+    )
+    u = Universe(
+        ["A", "B", "C"],
+        {"A": "core", "B": "core", "C": "sat"},
+        {"A": 0.0, "B": 0.0, "C": 0.0},
+    )
+    u._returns = rets
+    spec = ConstraintBuilder(u).transaction_costs(0.005).build()
+    pipe = StrategyBuilder(constraints=spec).set_optimizer(MeanRisk()).build_pipeline()
+
+    # 1. Divergent: outer_train=150 -> derived inner_test=30 vs outer_test_size=5 (6x divergence)
+    eng_div = PortfolioExperimentEngine(u, n_jobs=1)
+    eng_div.add_strategy("DivTC", pipe, {"optimizer__l2_coef": [0.0]})
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="flowportfolio.core.experiment"):
+        eng_div.run_robustness_test(cv_type="walk_forward", train_size=150, test_size=5)
+    assert any(
+        "inner" in rec.message.lower() and "transaction_costs" in rec.message.lower()
+        for rec in caplog.records
+    )
+
+    # 2. Matched: outer_train=150 -> derived inner_test=30 == outer_test_size=30 -> no inner divergence warning
+    eng_match = PortfolioExperimentEngine(u, n_jobs=1)
+    eng_match.add_strategy("MatchTC", pipe, {"optimizer__l2_coef": [0.0]})
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="flowportfolio.core.experiment"):
+        eng_match.run_robustness_test(
+            cv_type="walk_forward", train_size=150, test_size=30
+        )
+    assert not any(
+        "inner" in rec.message.lower() and "transaction_costs" in rec.message.lower()
+        for rec in caplog.records
+    )

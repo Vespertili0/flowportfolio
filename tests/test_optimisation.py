@@ -460,3 +460,45 @@ def test_grid_search_cv_refit_false_and_clone_immutability() -> None:
     port = gscv.predict(X)
     assert port.tag == "grid_tag"
     assert port.management_fees == pytest.approx(0.0002)
+
+
+def test_grid_search_cv_exposes_wrapped_risk_free_rate_for_cross_val_predict_mpp() -> (
+    None
+):
+    """Sprint 5 (#6b gap): cross_val_predict must inherit risk_free_rate on outer MultiPeriodPortfolio."""
+    from skfolio import Portfolio
+    from skfolio.model_selection import cross_val_predict
+    from skfolio.optimization import HierarchicalRiskParity
+
+    X = _sample_returns(n_obs=120, seed=31)
+    rfr = 0.0504 / 252.0
+    cv = WalkForward(train_size=60, test_size=30)
+
+    # 1. Optimizer with top-level risk_free_rate (MeanRisk)
+    gscv_mr = SkfolioGridSearchCV(
+        estimator=Pipeline([("optimizer", MeanRisk(risk_free_rate=rfr))]),
+        param_grid={"optimizer__l2_coef": [0.0]},
+        cv=WalkForward(train_size=30, test_size=15),
+    )
+    mpp_mr = cross_val_predict(gscv_mr, X, cv=cv)
+    assert float(mpp_mr.risk_free_rate) == pytest.approx(rfr, abs=1e-12)
+    oracle_mr = Portfolio(X=mpp_mr.returns[:, None], weights=[1.0], risk_free_rate=rfr)
+    assert float(mpp_mr.sharpe_ratio) == pytest.approx(
+        float(oracle_mr.sharpe_ratio), rel=1e-9, abs=1e-12
+    )
+
+    # 2. Optimizer carrying risk_free_rate via portfolio_params (HierarchicalRiskParity)
+    gscv_hrp = SkfolioGridSearchCV(
+        estimator=Pipeline(
+            [
+                (
+                    "optimizer",
+                    HierarchicalRiskParity(portfolio_params={"risk_free_rate": rfr}),
+                )
+            ]
+        ),
+        param_grid={},
+        cv=WalkForward(train_size=30, test_size=15),
+    )
+    mpp_hrp = cross_val_predict(gscv_hrp, X, cv=cv)
+    assert float(mpp_hrp.risk_free_rate) == pytest.approx(rfr, abs=1e-12)
