@@ -62,6 +62,52 @@ def _extract_prior_risk_free_rate(prior: BasePrior | None) -> float:
     return 0.0
 
 
+def _contains_view_prior(prior: Any, _visited: set[int] | None = None) -> bool:
+    """Return True if ``prior`` is or wraps a ticker/group view prior."""
+    if prior is None:
+        return False
+    visited = _visited if _visited is not None else set()
+    if id(prior) in visited:
+        return False
+    visited.add(id(prior))
+
+    if isinstance(prior, (BlackLitterman, EntropyPooling)):
+        return True
+
+    nested = getattr(prior, "prior_estimator", None)
+    if nested is not None and _contains_view_prior(nested, _visited=visited):
+        return True
+
+    sub_estimators = getattr(prior, "estimators", None)
+    if isinstance(sub_estimators, (list, tuple)):
+        for item in sub_estimators:
+            sub = item[1] if isinstance(item, tuple) and len(item) >= 2 else item
+            if _contains_view_prior(sub, _visited=visited):
+                return True
+    return False
+
+
+def _estimator_has_view_prior(opt: Any, _visited: set[int] | None = None) -> bool:
+    """Return True if ``opt``, its Pipeline steps, or its fallback chain carries a view prior."""
+    if opt is None:
+        return False
+    visited = _visited if _visited is not None else set()
+    if id(opt) in visited:
+        return False
+    visited.add(id(opt))
+
+    if isinstance(opt, Pipeline):
+        return any(
+            _estimator_has_view_prior(step, _visited=visited) for _, step in opt.steps
+        )
+    if _contains_view_prior(getattr(opt, "prior_estimator", None)):
+        return True
+    fallback = getattr(opt, "fallback", None)
+    return fallback is not None and _estimator_has_view_prior(
+        fallback, _visited=visited
+    )
+
+
 def _safe_clone(estimator: Any) -> Any:
     """Clone an estimator safely."""
     if estimator is None:
@@ -793,10 +839,15 @@ class StrategyBuilder:
                     opt, "management_fees", dict(self._management_fees)
                 )
 
-        if include_prior and self.prior is not None:
-            if hasattr(opt, "prior_estimator"):
+        if include_prior:
+            if self.prior is not None and hasattr(opt, "prior_estimator"):
                 opt.prior_estimator = clone(self.prior)
-            prior_rfr = _extract_prior_risk_free_rate(self.prior)
+            effective_prior = (
+                self.prior
+                if self.prior is not None
+                else getattr(opt, "prior_estimator", None)
+            )
+            prior_rfr = _extract_prior_risk_free_rate(effective_prior)
             if prior_rfr != 0.0:
                 if hasattr(opt, "risk_free_rate"):
                     if getattr(opt, "risk_free_rate", 0.0) == 0.0:
@@ -974,8 +1025,11 @@ class StrategyBuilder:
                 "No optimizer set. Call set_optimizer() before build_pipeline()."
             )
 
-        if self._pre_selection and isinstance(
-            self.prior, (BlackLitterman, EntropyPooling)
+        cloned_optimizer = self._wire_from_raw(include_prior=True)
+
+        if self._pre_selection and (
+            _contains_view_prior(self.prior)
+            or _estimator_has_view_prior(cloned_optimizer)
         ):
             raise ValueError(
                 "Pre-selection transformers cannot be combined with ticker/group "
@@ -983,7 +1037,6 @@ class StrategyBuilder:
                 "referenced assets breaks view equations and distorts group weights."
             )
 
-        cloned_optimizer = self._wire_from_raw(include_prior=True)
         opt_min_w = getattr(cloned_optimizer, "min_weights", None)
         opt_max_w = getattr(cloned_optimizer, "max_weights", None)
 
@@ -1110,8 +1163,16 @@ class StrategyBuilder:
                 "consistently inside isolated NestedClustersOptimization sub-clusters."
             )
 
-        if self.prior is not None and isinstance(
-            self.prior, (BlackLitterman, EntropyPooling)
+        cloned_inner = _safe_clone(inner_estimator)
+        cloned_outer = _safe_clone(outer_estimator)
+
+        if self.prior is not None and hasattr(cloned_inner, "prior_estimator"):
+            cloned_inner.prior_estimator = clone(self.prior)
+
+        if (
+            _contains_view_prior(self.prior)
+            or _estimator_has_view_prior(cloned_inner)
+            or _estimator_has_view_prior(cloned_outer)
         ):
             raise ValueError(
                 "Ticker-level view priors (BlackLitterman, EntropyPooling) cannot be "
@@ -1119,16 +1180,10 @@ class StrategyBuilder:
                 "cluster allocations do not preserve the full ticker universe."
             )
 
-        cloned_inner = _safe_clone(inner_estimator)
-        cloned_outer = _safe_clone(outer_estimator)
-
         if self._management_fees is not None and hasattr(
             cloned_inner, "management_fees"
         ):
             cloned_inner.management_fees = dict(self._management_fees)
-
-        if self.prior is not None and hasattr(cloned_inner, "prior_estimator"):
-            cloned_inner.prior_estimator = clone(self.prior)
 
         if clusterer == "kmeans":
             clustering_estimator = _AdaptiveKMeans(random_state=random_state)

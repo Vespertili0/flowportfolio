@@ -195,6 +195,43 @@ def _has_max_turnover_chain(opt: Any, _visited: set[int] | None = None) -> bool:
     )
 
 
+def _param_grid_sets_param(
+    param_grid: Any, param_name: str, *, require_non_none: bool = True
+) -> bool:
+    """Return True if ``param_grid`` sweeps ``param_name`` (top-level or Pipeline step)."""
+    if param_grid is None:
+        return False
+    grids = (
+        [param_grid]
+        if isinstance(param_grid, dict)
+        else list(param_grid)
+        if isinstance(param_grid, (list, tuple))
+        else []
+    )
+    suffix = f"__{param_name}"
+    for grid in grids:
+        if not isinstance(grid, dict):
+            continue
+        for key, values in grid.items():
+            if not isinstance(key, str):
+                continue
+            if key == param_name or key.endswith(suffix):
+                if not require_non_none:
+                    return True
+                try:
+                    if any(v is not None for v in values):
+                        return True
+                except TypeError:
+                    if values is not None:
+                        return True
+    return False
+
+
+def _param_grid_sets_max_turnover(param_grid: Any) -> bool:
+    """Return True if ``param_grid`` sweeps any non-None ``max_turnover`` candidate."""
+    return _param_grid_sets_param(param_grid, "max_turnover", require_non_none=True)
+
+
 def _neutral_equal_previous_weights(X: Any) -> Any:
     """Build equal-weight baseline matching ``X`` columns to keep constrained inner CV feasible."""
     if isinstance(X, pd.DataFrame) and X.shape[1] > 0:
@@ -260,7 +297,11 @@ class SkfolioGridSearchCV(BaseOptimization, GridSearchCV):
 
     @property
     def needs_previous_weights(self) -> bool:
-        """Whether the wrapped optimiser requires sequential previous weights."""
+        """Whether the wrapped optimiser or param_grid requires sequential previous weights."""
+        if _param_grid_sets_max_turnover(self.param_grid) or _param_grid_sets_param(
+            self.param_grid, "transaction_costs", require_non_none=True
+        ):
+            return True
         current = self._get_target_optimizer(self.estimator)
         visited: set[int] = set()
         while current is not None and id(current) not in visited:
@@ -283,16 +324,20 @@ class SkfolioGridSearchCV(BaseOptimization, GridSearchCV):
 
     @property
     def risk_free_rate(self) -> float:
-        """Per-period risk-free rate inherited from fitted or wrapped optimiser."""
+        """Per-period risk-free rate inherited from fitted or wrapped optimiser.
+
+        Follows ``skfolio`` precedence: explicit ``portfolio_params['risk_free_rate']``
+        overrides estimator-level ``risk_free_rate`` attributes.
+        """
         candidates: list[Any] = [getattr(self, "_fitted_risk_free_rate_", None)]
         if isinstance(self.portfolio_params, dict):
             candidates.append(self.portfolio_params.get("risk_free_rate"))
         inner = self._get_target_optimizer(self.estimator)
         if inner is not None:
-            candidates.append(getattr(inner, "risk_free_rate", None))
             inner_pp = getattr(inner, "portfolio_params", None)
             if isinstance(inner_pp, dict):
                 candidates.append(inner_pp.get("risk_free_rate"))
+            candidates.append(getattr(inner, "risk_free_rate", None))
         for candidate in candidates:
             resolved = self._as_optional_float(candidate)
             if resolved is not None:
@@ -353,6 +398,9 @@ class SkfolioGridSearchCV(BaseOptimization, GridSearchCV):
         return w_arr, getattr(inner, "feature_names_in_", None)
 
     def fit(self, X: Any, y: Any = None, **fit_params: Any) -> SkfolioGridSearchCV:
+        if hasattr(self, "_fitted_risk_free_rate_"):
+            delattr(self, "_fitted_risk_free_rate_")
+
         est_clone = clone(self.estimator) if self.estimator is not None else None
         effective_pw = _normalize_previous_weights(self.previous_weights, X)
         safe_scorer = _make_safe_scorer(self.scoring)
@@ -361,10 +409,11 @@ class SkfolioGridSearchCV(BaseOptimization, GridSearchCV):
             # Inner CV evaluates historical sub-windows using a causal neutral
             # baseline so drifted terminal previous_weights (t_1) never leak into
             # earlier inner folds; effective_pw is restored only on full-window refit.
+            needs_feasible_baseline = _has_max_turnover_chain(
+                est_clone
+            ) or _param_grid_sets_max_turnover(self.param_grid)
             inner_pw = (
-                _neutral_equal_previous_weights(X)
-                if _has_max_turnover_chain(est_clone)
-                else None
+                _neutral_equal_previous_weights(X) if needs_feasible_baseline else None
             )
             set_previous_weights_chain(est_clone, inner_pw)
             run_delegate_refit = self.refit if isinstance(self.refit, str) else False
@@ -430,7 +479,7 @@ class SkfolioGridSearchCV(BaseOptimization, GridSearchCV):
         elif hasattr(self, "feature_names_in_"):
             delattr(self, "feature_names_in_")
 
-        for attr in ("management_fees", "transaction_costs", "risk_free_rate"):
+        for attr in ("management_fees", "transaction_costs"):
             if hasattr(inner, attr):
                 setattr(self, attr, getattr(inner, attr))
 
@@ -446,6 +495,18 @@ class SkfolioGridSearchCV(BaseOptimization, GridSearchCV):
                 if isinstance(self.portfolio_params, dict)
                 else self.portfolio_params
             )
+
+        resolved_rfr = self._as_optional_float(
+            self._resolved_portfolio_params_.get("risk_free_rate")
+            if isinstance(self._resolved_portfolio_params_, dict)
+            else None
+        )
+        if resolved_rfr is None:
+            resolved_rfr = self._as_optional_float(
+                getattr(inner, "risk_free_rate", None)
+            )
+        if resolved_rfr is not None:
+            self.risk_free_rate = resolved_rfr
 
         if hasattr(inner, "fallback_chain_"):
             self.fallback_chain_ = inner.fallback_chain_

@@ -886,3 +886,61 @@ def test_rebalance_delta_rejects_randomized_asset_subset_paths() -> None:
 
     with pytest.raises(ValueError, match="asset-subsampled"):
         eng.calculate_rebalance_delta(pop, strategy_tag="RandSub")
+
+
+def test_rebalance_delta_allow_asset_subsets_supports_direct_preselection_pipeline() -> (
+    None
+):
+    """Sprint 5 (S6): Direct pre-selection Pipeline subsets fail safely by default and work with allow_asset_subsets=True."""
+    from skfolio.model_selection import WalkForward, cross_val_predict
+    from skfolio.optimization import MeanRisk
+    from skfolio.pre_selection import DropCorrelated
+
+    from flowportfolio.core.constraints import ConstraintBuilder
+    from flowportfolio.strategies import StrategyBuilder
+
+    rng = np.random.default_rng(88)
+    idx = pd.bdate_range("2022-01-03", periods=200)
+    base = rng.normal(0.0005, 0.01, (200, 1))
+    rets = pd.DataFrame(
+        np.hstack(
+            [
+                base + rng.normal(0.0, 0.001, (200, 1)),
+                base + rng.normal(0.0, 0.001, (200, 1)),
+                rng.normal(0.0004, 0.01, (200, 1)),
+                rng.normal(0.0003, 0.01, (200, 1)),
+            ]
+        ),
+        index=idx,
+        columns=["A", "B", "C", "D"],
+    )
+    u = Universe(
+        ["A", "B", "C", "D"],
+        {"A": "core", "B": "core", "C": "sat", "D": "sat"},
+        {"A": 0.001, "B": 0.001, "C": 0.001, "D": 0.001},
+    )
+    u._returns = rets
+    pipe = (
+        StrategyBuilder(constraints=ConstraintBuilder(u).build())
+        .add_pre_selection(DropCorrelated(threshold=0.5))
+        .set_optimizer(MeanRisk())
+        .build_pipeline()
+    )
+    mpp = cross_val_predict(pipe, rets, cv=WalkForward(train_size=100, test_size=50))
+    mpp.tag = "DirectPre"
+    cw = {"A": 0.25, "B": 0.25, "C": 0.25, "D": 0.25}
+    eng = PortfolioDeltaEngine(u, current_weights=cw, target_weights=cw)
+
+    # Default remains fail-fast with guidance mentioning allow_asset_subsets
+    with pytest.raises(ValueError, match="allow_asset_subsets"):
+        eng.calculate_rebalance_delta(Population([mpp]), strategy_tag="DirectPre")
+
+    # Explicit opt-in succeeds and prices dropped ticker liquidation as 0% weight
+    res = eng.calculate_rebalance_delta(
+        Population([mpp]),
+        strategy_tag="DirectPre",
+        brokerage_bps=20.0,
+        allow_asset_subsets=True,
+    )
+    assert np.isfinite(res["rebalance"]["sharpe"])
+    assert res["rebalance"]["entry_drag"] > 0.0

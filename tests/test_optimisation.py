@@ -502,3 +502,60 @@ def test_grid_search_cv_exposes_wrapped_risk_free_rate_for_cross_val_predict_mpp
     )
     mpp_hrp = cross_val_predict(gscv_hrp, X, cv=cv)
     assert float(mpp_hrp.risk_free_rate) == pytest.approx(rfr, abs=1e-12)
+
+
+def test_grid_search_cv_portfolio_params_risk_free_rate_overrides_zero_estimator_attr() -> (
+    None
+):
+    """Sprint 5 (S1): inner.portfolio_params['risk_free_rate'] must take precedence over default 0.0 attr."""
+    from skfolio.model_selection import cross_val_predict
+
+    X = _sample_returns(n_obs=120, seed=37)
+    rfr = 0.0504 / 252.0
+    gscv = SkfolioGridSearchCV(
+        estimator=MeanRisk(
+            risk_free_rate=0.0, portfolio_params={"risk_free_rate": rfr}
+        ),
+        param_grid={"l2_coef": [0.0]},
+        cv=WalkForward(train_size=30, test_size=15),
+    )
+    assert gscv.risk_free_rate == pytest.approx(rfr, abs=1e-12)
+    mpp = cross_val_predict(gscv, X, cv=WalkForward(train_size=60, test_size=30))
+    assert float(mpp.risk_free_rate) == pytest.approx(rfr, abs=1e-12)
+    gscv.fit(X)
+    assert gscv.risk_free_rate == pytest.approx(rfr, abs=1e-12)
+
+
+def test_grid_search_cv_tuning_max_turnover_in_param_grid_uses_feasible_inner_baseline() -> (
+    None
+):
+    """Sprint 5 (S8): Tuning max_turnover in param_grid on an unconstrained base estimator must remain feasible in inner CV."""
+    X = _sample_returns(n_obs=100, seed=41)
+    pw = {"A": 0.60, "B": 0.20, "C": 0.20}
+    gscv = SkfolioGridSearchCV(
+        estimator=MeanRisk(),
+        param_grid={"max_turnover": [0.05, 0.15]},
+        cv=WalkForward(train_size=40, test_size=20),
+        previous_weights=pw,
+    )
+    assert gscv.needs_previous_weights is True
+    gscv.fit(X)
+    assert gscv.best_params_["max_turnover"] in (0.05, 0.15)
+    assert gscv.weights_ is not None
+    assert (
+        abs(float(gscv.weights_[0]) - 0.60) <= gscv.best_params_["max_turnover"] + 1e-6
+    )
+
+    # Also verify list-of-dicts param_grid with Pipeline step prefix
+    gscv_list = SkfolioGridSearchCV(
+        estimator=Pipeline([("optimizer", MeanRisk())]),
+        param_grid=[
+            {"optimizer__max_turnover": [0.05]},
+            {"optimizer__max_turnover": [0.15]},
+        ],
+        cv=WalkForward(train_size=40, test_size=20),
+        previous_weights=pw,
+    )
+    assert gscv_list.needs_previous_weights is True
+    gscv_list.fit(X)
+    assert gscv_list.best_params_["optimizer__max_turnover"] in (0.05, 0.15)

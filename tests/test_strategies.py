@@ -985,3 +985,32 @@ def test_safe_pre_selection_forwards_wrapped_transformer_params_to_grid_search()
     gs = GridSearchCV(pipe, param_grid={"pre_0__threshold": [0.7, 0.9]}, cv=2)
     gs.fit(rets)
     assert gs.best_params_["pre_0__threshold"] in (0.7, 0.9)
+
+
+def test_strategy_builder_rejects_view_priors_attached_directly_on_optimizer() -> None:
+    """Sprint 5 (S2): View-prior guards catch BlackLitterman/EntropyPooling set directly on optimizer, fallback, or NCO estimators."""
+    from skfolio.pre_selection import DropCorrelated
+    from skfolio.prior import BlackLitterman, EntropyPooling
+
+    bl = BlackLitterman(views=["A == 0.001"], view_confidences=[0.8])
+    ep = EntropyPooling(mean_views=["A >= 0.001"])
+
+    for prior in (bl, ep):
+        with pytest.raises(ValueError, match="view priors"):
+            (
+                StrategyBuilder()
+                .add_pre_selection(DropCorrelated())
+                .set_optimizer(MeanRisk(prior_estimator=prior))
+                .build_pipeline()
+            )
+        with pytest.raises(ValueError, match="view priors"):
+            (
+                StrategyBuilder()
+                .add_pre_selection(DropCorrelated())
+                .set_optimizer(MeanRisk(), fallback=MeanRisk(prior_estimator=prior))
+                .build_pipeline()
+            )
+        with pytest.raises(ValueError, match="view priors"):
+            StrategyBuilder().build_nco(MeanRisk(prior_estimator=prior), MeanRisk())
+        with pytest.raises(ValueError, match="view priors"):
+            StrategyBuilder().build_nco(MeanRisk(), MeanRisk(prior_estimator=prior))

@@ -191,7 +191,8 @@ def _validate_oos_asset_coverage(
                 "PortfolioDeltaEngine cannot evaluate buy-and-hold vs. rebalance against "
                 "asset-subsampled OOS paths (e.g. MultipleRandomizedCV with asset_subset_size < N) "
                 "because excluded universe tickers in current_weights create an asymmetric baseline. "
-                "Use full-universe walk_forward or combinatorial cross-validation."
+                "Use full-universe walk_forward or combinatorial cross-validation, or pass "
+                "allow_asset_subsets=True if evaluating a direct pre-selection Pipeline output."
             )
 
 
@@ -418,6 +419,7 @@ def evaluate_rebalance_benefit(
     transition_cost_fn: Callable[[dict[str, float]], float] | None = None,
     rebalance_cost_fn: Callable[[dict[str, float], dict[str, float]], float]
     | None = None,
+    allow_asset_subsets: bool = False,
 ) -> dict[str, dict[str, float]]:
     """Compare buy-and-hold vs. rebalance performance without look-ahead bias.
 
@@ -453,7 +455,8 @@ def evaluate_rebalance_benefit(
         hold_list: list[dict[str, float]] = []
         reb_list: list[dict[str, float]] = []
         for p in oos_portfolios:
-            _validate_oos_asset_coverage(p, columns)
+            if not allow_asset_subsets:
+                _validate_oos_asset_coverage(p, columns)
             path_returns = _align_returns_strict(universe_returns, p)
             port_rfr, ann_factor, compounded = _extract_portfolio_eval_settings(
                 p, periods_per_year
@@ -755,6 +758,7 @@ class PortfolioDeltaEngine:
         portfolio_value: float | None = None,
         brokerage_flat: float = 0.0,
         min_trade_weight: float = _DUST_TRADE_TOL,
+        allow_asset_subsets: bool = False,
     ) -> dict[str, dict[str, float]]:
         """Calculate the risk/return delta of holding vs rebalancing.
 
@@ -790,6 +794,13 @@ class PortfolioDeltaEngine:
         min_trade_weight : float, optional
             Minimum gross weight change to trigger ``brokerage_flat``.
             Defaults to ``1e-6`` to ignore numerical solver dust.
+        allow_asset_subsets : bool, optional
+            If ``True``, allows OOS folds whose asset list is a strict subset of
+            ``universe.tickers`` (for example, direct pre-selection ``Pipeline``
+            outputs evaluated outside ``PortfolioExperimentEngine``), treating
+            dropped tickers as 0% weight for transition/rebalance drag. Defaults
+            to ``False`` to reject ``MultipleRandomizedCV`` asset-subsampled
+            paths by default.
 
         Returns
         -------
@@ -808,8 +819,8 @@ class PortfolioDeltaEngine:
             If ``population`` is provided but empty, if ``strategy_tag`` matches
             no portfolio in ``population``, if OOS dates do not align strictly
             with ``universe.returns``, if OOS paths cover a strict asset subset
-            of ``universe.tickers``, or if ``universe.returns`` has not been
-            populated.
+            of ``universe.tickers`` (when ``allow_asset_subsets=False``), or if
+            ``universe.returns`` has not been populated.
         """
         if population is not None:
             if not isinstance(population, Population):
@@ -876,6 +887,7 @@ class PortfolioDeltaEngine:
             annual_fees=fees_map,
             periods_per_year=periods_per_year,
             rebalance_cost_fn=rebalance_cost_fn,
+            allow_asset_subsets=allow_asset_subsets,
         )
 
     @staticmethod
