@@ -398,8 +398,15 @@ class SkfolioGridSearchCV(BaseOptimization, GridSearchCV):
         return w_arr, getattr(inner, "feature_names_in_", None)
 
     def fit(self, X: Any, y: Any = None, **fit_params: Any) -> SkfolioGridSearchCV:
-        if hasattr(self, "_fitted_risk_free_rate_"):
-            delattr(self, "_fitted_risk_free_rate_")
+        for stale_attr in (
+            "_fitted_risk_free_rate_",
+            "_resolved_portfolio_params_",
+            "fallback_chain_",
+            "error_",
+            "weights_",
+        ):
+            if hasattr(self, stale_attr):
+                delattr(self, stale_attr)
 
         est_clone = clone(self.estimator) if self.estimator is not None else None
         effective_pw = _normalize_previous_weights(self.previous_weights, X)

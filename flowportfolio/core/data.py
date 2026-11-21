@@ -1,3 +1,4 @@
+import math
 import time
 from typing import Protocol, runtime_checkable
 
@@ -25,9 +26,10 @@ class YFinanceProvider:
         if (
             isinstance(backoff_base, bool)
             or not isinstance(backoff_base, (int, float))
+            or not math.isfinite(backoff_base)
             or backoff_base < 0.0
         ):
-            raise ValueError("backoff_base must be a non-negative number.")
+            raise ValueError("backoff_base must be a non-negative finite number.")
         self._retries = retries
         self._backoff_base = float(backoff_base)
 

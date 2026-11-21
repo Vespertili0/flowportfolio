@@ -32,8 +32,14 @@ from flowportfolio.core.constraints import (
     _resolve_periods_per_year,
     _validate_holding_period,
 )
-from flowportfolio.core.optimisation import SkfolioGridSearchCV as GridSearchCV
-from flowportfolio.core.optimisation import set_previous_weights_chain
+from flowportfolio.core.optimisation import (
+    SkfolioGridSearchCV as GridSearchCV,
+)
+from flowportfolio.core.optimisation import (
+    _param_grid_sets_max_turnover,
+    _param_grid_sets_param,
+    set_previous_weights_chain,
+)
 from flowportfolio.core.protocols import UniverseProtocol
 
 logger = logging.getLogger(__name__)
@@ -832,6 +838,10 @@ class PortfolioExperimentEngine:
             )
 
         # 3. Process each strategy using run-local accumulators (concurrency safe)
+        if returns.empty or returns.shape[1] == 0:
+            raise ValueError(
+                "Universe returns must be non-empty with at least one asset."
+            )
         collected: list[Any] = []
         run_latest_weights: dict[str, dict[str, float]] = {}
         equal_weights = {col: 1.0 / len(returns.columns) for col in returns.columns}
@@ -855,7 +865,15 @@ class PortfolioExperimentEngine:
             user_previous_weights = copy.deepcopy(
                 getattr(target_opt, "previous_weights", None)
             )
-            has_friction = _has_rebalancing_friction(target_opt)
+            grid_has_turnover = _param_grid_sets_max_turnover(config["grid"])
+            grid_has_tc = _param_grid_sets_param(
+                config["grid"], "transaction_costs", require_non_none=True
+            )
+            has_friction = (
+                _has_rebalancing_friction(target_opt)
+                or grid_has_turnover
+                or grid_has_tc
+            )
 
             # Prevent present-day physical weights from contaminating historical
             # Fold 0 under BOTH max_turnover and transaction_costs.
@@ -869,7 +887,10 @@ class PortfolioExperimentEngine:
                 else:
                     baseline_pw = (
                         equal_weights
-                        if getattr(target_opt, "max_turnover", None) is not None
+                        if (
+                            getattr(target_opt, "max_turnover", None) is not None
+                            or grid_has_turnover
+                        )
                         else None
                     )
                     set_previous_weights_chain(est_clone, baseline_pw)
@@ -1021,6 +1042,14 @@ class PortfolioExperimentEngine:
         predict_kwargs: dict[str, Any],
     ) -> tuple[int, int, float]:
         """Resolve ``(burn_in_rows, predict_warmup, online_test_size)`` across row/freq modes."""
+        if burn_in_size is not None and (
+            isinstance(burn_in_size, bool)
+            or not isinstance(burn_in_size, int)
+            or burn_in_size < 1
+        ):
+            raise ValueError(
+                f"burn_in_size must be a positive integer, got {burn_in_size!r}."
+            )
         freq = predict_kwargs.get("freq")
         if freq is None:
             resolved_burn_in = (
@@ -1028,6 +1057,10 @@ class PortfolioExperimentEngine:
                 if burn_in_size is not None
                 else int(cv_kwargs.get("warmup_size", cv_kwargs.get("train_size", 252)))
             )
+            if resolved_burn_in < 1:
+                raise ValueError(
+                    f"burn_in_size must be a positive integer, got {resolved_burn_in}."
+                )
             if resolved_burn_in >= len(returns):
                 raise ValueError(
                     f"burn_in_size={resolved_burn_in} must be strictly less than total "
@@ -1064,6 +1097,10 @@ class PortfolioExperimentEngine:
                 if burn_in_size is not None
                 else int(cv_kwargs.get("train_size", 252))
             )
+            if resolved_burn_in < 1:
+                raise ValueError(
+                    f"burn_in_size must be a positive integer, got {resolved_burn_in}."
+                )
             if resolved_burn_in >= len(returns):
                 raise ValueError(
                     f"burn_in_size={resolved_burn_in} must be strictly less than total "
@@ -1200,6 +1237,10 @@ class PortfolioExperimentEngine:
             )
 
         returns = self._universe.returns
+        if returns.empty or returns.shape[1] == 0:
+            raise ValueError(
+                "Universe returns must be non-empty with at least one asset."
+            )
         annualization_factor = _resolve_periods_per_year(self._universe)
 
         online_predict_keys = {
@@ -1272,13 +1313,22 @@ class PortfolioExperimentEngine:
             user_previous_weights = copy.deepcopy(
                 getattr(est, "previous_weights", None)
             )
-            has_friction = _has_rebalancing_friction(est)
+            grid_has_turnover = _param_grid_sets_max_turnover(grid)
+            grid_has_tc = _param_grid_sets_param(
+                grid, "transaction_costs", require_non_none=True
+            )
+            has_friction = (
+                _has_rebalancing_friction(est) or grid_has_turnover or grid_has_tc
+            )
             entry_params: dict[str, Any] | None = None
 
             if has_friction or user_previous_weights is not None:
                 baseline_pw = (
                     equal_weights
-                    if getattr(est, "max_turnover", None) is not None
+                    if (
+                        getattr(est, "max_turnover", None) is not None
+                        or grid_has_turnover
+                    )
                     else None
                 )
                 set_previous_weights_chain(est, baseline_pw)

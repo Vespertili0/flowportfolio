@@ -278,9 +278,8 @@ class Universe:
         """Number of return observations per calendar year.
 
         Defaults to ``252`` before :meth:`fetch_data` is called, and is
-        inferred from the weekday exchange price index afterwards
-        (``252`` daily, ``52`` weekly, ``12`` monthly, ``4`` quarterly,
-        ``1`` annual).
+        validated as daily weekday exchange cadence (``252`` trading days per
+        year) afterwards.
 
         Returns
         -------

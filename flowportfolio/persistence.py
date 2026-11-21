@@ -263,16 +263,32 @@ class PersistenceManager:
                 ],
             }
         )
-        fd, tmp_name = tempfile.mkstemp(dir=resolved_path.parent, text=True)
+        fd: int | None = None
+        tmp_name: str | None = None
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
+            fd, tmp_name = tempfile.mkstemp(dir=resolved_path.parent, text=True)
+            f = os.fdopen(fd, "w", encoding="utf-8")
+            fd = None
+            with f:
                 json.dump(data, f, indent=4, allow_nan=False)
             os.replace(tmp_name, resolved_path)
         except OSError as e:
-            _cleanup_temp_file(tmp_name)
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if tmp_name is not None:
+                _cleanup_temp_file(tmp_name)
             raise RuntimeError(f"Failed to save snapshot to {path}") from e
         except Exception:
-            _cleanup_temp_file(tmp_name)
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if tmp_name is not None:
+                _cleanup_temp_file(tmp_name)
             raise
 
     def load_snapshot(self, filepath: str) -> dict[str, Any]:
@@ -439,8 +455,16 @@ class PersistenceManager:
 
         records: list[dict[str, Any]] = []
         warned_collisions: set[str] = set()
-        for (_file, data), ts in zip(valid_files_data, parsed_index, strict=True):
-            portfolios = data.get("portfolios") or []
+        for (file_path, data), ts in zip(valid_files_data, parsed_index, strict=True):
+            raw_portfolios = data.get("portfolios")
+            if raw_portfolios is None:
+                portfolios: list[Any] = []
+            elif isinstance(raw_portfolios, list):
+                portfolios = raw_portfolios
+            else:
+                raise ValueError(
+                    f"Invalid 'portfolios' field (expected list) in snapshot file: {file_path}"
+                )
             for p_data in portfolios:
                 if not isinstance(p_data, dict):
                     continue
