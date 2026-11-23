@@ -1198,3 +1198,171 @@ def test_reconcile_transaction_costs_warns_when_inner_test_diverges_from_outer_h
         "inner" in rec.message.lower() and "transaction_costs" in rec.message.lower()
         for rec in caplog.records
     )
+
+
+def test_walk_forward_sweeping_max_turnover_and_transaction_costs_neutralizes_fold0() -> (
+    None
+):
+    """Sweeping max_turnover or transaction_costs in config['grid'] must neutralize Fold 0 without crashing or charging entry cost."""
+    import warnings
+
+    from flowportfolio.core.constraints import ConstraintBuilder
+    from flowportfolio.delta import PortfolioDeltaEngine
+    from flowportfolio.strategies import StrategyBuilder
+
+    rng = np.random.default_rng(142)
+    dates = pd.bdate_range("2022-01-03", periods=200)
+    rets = pd.DataFrame(
+        rng.normal(0.0005, 0.01, (200, 3)),
+        index=dates,
+        columns=["A", "B", "C"],
+    )
+    u = Universe(
+        ["A", "B", "C"],
+        {"A": "core", "B": "core", "C": "sat"},
+        {"A": 0.0, "B": 0.0, "C": 0.0},
+    )
+    u._returns = rets
+    cw = {"A": 0.34, "B": 0.33, "C": 0.33}
+
+    # 1. Sweeping max_turnover=[0.1, 0.2] on 3 assets in walk_forward must not crash Fold 0
+    #    or emit parallel-disabled UserWarning, and must enforce max_turnover on Fold 1+ and live refit.
+    pipe_turn = (
+        StrategyBuilder(constraints=ConstraintBuilder(u).build())
+        .set_optimizer(MeanRisk())
+        .build_pipeline()
+    )
+    eng_turn = PortfolioExperimentEngine(u, n_jobs=-1)
+    eng_turn.add_strategy(
+        "SweepTurnover", pipe_turn, {"optimizer__max_turnover": [0.1, 0.2]}
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        res_turn = eng_turn.run_robustness_test(
+            cv_type="walk_forward",
+            train_size=100,
+            test_size=40,
+            inner_cv_kwargs={"train_size": 40, "test_size": 20},
+            return_result=True,
+        )
+    assert not any(
+        "Parallel processing has been disabled" in str(w.message) for w in caught
+    )
+    mpp_turn = res_turn.population[0]
+    assert len(mpp_turn.portfolios) == 2
+    assert "SweepTurnover" in res_turn.live_weights
+    assert sum(res_turn.live_weights["SweepTurnover"].values()) == pytest.approx(
+        1.0, abs=1e-6
+    )
+
+    # Also verify combinatorial CV with grid-swept max_turnover does not crash with infeasibility
+    pop_cpcv = eng_turn.run_robustness_test(
+        cv_type="combinatorial",
+        n_folds=4,
+        n_test_folds=2,
+        purged_size=2,
+        inner_cv_kwargs={"train_size": 40, "test_size": 20},
+    )
+    assert len(pop_cpcv) > 0
+
+    # 2. Sweeping transaction_costs=[0.005, 0.01] on a clean base estimator:
+    #    Fold 0 must have total_cost == 0.0, Fold 1 must have positive cost,
+    #    and PortfolioDeltaEngine must charge positive external entry_drag.
+    pipe_tc = (
+        StrategyBuilder(constraints=ConstraintBuilder(u).build())
+        .set_optimizer(MeanRisk())
+        .build_pipeline()
+    )
+    eng_tc = PortfolioExperimentEngine(u, n_jobs=-1)
+    eng_tc.add_strategy(
+        "SweepTC", pipe_tc, {"optimizer__transaction_costs": [0.005, 0.01]}
+    )
+    pop_tc = eng_tc.run_robustness_test(
+        cv_type="walk_forward",
+        train_size=100,
+        test_size=40,
+        inner_cv_kwargs={"train_size": 40, "test_size": 20},
+    )
+    mpp_tc = pop_tc[0]
+    assert float(mpp_tc.portfolios[0].total_cost) == pytest.approx(0.0, abs=1e-12)
+    assert float(mpp_tc.portfolios[1].total_cost) > 0.0
+    de = PortfolioDeltaEngine(u, current_weights=cw, target_weights=cw)
+    delta_res = de.calculate_rebalance_delta(
+        pop_tc, strategy_tag="SweepTC", brokerage_bps=50.0
+    )
+    assert delta_res["rebalance"]["entry_drag"] > 0.0
+
+    # 3. Base estimator ALREADY has transaction_costs=0.005 AND grid ALSO sweeps transaction_costs:
+    #    Fold 0 must STILL be neutralized (total_cost == 0.0), not overwritten by best_params_.
+    pipe_both = (
+        StrategyBuilder(
+            constraints=ConstraintBuilder(u)
+            .transaction_costs(0.005, holding_period=40)
+            .build()
+        )
+        .set_optimizer(MeanRisk())
+        .build_pipeline()
+    )
+    eng_both = PortfolioExperimentEngine(u, n_jobs=1)
+    eng_both.add_strategy(
+        "BaseAndSweepTC", pipe_both, {"optimizer__transaction_costs": [0.005, 0.01]}
+    )
+    pop_both = eng_both.run_robustness_test(
+        cv_type="walk_forward",
+        train_size=100,
+        test_size=40,
+        inner_cv_kwargs={"train_size": 40, "test_size": 20},
+    )
+    mpp_both = pop_both[0]
+    assert float(mpp_both.portfolios[0].total_cost) == pytest.approx(0.0, abs=1e-12)
+    assert float(mpp_both.portfolios[1].total_cost) > 0.0
+
+
+def test_online_evaluation_sweeping_friction_neutralizes_fold0() -> None:
+    """run_online_evaluation must also neutralize Fold 0 when config['grid'] sweeps max_turnover or transaction_costs."""
+    from skfolio.moments import EWCovariance, EWMu
+    from skfolio.prior import EmpiricalPrior
+
+    from flowportfolio.core.constraints import ConstraintBuilder
+    from flowportfolio.strategies import StrategyBuilder
+
+    rng = np.random.default_rng(143)
+    dates = pd.bdate_range("2022-01-03", periods=160)
+    rets = pd.DataFrame(
+        rng.normal(0.0005, 0.01, (160, 3)),
+        index=dates,
+        columns=["A", "B", "C"],
+    )
+    u = Universe(
+        ["A", "B", "C"],
+        {"A": "core", "B": "core", "C": "sat"},
+        {"A": 0.0, "B": 0.0, "C": 0.0},
+    )
+    u._returns = rets
+    online_prior = EmpiricalPrior(
+        mu_estimator=EWMu(half_life=10),
+        covariance_estimator=EWCovariance(half_life=10),
+    )
+    pipe = (
+        StrategyBuilder(constraints=ConstraintBuilder(u).build(), prior=online_prior)
+        .set_optimizer(MeanRisk())
+        .build_pipeline()
+    )
+    eng = PortfolioExperimentEngine(u, n_jobs=1)
+    eng.add_strategy(
+        "OnlineSweepFriction",
+        pipe,
+        {
+            "optimizer__max_turnover": [0.1, 0.2],
+            "optimizer__transaction_costs": [0.005, 0.01],
+        },
+    )
+    pop = eng.run_online_evaluation(
+        cv_type="walk_forward",
+        warmup_size=80,
+        test_size=20,
+    )
+    mpp = pop[0]
+    assert len(mpp.portfolios) >= 2
+    assert float(mpp.portfolios[0].total_cost) == pytest.approx(0.0, abs=1e-12)
+    assert float(mpp.portfolios[1].transaction_costs) in (0.005, 0.01)

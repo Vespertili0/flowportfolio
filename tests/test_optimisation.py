@@ -559,3 +559,45 @@ def test_grid_search_cv_tuning_max_turnover_in_param_grid_uses_feasible_inner_ba
     assert gscv_list.needs_previous_weights is True
     gscv_list.fit(X)
     assert gscv_list.best_params_["optimizer__max_turnover"] in (0.05, 0.15)
+
+
+def test_grid_search_cv_refit_param_overrides_survive_best_params() -> None:
+    """Fold-0 entry neutralisation via refit_param_overrides must survive best_params_ on Fold 0 and restore on Fold 1+."""
+    from skfolio.model_selection import cross_val_predict
+
+    X = _sample_returns(n_obs=180, seed=53)
+    gscv = SkfolioGridSearchCV(
+        estimator=MeanRisk(),
+        param_grid={
+            "max_turnover": [0.10, 0.20],
+            "transaction_costs": [0.005, 0.01],
+        },
+        cv=WalkForward(train_size=40, test_size=20),
+    )
+    mpp = cross_val_predict(
+        gscv,
+        X,
+        cv=WalkForward(train_size=80, test_size=40),
+        entry_rebalancing_params={
+            "refit_param_overrides": {
+                "max_turnover": None,
+                "transaction_costs": 0.0,
+            }
+        },
+    )
+    assert len(mpp.portfolios) == 2
+    fold0, fold1 = mpp.portfolios[0], mpp.portfolios[1]
+    assert float(fold0.total_cost) == pytest.approx(0.0, abs=1e-12)
+    assert float(fold1.transaction_costs) in (0.005, 0.01)
+    assert float(fold1.total_cost) > 0.0
+
+    # Also verify refit_param_overrides works when isolate_inner_previous_weights=False
+    gscv_no_iso = SkfolioGridSearchCV(
+        estimator=MeanRisk(),
+        param_grid={"transaction_costs": [0.005, 0.01]},
+        cv=WalkForward(train_size=40, test_size=20),
+        isolate_inner_previous_weights=False,
+        refit_param_overrides={"transaction_costs": 0.0},
+    )
+    gscv_no_iso.fit(X.iloc[:100])
+    assert float(gscv_no_iso.transaction_costs) == pytest.approx(0.0, abs=1e-12)

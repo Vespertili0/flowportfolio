@@ -195,12 +195,26 @@ def _has_max_turnover_chain(opt: Any, _visited: set[int] | None = None) -> bool:
     )
 
 
-def _param_grid_sets_param(
-    param_grid: Any, param_name: str, *, require_non_none: bool = True
-) -> bool:
-    """Return True if ``param_grid`` sweeps ``param_name`` (top-level or Pipeline step)."""
-    if param_grid is None:
+def _is_positive_tc_value(value: Any) -> bool:
+    """Return True if a transaction_costs candidate value contains any strictly positive cost."""
+    if value is None or isinstance(value, bool):
         return False
+    if isinstance(value, (int, float)):
+        f_val = float(value)
+        return math.isfinite(f_val) and f_val > 0.0
+    if isinstance(value, dict):
+        return any(_is_positive_tc_value(v) for v in value.values())
+    try:
+        arr = np.asarray(value, dtype=float)
+        return bool(np.any(np.isfinite(arr) & (arr > 0.0)))
+    except (TypeError, ValueError):
+        return False
+
+
+def _iter_param_grid_items(param_grid: Any) -> list[tuple[str, list[Any]]]:
+    """Flatten a dict or sequence-of-dicts param_grid into ``(key, candidates)`` pairs."""
+    if param_grid is None:
+        return []
     grids = (
         [param_grid]
         if isinstance(param_grid, dict)
@@ -208,28 +222,68 @@ def _param_grid_sets_param(
         if isinstance(param_grid, (list, tuple))
         else []
     )
-    suffix = f"__{param_name}"
+    items: list[tuple[str, list[Any]]] = []
     for grid in grids:
         if not isinstance(grid, dict):
             continue
         for key, values in grid.items():
             if not isinstance(key, str):
                 continue
-            if key == param_name or key.endswith(suffix):
-                if not require_non_none:
-                    return True
+            if isinstance(values, (list, tuple, set, np.ndarray)):
+                cand_list = list(values)
+            elif isinstance(values, (dict, str, bytes)):
+                cand_list = [values]
+            else:
                 try:
-                    if any(v is not None for v in values):
-                        return True
+                    cand_list = list(values)
                 except TypeError:
-                    if values is not None:
-                        return True
+                    cand_list = [values]
+            items.append((key, cand_list))
+    return items
+
+
+def _param_grid_sets_param(
+    param_grid: Any, param_name: str, *, require_non_none: bool = True
+) -> bool:
+    """Return True if ``param_grid`` sweeps ``param_name`` (top-level or Pipeline step)."""
+    suffix = f"__{param_name}"
+    for key, values in _iter_param_grid_items(param_grid):
+        if key == param_name or key.endswith(suffix):
+            if not require_non_none:
+                return True
+            if any(v is not None for v in values):
+                return True
     return False
 
 
 def _param_grid_sets_max_turnover(param_grid: Any) -> bool:
     """Return True if ``param_grid`` sweeps any non-None ``max_turnover`` candidate."""
     return _param_grid_sets_param(param_grid, "max_turnover", require_non_none=True)
+
+
+def _param_grid_sets_positive_tc(param_grid: Any) -> bool:
+    """Return True if ``param_grid`` sweeps any strictly positive ``transaction_costs`` candidate."""
+    for key, values in _iter_param_grid_items(param_grid):
+        if (key == "transaction_costs" or key.endswith("__transaction_costs")) and any(
+            _is_positive_tc_value(v) for v in values
+        ):
+            return True
+    return False
+
+
+def _collect_param_grid_neutral_params(param_grid: Any) -> dict[str, Any]:
+    """Collect estimator-relative Fold-0 neutral overrides for friction params swept in ``param_grid``."""
+    neutral: dict[str, Any] = {}
+    for key, values in _iter_param_grid_items(param_grid):
+        if (key == "max_turnover" or key.endswith("__max_turnover")) and any(
+            v is not None for v in values
+        ):
+            neutral[key] = None
+        elif (
+            key == "transaction_costs" or key.endswith("__transaction_costs")
+        ) and any(_is_positive_tc_value(v) for v in values):
+            neutral[key] = 0.0
+    return neutral
 
 
 def _neutral_equal_previous_weights(X: Any) -> Any:
@@ -249,7 +303,9 @@ class SkfolioGridSearchCV(BaseOptimization, GridSearchCV):
     This ensures that when skfolio's cross_val_predict uses this search object,
     it exposes weights_ and predict correctly as an optimization estimator,
     isolates inner CV folds from future outer-terminal ``previous_weights`` when
-    refitting, and sanitizes degenerate zero-risk ratio fold scores.
+    refitting, supports Fold-0 entry neutralisation via ``refit_param_overrides``
+    even when ``param_grid`` sweeps friction parameters, and sanitizes
+    degenerate zero-risk ratio fold scores.
     """
 
     def __init__(
@@ -268,6 +324,7 @@ class SkfolioGridSearchCV(BaseOptimization, GridSearchCV):
         previous_weights: Any = None,
         portfolio_params: dict[str, Any] | None = None,
         isolate_inner_previous_weights: bool = True,
+        refit_param_overrides: dict[str, Any] | None = None,
         **kwargs: Any,
     ):
         GridSearchCV.__init__(
@@ -288,6 +345,7 @@ class SkfolioGridSearchCV(BaseOptimization, GridSearchCV):
         self.portfolio_params: dict[str, Any] | None = portfolio_params
         self.previous_weights = previous_weights
         self.isolate_inner_previous_weights = isolate_inner_previous_weights
+        self.refit_param_overrides = refit_param_overrides
 
     def _get_target_optimizer(self, est: Any) -> Any:
         """Return the terminal optimiser of a Pipeline, or ``est`` itself."""
@@ -298,9 +356,9 @@ class SkfolioGridSearchCV(BaseOptimization, GridSearchCV):
     @property
     def needs_previous_weights(self) -> bool:
         """Whether the wrapped optimiser or param_grid requires sequential previous weights."""
-        if _param_grid_sets_max_turnover(self.param_grid) or _param_grid_sets_param(
-            self.param_grid, "transaction_costs", require_non_none=True
-        ):
+        if _param_grid_sets_max_turnover(
+            self.param_grid
+        ) or _param_grid_sets_positive_tc(self.param_grid):
             return True
         current = self._get_target_optimizer(self.estimator)
         visited: set[int] = set()
@@ -411,6 +469,10 @@ class SkfolioGridSearchCV(BaseOptimization, GridSearchCV):
         est_clone = clone(self.estimator) if self.estimator is not None else None
         effective_pw = _normalize_previous_weights(self.previous_weights, X)
         safe_scorer = _make_safe_scorer(self.scoring)
+        has_refit_overrides = (
+            isinstance(self.refit_param_overrides, dict)
+            and len(self.refit_param_overrides) > 0
+        )
 
         if self.isolate_inner_previous_weights and est_clone is not None:
             # Inner CV evaluates historical sub-windows using a causal neutral
@@ -427,7 +489,11 @@ class SkfolioGridSearchCV(BaseOptimization, GridSearchCV):
         else:
             if effective_pw is not None and est_clone is not None:
                 set_previous_weights_chain(est_clone, effective_pw)
-            run_delegate_refit = self.refit
+            run_delegate_refit = (
+                (self.refit if isinstance(self.refit, str) else False)
+                if has_refit_overrides
+                else self.refit
+            )
 
         delegate = GridSearchCV(
             estimator=est_clone,
@@ -444,7 +510,9 @@ class SkfolioGridSearchCV(BaseOptimization, GridSearchCV):
         delegate.fit(X, y, **fit_params)
         _copy_fitted_attrs(delegate, self)
 
-        if self.isolate_inner_previous_weights and self.estimator is not None:
+        if (
+            self.isolate_inner_previous_weights or has_refit_overrides
+        ) and self.estimator is not None:
             should_refit = False
             if self.refit is True or callable(self.refit):
                 best_idx = (
@@ -466,6 +534,8 @@ class SkfolioGridSearchCV(BaseOptimization, GridSearchCV):
                 refit_est = clone(self.estimator).set_params(**self.best_params_)
                 if effective_pw is not None:
                     set_previous_weights_chain(refit_est, effective_pw)
+                if has_refit_overrides and self.refit_param_overrides is not None:
+                    refit_est.set_params(**self.refit_param_overrides)
                 refit_start = time.perf_counter()
                 refit_est.fit(X, y, **fit_params)
                 self.refit_time_ = time.perf_counter() - refit_start

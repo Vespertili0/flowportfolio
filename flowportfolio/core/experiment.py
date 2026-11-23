@@ -36,8 +36,10 @@ from flowportfolio.core.optimisation import (
     SkfolioGridSearchCV as GridSearchCV,
 )
 from flowportfolio.core.optimisation import (
+    _collect_param_grid_neutral_params,
+    _has_max_turnover_chain,
     _param_grid_sets_max_turnover,
-    _param_grid_sets_param,
+    _param_grid_sets_positive_tc,
     set_previous_weights_chain,
 )
 from flowportfolio.core.protocols import UniverseProtocol
@@ -241,20 +243,6 @@ def _has_chain_transaction_costs(opt: Any) -> bool:
     return False
 
 
-def _has_rebalancing_friction(opt: Any) -> bool:
-    """Return True if ``opt`` or any fallback has max_turnover or transaction_costs."""
-    current = opt
-    visited: set[int] = set()
-    while current is not None and id(current) not in visited:
-        visited.add(id(current))
-        if getattr(current, "max_turnover", None) is not None:
-            return True
-        if _has_transaction_costs(current):
-            return True
-        current = getattr(current, "fallback", None)
-    return False
-
-
 def _collect_chain_neutral_params(
     opt: Any, prefix: str, params: dict[str, Any]
 ) -> None:
@@ -273,16 +261,45 @@ def _collect_chain_neutral_params(
 
 
 def _build_entry_rebalancing_params(
-    est: Any, *, prefix: str = "estimator__"
+    est: Any,
+    *,
+    prefix: str = "estimator__",
+    param_grid: Any = None,
+    include_refit_overrides: bool = False,
 ) -> dict[str, Any] | None:
-    """Build ``skfolio`` ``entry_rebalancing_params`` neutralizing Fold-0 entry friction."""
-    params: dict[str, Any] = {}
+    """Build ``skfolio`` ``entry_rebalancing_params`` neutralizing Fold-0 entry friction.
+
+    Inspects both the base estimator chain and any friction parameters
+    (``max_turnover``, ``transaction_costs``) swept in ``param_grid``. When
+    ``include_refit_overrides=True``, also populates ``refit_param_overrides``
+    so :class:`SkfolioGridSearchCV` preserves Fold-0 neutralisation after
+    applying ``best_params_``.
+    """
+    est_neutral: dict[str, Any] = {}
     if hasattr(est, "steps") and est.steps:
         for step_name, step in est.steps:
-            _collect_chain_neutral_params(step, f"{prefix}{step_name}__", params)
+            _collect_chain_neutral_params(step, f"{step_name}__", est_neutral)
     else:
-        _collect_chain_neutral_params(est, prefix, params)
-    return params or None
+        _collect_chain_neutral_params(est, "", est_neutral)
+
+    grid_neutral = _collect_param_grid_neutral_params(param_grid)
+    if grid_neutral:
+        valid_params = (
+            set(est.get_params(deep=True).keys())
+            if hasattr(est, "get_params")
+            else None
+        )
+        for key, value in grid_neutral.items():
+            if valid_params is None or key in valid_params:
+                est_neutral[key] = value
+
+    if not est_neutral:
+        return None
+
+    params: dict[str, Any] = {f"{prefix}{k}": v for k, v in est_neutral.items()}
+    if include_refit_overrides:
+        params["refit_param_overrides"] = dict(est_neutral)
+    return params
 
 
 def _scale_transaction_costs_chain(
@@ -865,45 +882,39 @@ class PortfolioExperimentEngine:
             user_previous_weights = copy.deepcopy(
                 getattr(target_opt, "previous_weights", None)
             )
-            grid_has_turnover = _param_grid_sets_max_turnover(config["grid"])
-            grid_has_tc = _param_grid_sets_param(
-                config["grid"], "transaction_costs", require_non_none=True
-            )
-            has_friction = (
-                _has_rebalancing_friction(target_opt)
-                or grid_has_turnover
-                or grid_has_tc
-            )
+            has_max_turnover = _has_max_turnover_chain(
+                est_clone
+            ) or _param_grid_sets_max_turnover(config["grid"])
+            has_tc = _has_chain_transaction_costs(
+                target_opt
+            ) or _param_grid_sets_positive_tc(config["grid"])
+            has_friction = has_max_turnover or has_tc
 
             # Prevent present-day physical weights from contaminating historical
-            # Fold 0 under BOTH max_turnover and transaction_costs.
+            # Fold 0 under BOTH max_turnover and transaction_costs (including grid-swept friction).
             entry_params: dict[str, Any] | None = None
             if has_friction or user_previous_weights is not None:
                 if cv_type in ("walk_forward", "randomised"):
                     set_previous_weights_chain(est_clone, None)
                     entry_params = _build_entry_rebalancing_params(
-                        est_clone, prefix="estimator__"
+                        est_clone,
+                        prefix="estimator__",
+                        param_grid=config["grid"],
+                        include_refit_overrides=True,
                     )
                 else:
-                    baseline_pw = (
-                        equal_weights
-                        if (
-                            getattr(target_opt, "max_turnover", None) is not None
-                            or grid_has_turnover
-                        )
-                        else None
-                    )
+                    baseline_pw = equal_weights if has_max_turnover else None
                     set_previous_weights_chain(est_clone, baseline_pw)
 
             if cv_type == "combinatorial":
-                if getattr(target_opt, "max_turnover", None) is not None:
+                if has_max_turnover:
                     logger.warning(
                         "Strategy '%s' configured with max_turnover under non-sequential cv_type='combinatorial'. "
                         "Historical cross-validation evaluates turnover against equal baseline weights; "
                         "live terminal refit enforces max_turnover against current physical weights.",
                         name,
                     )
-                if _has_chain_transaction_costs(target_opt):
+                if has_tc:
                     logger.warning(
                         "Strategy '%s' configured with transaction_costs under non-sequential "
                         "cv_type='combinatorial': independent CPCV folds enter from zero weights "
@@ -911,10 +922,7 @@ class PortfolioExperimentEngine:
                         "for sequential cost simulation.",
                         name,
                     )
-            elif (
-                cv_type == "randomised"
-                and getattr(target_opt, "max_turnover", None) is not None
-            ):
+            elif cv_type == "randomised" and has_max_turnover:
                 logger.warning(
                     "Strategy '%s' configured with max_turnover under cv_type='randomised'. "
                     "Historical subsampled paths start with neutralized Fold-0 entry rebalancing; "
@@ -1313,26 +1321,21 @@ class PortfolioExperimentEngine:
             user_previous_weights = copy.deepcopy(
                 getattr(est, "previous_weights", None)
             )
-            grid_has_turnover = _param_grid_sets_max_turnover(grid)
-            grid_has_tc = _param_grid_sets_param(
-                grid, "transaction_costs", require_non_none=True
+            has_max_turnover = _has_max_turnover_chain(
+                est
+            ) or _param_grid_sets_max_turnover(grid)
+            has_tc = _has_chain_transaction_costs(est) or _param_grid_sets_positive_tc(
+                grid
             )
-            has_friction = (
-                _has_rebalancing_friction(est) or grid_has_turnover or grid_has_tc
-            )
+            has_friction = has_max_turnover or has_tc
             entry_params: dict[str, Any] | None = None
 
             if has_friction or user_previous_weights is not None:
-                baseline_pw = (
-                    equal_weights
-                    if (
-                        getattr(est, "max_turnover", None) is not None
-                        or grid_has_turnover
-                    )
-                    else None
-                )
+                baseline_pw = equal_weights if has_max_turnover else None
                 set_previous_weights_chain(est, baseline_pw)
-                entry_params = _build_entry_rebalancing_params(est, prefix="")
+                entry_params = _build_entry_rebalancing_params(
+                    est, prefix="", param_grid=grid
+                )
 
             # inner_warmup and inner_test are observation row counts from burn_in_returns,
             # so calendar freq/freq_offset/previous/reduce_test must NOT leak into OnlineGridSearch.
