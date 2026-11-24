@@ -1,3 +1,5 @@
+import numpy as np
+import pandas as pd
 import pytest
 from skfolio.optimization import (
     HierarchicalRiskParity,
@@ -5,12 +7,14 @@ from skfolio.optimization import (
     NestedClustersOptimization,
 )
 from skfolio.prior import EmpiricalPrior
+from sklearn.base import BaseEstimator, TransformerMixin, clone
 from sklearn.pipeline import Pipeline
 
+from flowportfolio.core.constraints import ConstraintSpec
 from flowportfolio.strategies import StrategyBuilder
 
 
-class MockTransformer:
+class MockTransformer(BaseEstimator, TransformerMixin):
     def fit_transform(self, X):
         return X
 
@@ -38,14 +42,6 @@ def test_add_pre_selection_raises_type_error():
         builder.add_pre_selection("not a transformer")
 
 
-def test_add_cross_sectional_raises_type_error():
-    builder = StrategyBuilder(constraints=[])
-    with pytest.raises(
-        TypeError, match="transformer must implement a fit_transform method"
-    ):
-        builder.add_cross_sectional("not a transformer")
-
-
 def test_set_optimizer_raises_type_error_if_none():
     builder = StrategyBuilder(constraints=[])
     with pytest.raises(TypeError, match="optimizer must not be None"):
@@ -67,7 +63,8 @@ def test_set_optimizer_fallback_unsupported_raises_type_error():
 
     builder = StrategyBuilder(constraints=[])
     with pytest.raises(
-        TypeError, match="The provided optimizer does not support fallback semantics."
+        TypeError,
+        match="does not implement a 'get_params' method|does not support fallback semantics",
     ):
         builder.set_optimizer(UnsupportedOptimizer(), fallback=MeanRisk())
 
@@ -83,26 +80,24 @@ def test_build_pipeline_ordering_and_prior_injection():
     builder = StrategyBuilder(constraints=[], prior=prior)
 
     pre = MockTransformer()
-    cs = MockTransformer()
     opt = MeanRisk()
 
     builder.add_pre_selection(pre)
-    builder.add_cross_sectional(cs)
     builder.set_optimizer(opt)
 
     pipeline = builder.build_pipeline()
     assert isinstance(pipeline, Pipeline)
-    assert len(pipeline.steps) == 3
+    assert len(pipeline.steps) == 2
     assert pipeline.steps[0][0] == "pre_0"
-    assert pipeline.steps[1][0] == "cs_0"
-    assert pipeline.steps[2][0] == "optimizer"
+    assert pipeline.steps[1][0] == "optimizer"
 
     # Check prior injection
-    assert pipeline.steps[2][1].prior_estimator is prior
+    assert pipeline.steps[1][1].prior_estimator is not prior
+    assert type(pipeline.steps[1][1].prior_estimator) is type(prior)
 
 
 def test_build_nco_clustering_dispatch_and_no_mutation():
-    builder = StrategyBuilder(constraints=["A >= 0.1"])
+    builder = StrategyBuilder()
 
     inner = MeanRisk()
     outer = MeanRisk()
@@ -110,31 +105,26 @@ def test_build_nco_clustering_dispatch_and_no_mutation():
     nco = builder.build_nco(inner, outer, clusterer="kmeans")
     assert isinstance(nco, NestedClustersOptimization)
 
-    # Check injection
-    assert nco.inner_estimator.linear_constraints == ["A >= 0.1"]
-
     # Check invalid clusterer
     with pytest.raises(ValueError, match="clusterer must be one of"):
         builder.build_nco(inner, outer, clusterer="invalid")
 
 
 def test_build_nco_does_not_mutate_estimators():
-    builder = StrategyBuilder(constraints=["constraint1"])
+    prior = EmpiricalPrior()
+    builder = StrategyBuilder(prior=prior)
 
     inner = MeanRisk()
     outer = HierarchicalRiskParity()
 
-    nco = builder.build_nco(inner, outer)
+    builder.build_nco(inner, outer)
 
-    # Original inner should not have constraints
+    # Original inner should not have prior injected
     assert (
-        not hasattr(inner, "linear_constraints")
-        or inner.linear_constraints is None
-        or inner.linear_constraints != ["constraint1"]
+        not hasattr(inner, "prior_estimator")
+        or inner.prior_estimator is None
+        or inner.prior_estimator is not prior
     )
-
-    # But NCO's inner should
-    assert nco.inner_estimator.linear_constraints == ["constraint1"]
 
 
 def test_build_nco_raises_type_error_if_none():
@@ -161,13 +151,11 @@ def test_reset_clears_optimizer_state() -> None:
 
 
 def test_reset_clears_pipeline_queues() -> None:
-    """Test reset() clears pre_selection and cross_sectional queues."""
+    """Test reset() clears pre_selection queue."""
     builder = StrategyBuilder(constraints=[])
     builder.add_pre_selection(MockTransformer())
-    builder.add_cross_sectional(MockTransformer())
     builder.reset()
     assert builder._pre_selection == []
-    assert builder._cross_sectional == []
 
 
 def test_reset_preserves_base_config_by_default() -> None:
@@ -211,10 +199,8 @@ def test_init_accepts_none_constraints() -> None:
 def test_build_pipeline_clones_transformers() -> None:
     """Test build_pipeline creates independent clones of queued transformers."""
     pre = MockTransformer()
-    cs = MockTransformer()
     builder = StrategyBuilder()
     builder.add_pre_selection(pre)
-    builder.add_cross_sectional(cs)
     builder.set_optimizer(MeanRisk())
 
     pipeline1 = builder.build_pipeline()
@@ -222,3 +208,809 @@ def test_build_pipeline_clones_transformers() -> None:
 
     assert pipeline1.steps[0][1] is not pipeline2.steps[0][1]
     assert pipeline1.steps[1][1] is not pipeline2.steps[1][1]
+
+
+def test_set_optimizer_preserves_pre_configured_constraints_when_builder_empty():
+    opt = MeanRisk(linear_constraints=["pre_existing <= 0.2"])
+    builder = StrategyBuilder(constraints=[])
+    builder.set_optimizer(opt)
+
+    pipeline = builder.build_pipeline()
+    pipeline_opt = pipeline.steps[-1][1]
+    assert pipeline_opt.linear_constraints == ["pre_existing <= 0.2"]
+
+
+def test_set_optimizer_merges_linear_constraints():
+    opt = MeanRisk(linear_constraints=["pre_existing <= 0.2"])
+    builder = StrategyBuilder(constraints=["new_constraint >= 0.1"])
+    builder.set_optimizer(opt)
+
+    pipeline = builder.build_pipeline()
+    pipeline_opt = pipeline.steps[-1][1]
+    assert pipeline_opt.linear_constraints == [
+        "pre_existing <= 0.2",
+        "new_constraint >= 0.1",
+    ]
+
+
+def test_constraint_spec_binds_groups_and_linear_constraints():
+    spec = ConstraintSpec(
+        linear_constraints=["core >= 0.5"],
+        groups={"A": ["core"], "B": ["satellite"]},
+    )
+    builder = StrategyBuilder(constraints=spec)
+    opt = MeanRisk()
+    builder.set_optimizer(opt)
+
+    pipeline = builder.build_pipeline()
+    pipeline_opt = pipeline.steps[-1][1]
+    assert pipeline_opt.linear_constraints == ["core >= 0.5"]
+    assert pipeline_opt.groups == {"A": ["core"], "B": ["satellite"]}
+
+
+def test_build_nco_binds_groups_and_merges_constraints():
+    spec = ConstraintSpec(
+        linear_constraints=["core >= 0.4"],
+        groups={"A": ["core"], "B": ["satellite"]},
+    )
+    builder = StrategyBuilder(constraints=spec)
+    inner = MeanRisk()
+    outer = MeanRisk()
+
+    with pytest.raises(
+        ValueError,
+        match="Cross-asset linear constraints and turnover limits cannot be enforced",
+    ):
+        builder.build_nco(inner, outer)
+
+
+def test_constraints_reassignment_replaces_not_accumulates():
+    builder = StrategyBuilder(constraints=["old_constraint >= 0.1"])
+    builder.set_optimizer(MeanRisk())
+    builder.constraints = ["core <= 0.5"]
+
+    pipeline = builder.build_pipeline()
+    pipeline_opt = pipeline.steps[-1][1]
+    assert pipeline_opt.linear_constraints == ["core <= 0.5"]
+
+    # Verify build_nco populates portfolio_params["management_fees"] when fees present
+    fee_spec = ConstraintSpec(management_fees={"A": 0.0001, "B": 0.0002})
+    fee_builder = StrategyBuilder(constraints=fee_spec)
+    nco = fee_builder.build_nco(MeanRisk(), MeanRisk())
+    assert nco.portfolio_params is not None
+    assert nco.portfolio_params.get("management_fees") == {"A": 0.0001, "B": 0.0002}
+
+
+def test_safe_pre_selection_preserves_constrained_group():
+    """Verify _SafePreSelectionTransformer preserves assets required by linear constraints."""
+    import numpy as np
+    from skfolio.pre_selection import DropCorrelated
+
+    from flowportfolio.core.constraints import ConstraintBuilder
+    from flowportfolio.core.universe import Universe
+    from tests.test_audit_remediation_integration import StubProvider, _synthetic_prices
+
+    u = Universe(
+        tickers=["SPY", "QQQ", "TLT", "GLD"],
+        metadata={
+            "SPY": "satellite",
+            "QQQ": "core",
+            "TLT": "defensive",
+            "GLD": "defensive",
+        },
+        fees={"SPY": 0.0009, "QQQ": 0.0020, "TLT": 0.0003, "GLD": 0.0040},
+    )
+    prices = _synthetic_prices(600)
+    # Ensure QQQ is almost identical to SPY so DropCorrelated would otherwise drop QQQ
+    prices["QQQ"] = prices["SPY"] * 1.001 + np.random.randn(600) * 0.0001
+    u.fetch_data(data_provider=StubProvider(prices))
+    u.anchor_history()
+
+    spec = (
+        ConstraintBuilder(u)
+        .min_group("core", 0.40)
+        .max_group("satellite", 0.30)
+        .build()
+    )
+    pipe = (
+        StrategyBuilder(constraints=spec)
+        .add_pre_selection(DropCorrelated(threshold=0.85))
+        .set_optimizer(MeanRisk())
+        .build_pipeline()
+    )
+
+    pipe.fit(u.returns)
+    opt = pipe.named_steps["optimizer"]
+    assert "QQQ" in opt.feature_names_in_
+    weights_dict = dict(zip(opt.feature_names_in_, opt.weights_))
+    assert weights_dict["QQQ"] >= 0.40 - 1e-5
+
+
+def test_adaptive_kmeans_and_pickle():
+    """Verify _AdaptiveKMeans adapts cluster count on small N and is picklable."""
+    import pickle
+
+    import numpy as np
+
+    from flowportfolio.strategies import _AdaptiveKMeans
+
+    ak = _AdaptiveKMeans(n_clusters=8, random_state=42)
+    # 8 assets, 100 features
+    X = np.random.randn(8, 100)
+    ak.fit(X)
+
+    unique_clusters = len(set(ak.labels_))
+    # Effective k should be min(8, 8//2) = 4
+    assert unique_clusters == 4
+    assert ak.n_clusters == 8  # unmutated
+
+    # Picklable
+    pickled = pickle.dumps(ak)
+    restored = pickle.loads(pickled)
+    assert np.array_equal(restored.labels_, ak.labels_)
+
+
+def test_fee_aware_nco_deducts_fees():
+    """Verify _FeeAwareNCO fits successfully and attributes fees to predicted portfolio."""
+    import numpy as np
+    import pandas as pd
+
+    from flowportfolio.strategies import _FeeAwareNCO
+
+    np.random.seed(42)
+    returns = pd.DataFrame(
+        np.random.randn(100, 4) * 0.01 + 0.0005, columns=["A", "B", "C", "D"]
+    )
+    fees = {"A": 0.001 / 252, "B": 0.002 / 252, "C": 0.001 / 252, "D": 0.003 / 252}
+
+    nco = _FeeAwareNCO(
+        inner_estimator=MeanRisk(),
+        outer_estimator=MeanRisk(),
+        portfolio_params={"management_fees": fees},
+    )
+    nco.fit(returns)
+    assert nco.weights_ is not None
+    assert abs(sum(nco.weights_) - 1.0) < 1e-5
+
+    port = nco.predict(returns)
+    assert hasattr(port, "management_fees")
+
+
+def test_warnings_on_unsupported_constraints_in_optimizer(caplog):
+    """Verify StrategyBuilder logs warnings when optimizer lacks linear_constraints or max_turnover."""
+    import logging
+
+    from skfolio.optimization import HierarchicalRiskParity
+
+    builder = StrategyBuilder(constraints=["core >= 0.5"])
+    builder._max_turnover = 0.05
+    builder._previous_weights = {"A": 0.5, "B": 0.5}
+
+    with caplog.at_level(logging.WARNING):
+        builder.set_optimizer(HierarchicalRiskParity())
+
+    assert "does not support linear_constraints" in caplog.text
+    assert "does not support max_turnover" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Cycle 6 (F-07 & F-11): Multi-Asset Restore, _FeeAwareNCO, Seeding & Cleanup
+# ---------------------------------------------------------------------------
+
+
+def _correlated_core_returns(n_obs: int = 160) -> pd.DataFrame:
+    rng = np.random.default_rng(42)
+    base = rng.normal(0.0006, 0.01, n_obs)
+    return pd.DataFrame(
+        {
+            "C1": base,
+            "C2": base + rng.normal(0.0, 1e-4, n_obs),
+            "C3": base + rng.normal(0.0, 1e-4, n_obs),
+            "S1": rng.normal(0.0003, 0.01, n_obs),
+            "S2": rng.normal(0.0002, 0.01, n_obs),
+        }
+    )
+
+
+class _NumpyMaskSelector(BaseEstimator, TransformerMixin):
+    """Minimal selector returning raw np.ndarray (no set_output support)."""
+
+    def __init__(self, keep_indices: tuple[int, ...] = (0, 3, 4)) -> None:
+        self.keep_indices = keep_indices
+
+    def fit(self, X, y=None):
+        n_cols = X.shape[1]
+        mask = np.zeros(n_cols, dtype=bool)
+        for idx in self.keep_indices:
+            mask[idx] = True
+        self.mask_ = mask
+        return self
+
+    def transform(self, X):
+        return np.asarray(X)[:, self.mask_]
+
+    def get_support(self, indices: bool = False):
+        return np.where(self.mask_)[0] if indices else self.mask_
+
+
+def test_safe_pre_selection_restores_multiple_group_members_for_max_weights() -> None:
+    """F-07 (O5): min_group('core', 0.60) + MeanRisk(max_weights=0.40) preserves >= 2 core assets."""
+    from skfolio.pre_selection import DropCorrelated
+
+    X = _correlated_core_returns()
+    spec = ConstraintSpec(
+        linear_constraints=["core >= 0.6"],
+        groups={
+            "C1": ["core"],
+            "C2": ["core"],
+            "C3": ["core"],
+            "S1": ["sat"],
+            "S2": ["sat"],
+        },
+    )
+    pipe = (
+        StrategyBuilder(constraints=spec)
+        .add_pre_selection(DropCorrelated(threshold=0.9))
+        .set_optimizer(MeanRisk(max_weights=0.40))
+        .build_pipeline()
+    )
+
+    pipe.fit(X)
+    opt = pipe.named_steps["optimizer"]
+    surviving = list(opt.feature_names_in_)
+    core_surviving = [c for c in surviving if c in {"C1", "C2", "C3"}]
+    assert len(core_surviving) >= 2
+
+    weights = dict(zip(surviving, opt.weights_))
+    assert sum(weights[c] for c in core_surviving) >= 0.60 - 1e-5
+    assert max(weights.values()) <= 0.40 + 1e-5
+
+
+def test_safe_pre_selection_restores_complement_for_max_group_and_max_weights() -> None:
+    """F-07: max_group('sat', 0.30) + MeanRisk(max_weights=0.40) restores >= 2 non-sat assets."""
+    from skfolio.pre_selection import DropCorrelated
+
+    X = _correlated_core_returns()
+    spec = ConstraintSpec(
+        linear_constraints=["sat <= 0.3"],
+        groups={
+            "C1": ["core"],
+            "C2": ["core"],
+            "C3": ["core"],
+            "S1": ["sat"],
+            "S2": ["sat"],
+        },
+    )
+    pipe = (
+        StrategyBuilder(constraints=spec)
+        .add_pre_selection(DropCorrelated(threshold=0.9))
+        .set_optimizer(MeanRisk(max_weights=0.40))
+        .build_pipeline()
+    )
+
+    pipe.fit(X)
+    opt = pipe.named_steps["optimizer"]
+    surviving = list(opt.feature_names_in_)
+    non_sat = [c for c in surviving if c not in {"S1", "S2"}]
+    assert len(non_sat) >= 2
+
+    weights = dict(zip(surviving, opt.weights_))
+    assert sum(weights.get(c, 0.0) for c in ("S1", "S2")) <= 0.30 + 1e-5
+    assert max(weights.values()) <= 0.40 + 1e-5
+
+
+def test_safe_pre_selection_restores_asset_level_linear_constraint() -> None:
+    """F-07: Asset-level linear constraint ('C2 >= 0.25') restores dropped ticker C2."""
+    X = _correlated_core_returns()
+    spec = ConstraintSpec(
+        linear_constraints=["C2 >= 0.25"],
+        groups={
+            "C1": ["core"],
+            "C2": ["core"],
+            "C3": ["core"],
+            "S1": ["sat"],
+            "S2": ["sat"],
+        },
+    )
+    pipe = (
+        StrategyBuilder(constraints=spec)
+        .add_pre_selection(_NumpyMaskSelector(keep_indices=(0, 3, 4)))
+        .set_optimizer(MeanRisk())
+        .build_pipeline()
+    )
+
+    pipe.fit(X)
+    opt = pipe.named_steps["optimizer"]
+    weights = dict(zip(opt.feature_names_in_, opt.weights_))
+    assert "C2" in weights
+    assert weights["C2"] >= 0.25 - 1e-5
+
+
+def test_safe_pre_selection_restores_global_simplex_capacity_for_max_weights() -> None:
+    """F-07: MeanRisk(max_weights=0.40) without linear constraints restores >= 3 assets."""
+    X = _correlated_core_returns()
+    pipe = (
+        StrategyBuilder()
+        .add_pre_selection(_NumpyMaskSelector(keep_indices=(0, 3)))
+        .set_optimizer(MeanRisk(max_weights=0.40))
+        .build_pipeline()
+    )
+
+    pipe.fit(X)
+    opt = pipe.named_steps["optimizer"]
+    assert len(opt.feature_names_in_) >= 3
+    assert max(opt.weights_) <= 0.40 + 1e-5
+
+
+def test_restore_feasible_subset_stateless_helper() -> None:
+    """F-07: Standalone stateless feasibility helper restores minimal feasible asset set."""
+    from flowportfolio.strategies import _restore_feasible_subset
+
+    all_cols = ["C1", "C2", "C3", "S1", "S2"]
+    groups = {
+        "C1": ["core"],
+        "C2": ["core"],
+        "C3": ["core"],
+        "S1": ["sat"],
+        "S2": ["sat"],
+    }
+    restored, reasons = _restore_feasible_subset(
+        surviving=["C1", "S1", "S2"],
+        all_cols=all_cols,
+        groups=groups,
+        linear_constraints=["core >= 0.6"],
+        max_weights=0.40,
+    )
+    assert restored == ["C1", "C2", "S1", "S2"]
+    assert len(reasons) >= 1
+
+
+def test_build_pipeline_wraps_pre_selection_for_fee_and_cost_dicts() -> None:
+    """F-07: Pre-selection is wrapped when dict management_fees or transaction_costs are present."""
+    from flowportfolio.strategies import _SafePreSelectionTransformer
+
+    X = _correlated_core_returns()
+    fees = {"C1": 0.0001, "C2": 0.0002, "C3": 0.0001, "S1": 0.0003, "S2": 0.0002}
+
+    # Case 1: management_fees dict only (no linear_constraints, no max_turnover)
+    fee_pipe = (
+        StrategyBuilder(constraints=ConstraintSpec(management_fees=fees))
+        .add_pre_selection(_NumpyMaskSelector(keep_indices=(0, 3, 4)))
+        .set_optimizer(MeanRisk())
+        .build_pipeline()
+    )
+    assert isinstance(fee_pipe.named_steps["pre_0"], _SafePreSelectionTransformer)
+    fee_pipe.fit(X)
+    assert list(fee_pipe.named_steps["optimizer"].feature_names_in_) == [
+        "C1",
+        "S1",
+        "S2",
+    ]
+
+    # Case 2: transaction_costs dict + previous_weights (no linear_constraints, no max_turnover)
+    prev = {"C1": 0.2, "C2": 0.2, "C3": 0.2, "S1": 0.2, "S2": 0.2}
+    tc_pipe = (
+        StrategyBuilder(
+            constraints=ConstraintSpec(transaction_costs=fees, previous_weights=prev)
+        )
+        .add_pre_selection(_NumpyMaskSelector(keep_indices=(0, 3, 4)))
+        .set_optimizer(MeanRisk())
+        .build_pipeline()
+    )
+    assert isinstance(tc_pipe.named_steps["pre_0"], _SafePreSelectionTransformer)
+    tc_pipe.fit(X)
+    assert list(tc_pipe.named_steps["optimizer"].feature_names_in_) == [
+        "C1",
+        "S1",
+        "S2",
+    ]
+
+
+def test_fee_aware_nco_ndarray_fit_predict_parity_and_validation() -> None:
+    """F-07 & P2-9b: _FeeAwareNCO rejects ambiguous dict fees on raw ndarray, matches positional array fees, and preserves fitted DataFrame feature names."""
+    from skfolio.cluster import HierarchicalClustering, LinkageMethod
+    from skfolio.distance import PearsonDistance
+
+    from flowportfolio.strategies import _FeeAwareNCO
+
+    X_df = _correlated_core_returns(n_obs=120)
+    X_arr = X_df.to_numpy()
+    fees = {
+        "C1": 0.0001,
+        "C2": 0.0004,
+        "C3": 0.0002,
+        "S1": 0.0003,
+        "S2": 0.0005,
+    }
+    fee_arr = np.array([fees[c] for c in X_df.columns], dtype=float)
+    builder_dict = StrategyBuilder(constraints=ConstraintSpec(management_fees=fees))
+
+    nco_df = builder_dict.build_nco(MeanRisk(), MeanRisk(), clusterer="ward")
+    nco_arr = _FeeAwareNCO(
+        inner_estimator=MeanRisk(),
+        outer_estimator=MeanRisk(),
+        distance_estimator=PearsonDistance(),
+        clustering_estimator=HierarchicalClustering(linkage_method=LinkageMethod.WARD),
+        portfolio_params={"management_fees": fee_arr},
+    )
+
+    nco_df.fit(X_df)
+    nco_arr.fit(X_arr)
+
+    np.testing.assert_allclose(nco_arr.weights_, nco_df.weights_, rtol=0, atol=1e-6)
+
+    port_df = nco_df.predict(X_df)
+    port_arr = nco_arr.predict(X_arr)
+    port_df_on_arr = nco_df.predict(X_arr)
+
+    np.testing.assert_allclose(port_arr.returns, port_df.returns, rtol=0, atol=1e-6)
+    np.testing.assert_allclose(
+        port_df_on_arr.returns, port_df.returns, rtol=0, atol=1e-6
+    )
+
+    # Raw unlabeled ndarray with dict management_fees must fail instead of guessing insertion order
+    nco_dict_raw = builder_dict.build_nco(MeanRisk(), MeanRisk(), clusterer="ward")
+    with pytest.raises(ValueError, match="DataFrame|feature names"):
+        nco_dict_raw.fit(X_arr)
+
+    # Mismatched fee array width vs ndarray columns raises ValueError
+    bad_arr = X_arr[:, :3]
+    nco_bad = _FeeAwareNCO(
+        inner_estimator=MeanRisk(),
+        outer_estimator=MeanRisk(),
+        portfolio_params={"management_fees": fee_arr},
+    )
+    with pytest.raises(ValueError, match="management_fees"):
+        nco_bad.fit(bad_arr)
+
+
+def test_fee_aware_nco_does_not_mutate_inner_estimator_during_fit() -> None:
+    """F-07: _FeeAwareNCO.fit never mutates self.inner_estimator (even mid-fit)."""
+    from flowportfolio.strategies import _FeeAwareNCO
+
+    X_df = _correlated_core_returns(n_obs=120)
+    fees = {c: 0.0002 for c in X_df.columns}
+
+    nco_ref: list[object] = []
+    observed_during_fit: list[tuple[bool, object]] = []
+
+    class _SpyMeanRisk(MeanRisk):
+        def fit(self, X, y=None, **fit_params):
+            if nco_ref:
+                parent = nco_ref[0]
+                observed_during_fit.append(
+                    (
+                        parent.inner_estimator is orig_inner,  # type: ignore[attr-defined]
+                        parent.inner_estimator.management_fees,  # type: ignore[attr-defined]
+                    )
+                )
+            return super().fit(X, y=y, **fit_params)
+
+    orig_inner = _SpyMeanRisk(management_fees=dict(fees))
+    nco = _FeeAwareNCO(
+        inner_estimator=orig_inner,
+        outer_estimator=MeanRisk(),
+        portfolio_params={"management_fees": dict(fees)},
+    )
+    nco_ref.append(nco)
+    nco.fit(X_df)
+
+    assert len(observed_during_fit) > 0
+    assert all(same_obj and mf == fees for same_obj, mf in observed_during_fit)
+    assert nco.inner_estimator is orig_inner
+    assert orig_inner.management_fees == fees
+
+
+def test_subtract_management_fees_stateless_helper() -> None:
+    """F-07: Standalone _subtract_management_fees handles DataFrame, ndarray, and mismatches."""
+    from flowportfolio.strategies import _subtract_management_fees
+
+    df = pd.DataFrame({"A": [0.01, 0.02], "B": [0.03, 0.04]})
+    fees = {"A": 0.001, "B": 0.002}
+
+    df_net = _subtract_management_fees(df, fees)
+    assert isinstance(df_net, pd.DataFrame)
+    np.testing.assert_allclose(df_net["A"].to_numpy(), [0.009, 0.019], atol=1e-15)
+    np.testing.assert_allclose(df_net["B"].to_numpy(), [0.028, 0.038], atol=1e-15)
+    # Original DataFrame must remain unmutated
+    assert df["A"].iloc[0] == 0.01
+
+    arr_net = _subtract_management_fees(df.to_numpy(), fees, feature_names=["A", "B"])
+    assert isinstance(arr_net, np.ndarray)
+    np.testing.assert_allclose(arr_net, df_net.to_numpy(), atol=1e-15)
+
+    arr_pos = _subtract_management_fees(df.to_numpy(), np.array([0.001, 0.002]))
+    np.testing.assert_allclose(arr_pos, df_net.to_numpy(), atol=1e-15)
+
+    scalar_net = _subtract_management_fees(df.to_numpy(), 0.001)
+    np.testing.assert_allclose(scalar_net, df.to_numpy() - 0.001, atol=1e-15)
+
+    with pytest.raises(ValueError, match="management_fees"):
+        _subtract_management_fees(df.to_numpy(), fees)
+
+    with pytest.raises(ValueError, match="management_fees"):
+        _subtract_management_fees(np.zeros((5, 3)), np.array([0.001, 0.002]))
+
+
+def test_build_nco_kmeans_deterministic_default_and_adaptive_metadata() -> None:
+    """F-07: build_nco(clusterer='kmeans') uses deterministic seed and exposes effective_n_clusters_."""
+    rng = np.random.default_rng(123)
+    X_df = pd.DataFrame(
+        rng.normal(0.0005, 0.01, (120, 6)), columns=[f"A{i}" for i in range(6)]
+    )
+    builder = StrategyBuilder()
+    nco1 = builder.build_nco(MeanRisk(), MeanRisk(), clusterer="kmeans")
+    nco2 = builder.build_nco(MeanRisk(), MeanRisk(), clusterer="kmeans")
+
+    assert nco1.clustering_estimator.random_state is not None
+    assert (
+        nco1.clustering_estimator.random_state == nco2.clustering_estimator.random_state
+    )
+
+    nco1.fit(X_df)
+    nco2.fit(X_df)
+    np.testing.assert_allclose(nco1.weights_, nco2.weights_, rtol=0, atol=1e-12)
+    assert nco1.clustering_estimator_.effective_n_clusters_ == len(
+        set(nco1.clustering_estimator_.labels_)
+    )
+    assert nco1.clustering_estimator_.effective_n_clusters_ == 3
+    assert nco1.clustering_estimator_.n_clusters == 8  # hyperparameter unmutated
+
+    for bad_seed in (-1, True, "42"):
+        with pytest.raises(ValueError, match="random_state"):
+            builder.build_nco(
+                MeanRisk(),
+                MeanRisk(),
+                clusterer="kmeans",
+                random_state=bad_seed,  # type: ignore[arg-type]
+            )
+
+
+def test_strategy_builder_has_no_dead_fallback_attribute() -> None:
+    """F-11: Unused self._fallback dead code is removed from StrategyBuilder."""
+    builder = StrategyBuilder()
+    assert not hasattr(builder, "_fallback")
+    builder.reset()
+    assert not hasattr(builder, "_fallback")
+
+
+def test_custom_estimators_sklearn_clone_roundtrip() -> None:
+    """Verify custom wrappers preserve sklearn.base.clone() hyperparameter compliance."""
+    from skfolio.pre_selection import DropCorrelated
+
+    from flowportfolio.strategies import (
+        _AdaptiveKMeans,
+        _FeeAwareNCO,
+        _SafePreSelectionTransformer,
+    )
+
+    tr = _SafePreSelectionTransformer(
+        DropCorrelated(),
+        groups={"A": ["core"]},
+        linear_constraints=["core >= 0.5"],
+        min_weights=0.0,
+        max_weights=0.4,
+    )
+    tr_clone = clone(tr)
+    assert tr_clone.max_weights == 0.4
+    assert tr_clone.groups == {"A": ["core"]}
+
+    ak = _AdaptiveKMeans(n_clusters=6, random_state=42)
+    ak_clone = clone(ak)
+    assert ak_clone.n_clusters == 6
+    assert ak_clone.random_state == 42
+
+    nco = _FeeAwareNCO(
+        inner_estimator=MeanRisk(),
+        outer_estimator=MeanRisk(),
+        portfolio_params={"management_fees": {"A": 0.001}},
+    )
+    nco_clone = clone(nco)
+    assert nco_clone.portfolio_params == {"management_fees": {"A": 0.001}}
+
+
+# ---------------------------------------------------------------------------
+# Cycle 17 (Sprint 5): #2, #3, #6a, #6b, N2, N3
+# ---------------------------------------------------------------------------
+
+
+def test_restore_feasible_subset_restores_positive_lower_bounds() -> None:
+    """Sprint 5 (#2): Assets with positive effective lower bounds (min_weights / max_turnover) are always restored."""
+    from flowportfolio.strategies import _restore_feasible_subset
+
+    restored_mt, reasons_mt = _restore_feasible_subset(
+        surviving=["B", "C", "D", "E"],
+        all_cols=["A", "B", "C", "D", "E"],
+        previous_weights={"A": 0.20, "B": 0.20, "C": 0.20, "D": 0.20, "E": 0.20},
+        max_turnover=0.10,
+        max_weights=1.0,
+    )
+    assert "A" in restored_mt
+    assert len(reasons_mt) >= 1
+
+    restored_mw, reasons_mw = _restore_feasible_subset(
+        surviving=["B", "C"],
+        all_cols=["A", "B", "C"],
+        min_weights={"A": 0.15, "B": 0.0, "C": 0.0},
+        max_weights=1.0,
+    )
+    assert "A" in restored_mw
+    assert len(reasons_mw) >= 1
+
+
+def test_build_pipeline_rejects_pre_selection_with_view_priors() -> None:
+    """Sprint 5 (#3): build_pipeline fails fast when pre-selection is paired with BlackLitterman or EntropyPooling."""
+    from skfolio.pre_selection import DropCorrelated
+    from skfolio.prior import BlackLitterman, EntropyPooling
+
+    bl = BlackLitterman(views=["A == 0.001"], view_confidences=[0.8])
+    with pytest.raises(ValueError, match="view priors"):
+        (
+            StrategyBuilder(prior=bl)
+            .add_pre_selection(DropCorrelated())
+            .set_optimizer(MeanRisk())
+            .build_pipeline()
+        )
+
+    ep = EntropyPooling(mean_views=["A >= 0.001"])
+    with pytest.raises(ValueError, match="view priors"):
+        (
+            StrategyBuilder(prior=ep)
+            .add_pre_selection(DropCorrelated())
+            .set_optimizer(MeanRisk())
+            .build_pipeline()
+        )
+
+
+def test_build_nco_rejects_transaction_costs() -> None:
+    """Sprint 5 (#6a): build_nco must reject non-zero transaction_costs rather than silently dropping them."""
+    for bad_tc in (0.005, {"A": 0.005, "B": 0.0}):
+        spec = ConstraintSpec(transaction_costs=bad_tc)
+        with pytest.raises(ValueError, match="transaction costs"):
+            StrategyBuilder(constraints=spec).build_nco(MeanRisk(), MeanRisk())
+
+    ok_spec = ConstraintSpec(transaction_costs=0.0)
+    nco = StrategyBuilder(constraints=ok_spec).build_nco(MeanRisk(), MeanRisk())
+    assert isinstance(nco, NestedClustersOptimization)
+
+
+def test_strategy_builder_propagates_black_litterman_risk_free_rate() -> None:
+    """Sprint 5 (#6b): BL risk_free_rate must propagate to optimizer and predicted Portfolio."""
+    from flowportfolio.core.universe import Universe
+    from flowportfolio.priors import PriorSynthesiser
+
+    rng = np.random.default_rng(17)
+    idx = pd.bdate_range("2024-01-02", periods=60)
+    rets = pd.DataFrame(
+        rng.normal(0.0005, 0.01, (60, 3)),
+        index=idx,
+        columns=["A", "B", "C"],
+    )
+    u = Universe(
+        ["A", "B", "C"],
+        {"A": "core", "B": "core", "C": "sat"},
+        {"A": 0.0, "B": 0.0, "C": 0.0},
+    )
+    u._returns = rets
+    synth = PriorSynthesiser(u).add_market_view("A == 0.0504", confidence=0.8)
+
+    expected_rfr = 0.0504 / 252.0
+    for prior_est in (None, EmpiricalPrior()):
+        bl = synth.build_black_litterman_prior(
+            risk_free_rate=0.0504, prior_estimator=prior_est
+        )
+        pipe = StrategyBuilder(prior=bl).set_optimizer(MeanRisk()).build_pipeline()
+        pipe.fit(rets)
+        ptf = pipe.predict(rets)
+        assert pipe.steps[-1][1].risk_free_rate == pytest.approx(
+            expected_rfr, abs=1e-12
+        )
+        assert float(ptf.risk_free_rate) == pytest.approx(expected_rfr, abs=1e-12)
+
+        hrp_pipe = (
+            StrategyBuilder(prior=bl)
+            .set_optimizer(HierarchicalRiskParity())
+            .build_pipeline()
+        )
+        hrp_ptf = hrp_pipe.fit(rets).predict(rets)
+        assert float(hrp_ptf.risk_free_rate) == pytest.approx(expected_rfr, abs=1e-12)
+
+    # Explicit non-zero user optimizer risk_free_rate is preserved
+    bl_ex = synth.build_black_litterman_prior(risk_free_rate=0.0504)
+    explicit_rfr = 0.02 / 252.0
+    custom_pipe = (
+        StrategyBuilder(prior=bl_ex)
+        .set_optimizer(MeanRisk(risk_free_rate=explicit_rfr))
+        .build_pipeline()
+    )
+    assert custom_pipe.steps[-1][1].risk_free_rate == pytest.approx(
+        explicit_rfr, abs=1e-12
+    )
+
+
+def test_strategy_builder_injects_fees_via_portfolio_params_and_warns_tc(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Sprint 5 (N2): EqualWeighted/InverseVolatility receive fees via portfolio_params and warn on tc."""
+    import logging
+
+    from skfolio.optimization import EqualWeighted, InverseVolatility
+
+    rng = np.random.default_rng(23)
+    idx = pd.bdate_range("2024-01-02", periods=40)
+    rets = pd.DataFrame(
+        rng.normal(0.0005, 0.01, (40, 3)),
+        index=idx,
+        columns=["A", "B", "C"],
+    )
+    fees = {"A": 0.005 / 252.0, "B": 0.005 / 252.0, "C": 0.005 / 252.0}
+    spec = ConstraintSpec(management_fees=fees, transaction_costs=0.005)
+
+    for cls in (EqualWeighted, InverseVolatility):
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="flowportfolio.strategies"):
+            pipe = (
+                StrategyBuilder(constraints=spec).set_optimizer(cls()).build_pipeline()
+            )
+        ptf = pipe.fit(rets).predict(rets)
+        assert float(ptf.total_fee) > 0.0
+        assert any("transaction_costs" in rec.message for rec in caplog.records)
+
+
+def test_safe_pre_selection_forwards_wrapped_transformer_params_to_grid_search() -> (
+    None
+):
+    """Sprint 5 (N3): pre_0__<param> works identically with ConstraintSpec wrapping."""
+    from skfolio.pre_selection import DropCorrelated
+    from sklearn.model_selection import GridSearchCV
+
+    rng = np.random.default_rng(29)
+    idx = pd.bdate_range("2024-01-02", periods=60)
+    rets = pd.DataFrame(
+        rng.normal(0.0005, 0.01, (60, 3)),
+        index=idx,
+        columns=["A", "B", "C"],
+    )
+    spec = ConstraintSpec(management_fees={"A": 0.001, "B": 0.001, "C": 0.001})
+    pipe = (
+        StrategyBuilder(constraints=spec)
+        .add_pre_selection(DropCorrelated(threshold=0.95))
+        .set_optimizer(MeanRisk())
+        .build_pipeline()
+    )
+    assert pipe.get_params()["pre_0__threshold"] == pytest.approx(0.95)
+    pipe.set_params(pre_0__threshold=0.70)
+    assert pipe.steps[0][1].transformer.threshold == pytest.approx(0.70)
+
+    gs = GridSearchCV(pipe, param_grid={"pre_0__threshold": [0.7, 0.9]}, cv=2)
+    gs.fit(rets)
+    assert gs.best_params_["pre_0__threshold"] in (0.7, 0.9)
+
+
+def test_strategy_builder_rejects_view_priors_attached_directly_on_optimizer() -> None:
+    """Sprint 5 (S2): View-prior guards catch BlackLitterman/EntropyPooling set directly on optimizer, fallback, or NCO estimators."""
+    from skfolio.pre_selection import DropCorrelated
+    from skfolio.prior import BlackLitterman, EntropyPooling
+
+    bl = BlackLitterman(views=["A == 0.001"], view_confidences=[0.8])
+    ep = EntropyPooling(mean_views=["A >= 0.001"])
+
+    for prior in (bl, ep):
+        with pytest.raises(ValueError, match="view priors"):
+            (
+                StrategyBuilder()
+                .add_pre_selection(DropCorrelated())
+                .set_optimizer(MeanRisk(prior_estimator=prior))
+                .build_pipeline()
+            )
+        with pytest.raises(ValueError, match="view priors"):
+            (
+                StrategyBuilder()
+                .add_pre_selection(DropCorrelated())
+                .set_optimizer(MeanRisk(), fallback=MeanRisk(prior_estimator=prior))
+                .build_pipeline()
+            )
+        with pytest.raises(ValueError, match="view priors"):
+            StrategyBuilder().build_nco(MeanRisk(prior_estimator=prior), MeanRisk())
+        with pytest.raises(ValueError, match="view priors"):
+            StrategyBuilder().build_nco(MeanRisk(), MeanRisk(prior_estimator=prior))

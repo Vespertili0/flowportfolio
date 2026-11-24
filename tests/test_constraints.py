@@ -4,9 +4,14 @@ This module verifies the generation of skfolio-compatible linear constraints
 using the fluent builder pattern in :class:`flowportfolio.core.constraints.ConstraintBuilder`.
 """
 
-import pytest
+from unittest.mock import MagicMock
 
-from flowportfolio.core.constraints import ConstraintBuilder
+import numpy as np
+import pandas as pd
+import pytest
+from skfolio.optimization import MeanRisk, ObjectiveFunction
+
+from flowportfolio.core.constraints import ConstraintBuilder, ConstraintSpec
 from flowportfolio.core.protocols import UniverseProtocol
 from flowportfolio.core.universe import Universe
 
@@ -118,31 +123,23 @@ def test_unknown_group_raises(stub_universe: Universe) -> None:
 
 
 def test_max_turnover_output(stub_universe: Universe) -> None:
-    """Test max_turnover correctly computes upper and lower bounds."""
+    """Test max_turnover correctly stores parameters."""
     builder = ConstraintBuilder(stub_universe)
     current_weights = {"A": 0.4, "B": 0.4, "C": 0.2}
     result = builder.max_turnover(limit=0.1, current_weights=current_weights).build()
 
-    # 3 tickers * 2 bounds each = 6 constraints
-    assert len(result) == 6
-    assert "A >= 0.3" in result
-    assert "A <= 0.5" in result
-    assert "B >= 0.3" in result
-    assert "B <= 0.5" in result
-    assert "C >= 0.1" in result
-    assert "C <= 0.3" in result
+    assert result.max_turnover == 0.1
+    assert result.previous_weights == {"A": 0.4, "B": 0.4, "C": 0.2}
 
 
 def test_max_turnover_clamping(stub_universe: Universe) -> None:
-    """Test max_turnover clamps bounds to [0.0, 1.0]."""
+    """Test max_turnover stores parameters correctly without clamping."""
     builder = ConstraintBuilder(stub_universe)
-    # C weight is 0.05, limit is 0.1 -> lower bound clamped to 0.0
-    # A weight is 0.95, limit is 0.1 -> upper bound clamped to 1.0
     current_weights = {"A": 0.95, "B": 0.0, "C": 0.05}
     result = builder.max_turnover(limit=0.1, current_weights=current_weights).build()
 
-    assert "A <= 1" in result
-    assert "C >= 0" in result
+    assert result.max_turnover == 0.1
+    assert result.previous_weights == {"A": 0.95, "B": 0.0, "C": 0.05}
 
 
 def test_max_turnover_invalid_limit(stub_universe: Universe) -> None:
@@ -182,6 +179,21 @@ def test_build_does_not_mutate(stub_universe: Universe) -> None:
     assert result1 == ["core >= 0.5"]
     assert result1 is not result2
     assert result1 == result2
+
+
+def test_build_returns_constraint_spec(stub_universe: Universe) -> None:
+    """Test build() returns a ConstraintSpec with both constraints and groups."""
+    builder = ConstraintBuilder(stub_universe)
+    builder.min_group("core", 0.5)
+    spec = builder.build()
+
+    assert isinstance(spec, ConstraintSpec)
+    assert spec.linear_constraints == ["core >= 0.5"]
+    assert spec.groups == {
+        "A": ["core"],
+        "B": ["core"],
+        "C": ["satellite"],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +257,10 @@ def test_init_raises_if_metadata_not_dict() -> None:
             self.tickers = ["A"]
             self.metadata = "not-a-dict"
 
-    with pytest.raises(TypeError, match="universe.metadata must be a dictionary"):
+    with pytest.raises(
+        TypeError,
+        match="universe.(metadata must be a dictionary|tickers must be a list)",
+    ):
         ConstraintBuilder(_BadMetadata())  # type: ignore[arg-type]
 
 
@@ -257,5 +272,386 @@ def test_init_raises_if_tickers_not_list() -> None:
             self.tickers = "not-a-list"
             self.metadata = {"A": "growth"}
 
-    with pytest.raises(TypeError, match="universe.tickers must be a list"):
+    with pytest.raises(
+        TypeError,
+        match="universe.(metadata must be a dictionary|tickers must be a list)",
+    ):
         ConstraintBuilder(_BadTickers())  # type: ignore[arg-type]
+
+
+def test_constraint_spec_equality_all_fields() -> None:
+    """Test ConstraintSpec equality checks all fields when comparing with another spec."""
+    s1 = ConstraintSpec(linear_constraints=["A >= 0.5"], max_turnover=0.1)
+    s2 = ConstraintSpec(linear_constraints=["A >= 0.5"], max_turnover=0.2)
+    s3 = ConstraintSpec(linear_constraints=["A >= 0.5"], max_turnover=0.1)
+    assert s1 != s2
+    assert s1 == s3
+    assert s1 == ["A >= 0.5"]
+
+
+def test_constraint_spec_equals_list_and_validates_turnover_weights() -> None:
+    """Verify ConstraintSpec list equality and negative/invalid weight rejection in turnover."""
+    from flowportfolio.core.universe import Universe
+
+    spec = ConstraintSpec(linear_constraints=["core >= 0.4"])
+    assert spec == ["core >= 0.4"]
+
+    u = MagicMock(spec=Universe)
+    u.tickers = ["SPY", "TLT"]
+    u.metadata = {"SPY": "core", "TLT": "satellite"}
+    u.fees = {"SPY": 0.0003, "TLT": 0.0015}
+    builder = ConstraintBuilder(u)
+
+    with pytest.raises(ValueError, match="Weight must be between 0.0 and 1.0"):
+        builder.max_turnover(0.2, {"SPY": -0.5, "TLT": 1.5})
+
+
+def test_max_turnover_validates_sum_to_one(stub_universe: Universe) -> None:
+    """Verify max_turnover rejects weights not summing to 1.0 and normalizes valid weights."""
+    builder = ConstraintBuilder(stub_universe)
+    # stub_universe has tickers ['A', 'B', 'C']
+    bad_weights = {"A": 0.1, "B": 0.1, "C": 0.1}
+    with pytest.raises(
+        ValueError, match=r"current_weights must sum to 1\.0 \(within 1e-6 tolerance\)"
+    ):
+        builder.max_turnover(0.05, bad_weights)
+
+    good_weights = {"A": 0.501, "B": 0.299, "C": 0.200}
+    builder.max_turnover(0.05, good_weights)
+    spec = builder.build()
+    assert spec.max_turnover == 0.05
+    assert spec.previous_weights is not None
+    assert abs(sum(spec.previous_weights.values()) - 1.0) < 1e-12
+
+
+def test_transaction_costs_configuration_and_reset(stub_universe: Universe) -> None:
+    """Verify ConstraintBuilder.transaction_costs accepts float/dict and resets."""
+    builder = ConstraintBuilder(stub_universe)
+
+    # Float cost
+    builder.transaction_costs(0.001)
+    spec = builder.build()
+    assert spec.transaction_costs == 0.001
+
+    # Dict cost
+    builder.transaction_costs({"A": 0.001, "B": 0.002, "C": 0.0015})
+    spec = builder.build()
+    assert spec.transaction_costs == {"A": 0.001, "B": 0.002, "C": 0.0015}
+
+    # Reset
+    builder.reset()
+    assert builder.build().transaction_costs is None
+
+    # Invalid costs
+    with pytest.raises(
+        ValueError, match="Transaction costs must be a non-negative finite number"
+    ):
+        builder.transaction_costs(-0.01)
+    with pytest.raises(
+        ValueError,
+        match="Transaction cost for ticker 'A' must be non-negative and finite",
+    ):
+        builder.transaction_costs({"A": -0.01, "B": 0.01, "C": 0.01})
+    with pytest.raises(
+        TypeError, match="Transaction costs must be a float or a dictionary"
+    ):
+        builder.transaction_costs("invalid")  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Cycle 5 (F-06): Strict Simplex, Period Fee Scaling, Holding Period & Oracles
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad_weights",
+    [
+        {"A": 0.99, "B": 0.0, "C": 0.0},
+        {"A": 0.505, "B": 0.30, "C": 0.20},
+        {"A": 0.5 - 2e-6, "B": 0.3, "C": 0.2},
+        {"A": 0.5 + 2e-6, "B": 0.3, "C": 0.2},
+    ],
+)
+def test_max_turnover_rejects_simplex_drift_beyond_1e6(
+    stub_universe: Universe, bad_weights: dict[str, float]
+) -> None:
+    """F-06: Reject weight vectors drifting from 1.0 by more than 1e-6 (including 0.99)."""
+    builder = ConstraintBuilder(stub_universe)
+    with pytest.raises(ValueError, match=r"1e-6"):
+        builder.max_turnover(0.05, bad_weights)
+
+
+def test_max_turnover_accepts_sub_1e6_rounding_dust_and_normalizes(
+    stub_universe: Universe,
+) -> None:
+    """F-06: Tiny floating-point dust within 1e-6 is accepted and normalized to 1.0."""
+    builder = ConstraintBuilder(stub_universe)
+    dust_weights = {"A": 0.5 + 5e-7, "B": 0.3, "C": 0.2}
+    spec = builder.max_turnover(0.05, dust_weights).build()
+    assert spec.previous_weights is not None
+    assert abs(sum(spec.previous_weights.values()) - 1.0) < 1e-12
+
+
+def test_max_turnover_rejects_unknown_tickers_and_non_dict(
+    stub_universe: Universe,
+) -> None:
+    """F-06: Reject unknown extra tickers and non-dict current_weights."""
+    builder = ConstraintBuilder(stub_universe)
+    with pytest.raises(ValueError, match="unknown"):
+        builder.max_turnover(0.05, {"A": 0.5, "B": 0.3, "C": 0.2, "GHOST": 0.0})
+
+    with pytest.raises(TypeError, match="current_weights must be a dict"):
+        builder.max_turnover(0.05, [("A", 0.5), ("B", 0.3), ("C", 0.2)])  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("expected_ppy", [252, 52, 12, 4, 1])
+def test_build_scales_management_fees_by_live_periods_per_year(
+    expected_ppy: int,
+) -> None:
+    """F-06: build() divides annual management fees by live UniverseProtocol.periods_per_year."""
+    fees = {"A": 0.0052, "B": 0.0104, "C": 0.0}
+
+    class _ProtocolStub:
+        def __init__(self, ppy: int) -> None:
+            self.tickers = ["A", "B", "C"]
+            self.metadata = {"A": "core", "B": "core", "C": "satellite"}
+            self.fees = fees
+            self.periods_per_year = ppy
+
+    stub = _ProtocolStub(252)
+    builder = ConstraintBuilder(stub)  # type: ignore[arg-type]
+    stub.periods_per_year = expected_ppy
+
+    spec = builder.build()
+    assert spec.management_fees is not None
+    for ticker, annual_fee in fees.items():
+        assert spec.management_fees[ticker] == pytest.approx(
+            annual_fee / float(expected_ppy), rel=0, abs=1e-15
+        )
+
+
+def test_ghost_group_in_protocol_metadata_rejected_and_excluded_from_spec() -> None:
+    """P1-3: Groups belonging only to non-universe metadata keys must be rejected and omitted from ConstraintSpec.groups."""
+
+    class _GhostMetadataStub:
+        def __init__(self) -> None:
+            self.tickers = ["A", "B", "C"]
+            self.metadata = {"A": "core", "B": "core", "C": "satellite", "Z": "ghost"}
+            self.fees = {"A": 0.001, "B": 0.001, "C": 0.001}
+            self.periods_per_year = 252
+
+    builder = ConstraintBuilder(_GhostMetadataStub())  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="Group 'ghost' not found"):
+        builder.min_group("ghost", 0.2)
+    with pytest.raises(ValueError, match="Group 'ghost' not found"):
+        builder.max_group("ghost", 0.5)
+    with pytest.raises(ValueError, match="Group 'ghost' not found"):
+        builder.max_combined_groups(["core", "ghost"], 0.8)
+
+    spec = builder.min_group("core", 0.3).build()
+    assert set(spec.groups.keys()) == {"A", "B", "C"}
+    assert "Z" not in spec.groups
+
+
+def test_build_management_fees_magicmock_periods_per_year_fallback() -> None:
+    """F-06: MagicMock(spec=Universe) with unset periods_per_year falls back to 252.0, not 1.0."""
+    u = MagicMock(spec=Universe)
+    u.tickers = ["A", "B"]
+    u.metadata = {"A": "core", "B": "satellite"}
+    u.fees = {"A": 0.00252, "B": 0.00504}
+
+    spec = ConstraintBuilder(u).build()
+    assert spec.management_fees is not None
+    assert spec.management_fees["A"] == pytest.approx(0.00252 / 252.0, rel=0, abs=1e-15)
+    assert spec.management_fees["B"] == pytest.approx(0.00504 / 252.0, rel=0, abs=1e-15)
+
+
+@pytest.mark.parametrize("bad_fee", [-0.01, float("nan"), float("inf")])
+def test_build_validates_fees_from_protocol_stub(bad_fee: float) -> None:
+    """F-06: Duck-typed UniverseProtocol stubs with invalid fees raise ValueError."""
+
+    class _BadFeeStub:
+        @property
+        def tickers(self) -> list[str]:
+            return ["A", "B"]
+
+        @property
+        def metadata(self) -> dict[str, str]:
+            return {"A": "core", "B": "satellite"}
+
+        @property
+        def fees(self) -> dict[str, float]:
+            return {"A": bad_fee, "B": 0.001}
+
+    builder = ConstraintBuilder(_BadFeeStub())  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="Fee must be between 0.0 and 1.0"):
+        builder.build()
+
+
+def test_transaction_costs_holding_period_amortization_and_reset(
+    stub_universe: Universe,
+) -> None:
+    """F-06: Builder-level and per-call holding_period amortize transaction costs cleanly."""
+    builder = ConstraintBuilder(stub_universe, holding_period=21)
+
+    # Scalar cost amortized by builder default holding_period=21
+    spec_scalar = builder.transaction_costs(0.0021).build()
+    assert spec_scalar.transaction_costs == pytest.approx(0.0001, rel=0, abs=1e-15)
+
+    # Per-call holding_period override with partial valid-ticker dict
+    spec_override = builder.transaction_costs(
+        {"A": 0.0021, "B": 0.0042}, holding_period=7
+    ).build()
+    assert spec_override.transaction_costs == {
+        "A": pytest.approx(0.0003, rel=0, abs=1e-15),
+        "B": pytest.approx(0.0006, rel=0, abs=1e-15),
+    }
+
+    # reset() clears transaction_costs while preserving builder default holding_period=21
+    builder.reset()
+    assert builder.build().transaction_costs is None
+    spec_after_reset = builder.transaction_costs(0.0042).build()
+    assert spec_after_reset.transaction_costs == pytest.approx(0.0002, rel=0, abs=1e-15)
+
+
+@pytest.mark.parametrize("bad_hp", [0, 0.0, -5, float("nan"), float("inf")])
+def test_holding_period_rejects_non_positive_or_non_finite(
+    stub_universe: Universe, bad_hp: float
+) -> None:
+    """F-06: holding_period must be strictly positive and finite."""
+    with pytest.raises(ValueError, match="holding_period"):
+        ConstraintBuilder(stub_universe, holding_period=bad_hp)
+
+    builder = ConstraintBuilder(stub_universe)
+    with pytest.raises(ValueError, match="holding_period"):
+        builder.transaction_costs(0.001, holding_period=bad_hp)
+
+
+@pytest.mark.parametrize("bad_hp", [True, False, "21"])
+def test_holding_period_rejects_bool_and_non_numeric(
+    stub_universe: Universe, bad_hp: object
+) -> None:
+    """F-06: holding_period rejects booleans and non-numeric types with TypeError."""
+    with pytest.raises(TypeError, match="holding_period must be numeric"):
+        ConstraintBuilder(stub_universe, holding_period=bad_hp)  # type: ignore[arg-type]
+
+    builder = ConstraintBuilder(stub_universe)
+    with pytest.raises(TypeError, match="holding_period must be numeric"):
+        builder.transaction_costs(0.001, holding_period=bad_hp)  # type: ignore[arg-type]
+
+
+def test_transaction_costs_rejects_unknown_tickers_nan_inf_and_bool(
+    stub_universe: Universe,
+) -> None:
+    """F-06: transaction_costs validates unknown tickers, bools, and non-finite numbers."""
+    builder = ConstraintBuilder(stub_universe)
+
+    with pytest.raises(ValueError, match="unknown"):
+        builder.transaction_costs({"A": 0.001, "TYPO": 0.002})
+
+    for bad_val in (float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="non-negative"):
+            builder.transaction_costs(bad_val)
+        with pytest.raises(ValueError, match="non-negative"):
+            builder.transaction_costs({"A": bad_val})
+
+    with pytest.raises(TypeError, match="Transaction costs"):
+        builder.transaction_costs(True)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="Transaction cost for ticker 'A'"):
+        builder.transaction_costs({"A": True})  # type: ignore[arg-type]
+
+
+def test_max_combined_groups_rejects_empty_and_duplicate_groups(
+    stub_universe: Universe,
+) -> None:
+    """Edge case: max_combined_groups rejects empty lists and duplicate group names."""
+    builder = ConstraintBuilder(stub_universe)
+
+    with pytest.raises(ValueError, match="at least one group"):
+        builder.max_combined_groups([], 0.5)
+
+    with pytest.raises(ValueError, match="Duplicate"):
+        builder.max_combined_groups(["core", "core"], 0.5)
+
+
+def test_skfolio_mean_risk_per_asset_max_turnover_oracle() -> None:
+    """F-06 (O3_CLONE_TURNOVER): Lock down skfolio's per-asset |w_i - w_prev_i| <= limit contract."""
+    tickers = ["A", "B", "C", "D"]
+    u = Universe(
+        tickers=tickers,
+        metadata={t: "core" for t in tickers},
+        fees={t: 0.0 for t in tickers},
+    )
+    prev = {t: 0.25 for t in tickers}
+    spec = ConstraintBuilder(u).max_turnover(0.05, prev).build()
+
+    rng = np.random.default_rng(42)
+    returns = pd.DataFrame(rng.normal(0.0005, 0.01, (200, 4)), columns=tickers)
+    returns["A"] += 0.004
+    returns["C"] += 0.004
+
+    model = MeanRisk(
+        objective_function=ObjectiveFunction.MAXIMIZE_RETURN,
+        max_turnover=spec.max_turnover,
+        previous_weights=spec.previous_weights,
+    )
+    model.fit(returns)
+
+    w = pd.Series(model.weights_, index=tickers)
+    diffs = (w - pd.Series(prev)).abs()
+    assert float(diffs.max()) <= 0.05 + 1e-6
+    # On 4 assets with two winners and two losers, portfolio L1 half-turnover reaches ~0.10 > 0.05
+    l1_half_turnover = float(0.5 * diffs.sum())
+    assert l1_half_turnover > 0.05 + 1e-3
+
+
+def test_skfolio_mean_risk_amortized_transaction_costs_oracle() -> None:
+    """F-06: Verify holding_period amortization prevents daily return scale over-penalization."""
+    tickers = ["WIN", "LOSE"]
+    u = Universe(
+        tickers=tickers,
+        metadata={"WIN": "core", "LOSE": "core"},
+        fees={"WIN": 0.0, "LOSE": 0.0},
+    )
+    prev = {"WIN": 0.5, "LOSE": 0.5}
+
+    # Daily returns where WIN beats LOSE by 3 bps/day (0.0003), while one-off cost is 10 bps (0.001)
+    n_days = 252
+    rng = np.random.default_rng(7)
+    noise = rng.normal(0.0, 0.005, (n_days, 2))
+    noise -= noise.mean(axis=0)
+    returns = pd.DataFrame(
+        {
+            "WIN": 0.0005 + noise[:, 0],
+            "LOSE": 0.0002 + noise[:, 1],
+        }
+    )
+
+    # Unamortized (holding_period=1): 10 bps > 3 bps daily edge -> optimizer freezes at previous_weights
+    spec_unamortized = (
+        ConstraintBuilder(u, holding_period=1)
+        .max_turnover(1.0, prev)
+        .transaction_costs(0.001)
+        .build()
+    )
+    m_frozen = MeanRisk(
+        objective_function=ObjectiveFunction.MAXIMIZE_RETURN,
+        previous_weights=spec_unamortized.previous_weights,
+        transaction_costs=spec_unamortized.transaction_costs,
+    ).fit(returns)
+    assert abs(float(m_frozen.weights_[0]) - 0.5) < 1e-4
+
+    # Annual horizon (holding_period=252): 10 bps / 252 ~= 0.04 bps < 3 bps -> optimizer tilts into WIN
+    spec_amortized = (
+        ConstraintBuilder(u, holding_period=252)
+        .max_turnover(1.0, prev)
+        .transaction_costs(0.001)
+        .build()
+    )
+    m_rebalanced = MeanRisk(
+        objective_function=ObjectiveFunction.MAXIMIZE_RETURN,
+        previous_weights=spec_amortized.previous_weights,
+        transaction_costs=spec_amortized.transaction_costs,
+    ).fit(returns)
+    assert float(m_rebalanced.weights_[0]) > 0.99
