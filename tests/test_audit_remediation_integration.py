@@ -2,26 +2,24 @@
 
 These tests deliberately use real skfolio estimators, real ``Portfolio`` and
 ``MultiPeriodPortfolio`` objects, and synthetic daily price data. The only
-test doubles are a stub data provider (no network access) and a ``Portfolio``
-spy used to observe the evaluation window in ``PortfolioDeltaEngine``.
+test double is a stub data provider (no network access).
 """
 
 from __future__ import annotations
 
 import logging
-from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
 import pytest
 from skfolio import Population, RiskMeasure
 from skfolio.optimization import HierarchicalRiskParity, MeanRisk
-from skfolio.portfolio import MultiPeriodPortfolio, Portfolio
+from skfolio.portfolio import MultiPeriodPortfolio
 from skfolio.pre_selection import DropCorrelated
 from sklearn import config_context
 
 from flowportfolio.core.constraints import ConstraintBuilder
-from flowportfolio.core.experiment import PortfolioExperimentEngine
+from flowportfolio.core.experiment import ExperimentResult, PortfolioExperimentEngine
 from flowportfolio.core.reporting import Reporter
 from flowportfolio.core.universe import Universe
 from flowportfolio.delta import PortfolioDeltaEngine
@@ -77,7 +75,8 @@ def test_daily_fee_scaling_and_preselection() -> None:
     universe = _fetched_universe()
     current_weights = dict.fromkeys(TICKERS, 0.25)
 
-    spec = ConstraintBuilder(universe).max_turnover(0.20, current_weights).build()
+    # Use max_turnover=0.30 (> 0.25) so dropping an asset cleanly respects lb = 0.25 - 0.30 <= 0.
+    spec = ConstraintBuilder(universe).max_turnover(0.30, current_weights).build()
 
     assert spec.management_fees is not None
     assert spec.management_fees["SPY"] == pytest.approx(0.0050 / 252.0)
@@ -165,41 +164,75 @@ def test_holiday_ffill_and_truncation_warning(caplog: pytest.LogCaptureFixture) 
 
 
 def test_real_skfolio_reporting_and_delta() -> None:
-    """Tearsheet shows real tickers and the delta engine uses the out-of-sample window."""
+    """Tearsheet unrolls real folds with real tickers and delta preserves fee-symmetric OOS metrics."""
     universe = _fetched_universe(n_days=500)
+    spec = ConstraintBuilder(universe).build()
 
-    mean_risk = StrategyBuilder().set_optimizer(MeanRisk()).build_pipeline()
-    hrp = StrategyBuilder().set_optimizer(HierarchicalRiskParity()).build_pipeline()
+    mean_risk_net = (
+        StrategyBuilder(constraints=spec).set_optimizer(MeanRisk()).build_pipeline()
+    )
+    hrp_gross = (
+        StrategyBuilder().set_optimizer(HierarchicalRiskParity()).build_pipeline()
+    )
 
     engine = PortfolioExperimentEngine(universe, n_jobs=1)
-    engine.add_strategy("MeanRisk", mean_risk, {"optimizer__l1_coef": [0.0, 0.0005]})
     engine.add_strategy(
-        "HRP",
-        hrp,
+        "MeanRiskNet", mean_risk_net, {"optimizer__l1_coef": [0.0, 0.0005]}
+    )
+    engine.add_strategy(
+        "HRPGross",
+        hrp_gross,
         {"optimizer__risk_measure": [RiskMeasure.VARIANCE, RiskMeasure.CVAR]},
     )
 
-    population = engine.run_robustness_test(
-        cv_type="walk_forward", train_size=100, test_size=25
+    result = engine.run_robustness_test(
+        cv_type="walk_forward", train_size=100, test_size=25, return_result=True
     )
-
+    assert isinstance(result, ExperimentResult)
+    population = result.population
     assert isinstance(population, Population)
     assert all(isinstance(p, MultiPeriodPortfolio) for p in population)
 
-    markdown = Reporter(population).to_markdown_artifact()
+    selected_net = next(p for p in population if p.tag == "MeanRiskNet")
+    selected_gross = next(p for p in population if p.tag == "HRPGross")
+    assert len(selected_net.portfolios) > 1
+    assert len(selected_net.returns_df) < len(universe.returns)
+
+    reporter = Reporter(result)
+    markdown = reporter.to_markdown_artifact()
     holdings_line = next(
         line for line in markdown.splitlines() if "Top 5 Holdings" in line
     )
     assert "Asset_0" not in holdings_line
     assert any(ticker in holdings_line for ticker in TICKERS)
 
-    weights = dict.fromkeys(TICKERS, 0.25)
-    delta_engine = PortfolioDeltaEngine(
-        universe, current_weights=weights, target_weights=weights
-    )
-    with patch("flowportfolio.delta.Portfolio", wraps=Portfolio) as portfolio_spy:
-        delta_engine.calculate_rebalance_delta(population=population)
+    figs = reporter.get_plotly_figures()
+    traces_by_name = {t.name: t for t in figs["cvar_boxplot"].data}
+    assert len(traces_by_name["MeanRiskNet"].y) == len(selected_net.portfolios)
 
-    evaluated = portfolio_spy.call_args_list[0].kwargs["X"]
-    assert len(evaluated) == len(population[0].returns_df)
-    assert len(evaluated) < len(universe.returns)
+    current_weights = {"SPY": 0.70, "TLT": 0.10, "GLD": 0.10, "QQQ": 0.10}
+    target_weights = result.live_weights["MeanRiskNet"]
+    delta_engine = PortfolioDeltaEngine(
+        universe, current_weights=current_weights, target_weights=target_weights
+    )
+    # 1. Fee-bearing strategy built with ConstraintBuilder matches selected_net directly (no double fee)
+    delta_net = delta_engine.calculate_rebalance_delta(
+        population=population, strategy_tag="MeanRiskNet"
+    )
+    assert delta_net["rebalance"]["sharpe"] == pytest.approx(
+        float(selected_net.annualized_sharpe_ratio), rel=1e-9, abs=1e-9
+    )
+    assert delta_net["rebalance"]["cvar"] == pytest.approx(
+        float(selected_net.cvar), rel=1e-9, abs=1e-9
+    )
+    assert delta_net["rebalance"]["max_drawdown"] == pytest.approx(
+        float(selected_net.max_drawdown), rel=1e-9, abs=1e-9
+    )
+
+    # 2. Fee-free strategy built without ConstraintBuilder gets symmetric 50 bps/yr fee deduction
+    delta_gross = delta_engine.calculate_rebalance_delta(
+        population=population, strategy_tag="HRPGross"
+    )
+    assert delta_gross["rebalance"]["sharpe"] < float(
+        selected_gross.annualized_sharpe_ratio
+    )

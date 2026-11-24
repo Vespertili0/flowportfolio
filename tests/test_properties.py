@@ -111,6 +111,175 @@ def test_property_prior_view_scaling_and_bl_ep_consistency(
         ps_ineq.build_black_litterman_prior()
 
 
+def _fmt_number(val: float, style: str) -> str:
+    """Format a signed float across standard, leading-dot, and scientific styles."""
+    sign = "-" if val < 0 else ""
+    mag = abs(val)
+    if style == "leading_dot" and 0.0 < mag < 1.0:
+        return f"{sign}{f'{mag:.4f}'.lstrip('0')}"  # e.g. ".2500" or "-.0500"
+    if style == "scientific":
+        return f"{sign}{mag:.4e}"
+    return f"{sign}{mag:.6g}"
+
+
+class _PeriodicUniverse:
+    """Lightweight UniverseProtocol-compliant stub with configurable periodicity."""
+
+    def __init__(
+        self,
+        tickers: list[str],
+        metadata: dict[str, str],
+        fees: dict[str, float],
+        periods_per_year: int,
+    ) -> None:
+        self.tickers = tickers
+        self.metadata = metadata
+        self.fees = fees
+        self.returns = pd.DataFrame()
+        self.periods_per_year = periods_per_year
+
+
+@settings(max_examples=75, deadline=None)
+@given(
+    n_group=st.integers(min_value=2, max_value=6),
+    group_coef=st.floats(
+        min_value=0.05, max_value=0.95, allow_nan=False, allow_infinity=False
+    ),
+    spread=st.floats(
+        min_value=-0.30, max_value=0.30, allow_nan=False, allow_infinity=False
+    ).filter(lambda x: abs(x) >= 1e-3),
+    num_style=st.sampled_from(["standard", "leading_dot", "scientific"]),
+    spread_style=st.sampled_from(["standard", "leading_dot", "scientific"]),
+    post_multiply=st.booleans(),
+    tight_minus=st.booleans(),
+    periods_per_year=st.sampled_from([252, 52, 12]),
+)
+def test_property_prior_parser_grammar_invariance(
+    n_group: int,
+    group_coef: float,
+    spread: float,
+    num_style: str,
+    spread_style: str,
+    post_multiply: bool,
+    tight_minus: bool,
+    periods_per_year: int,
+) -> None:
+    """Any valid formatting of group coefficients, RHS spreads, periodicity,
+    and hyphenated/dotted equity tickers must compile to the exact same (A, b)
+    linear equations in both EntropyPooling and BlackLitterman.
+    """
+    group_tickers = [f"EQ{i}" for i in range(n_group)]
+    tickers = [*group_tickers, "BRK-B", "VAS.AX"]
+    metadata = {
+        **{t: "tech" for t in group_tickers},
+        "BRK-B": "value",
+        "VAS.AX": "intl",
+    }
+    fees = {t: 0.001 for t in tickers}
+    u: Universe | _PeriodicUniverse = (
+        Universe(tickers=tickers, metadata=metadata, fees=fees)
+        if periods_per_year == 252
+        else _PeriodicUniverse(
+            tickers=tickers,
+            metadata=metadata,
+            fees=fees,
+            periods_per_year=periods_per_year,
+        )
+    )
+
+    coef_str = _fmt_number(group_coef, num_style)
+    coef_val = float(coef_str)
+    spread_str = _fmt_number(spread, spread_style)
+    spread_val = float(spread_str)
+
+    grp_term = f"tech * {coef_str}" if post_multiply else f"{coef_str} * tech"
+    sep = "-" if tight_minus else " - "
+    view_str = f"{grp_term}{sep}BRK-B == {spread_str}"
+
+    ps = PriorSynthesiser(u)
+    ps.add_market_view(view_str, confidence=0.8, average_groups=True)
+
+    groups_arr = np.array([tickers, [metadata[t] for t in tickers]], dtype=object)
+    a_ep, b_ep, _, _ = equations_to_matrix(
+        groups=groups_arr,
+        equations=ps.build_entropy_prior().mean_views,
+        sum_to_one=False,
+    )
+    a_bl, b_bl, _, _ = equations_to_matrix(
+        groups=groups_arr,
+        equations=ps.build_black_litterman_prior().views,
+        sum_to_one=True,
+    )
+
+    expected_a = [coef_val / n_group] * n_group + [-1.0, 0.0]
+    expected_b = spread_val / float(periods_per_year)
+    np.testing.assert_allclose(a_ep[0], expected_a, rtol=1e-9, atol=1e-10)
+    np.testing.assert_allclose(a_bl[0], expected_a, rtol=1e-9, atol=1e-10)
+    np.testing.assert_allclose(b_ep[0], expected_b, rtol=1e-9, atol=1e-10)
+    np.testing.assert_allclose(b_bl[0], expected_b, rtol=1e-9, atol=1e-10)
+
+
+@settings(max_examples=50, deadline=None)
+@given(
+    rfr=st.floats(min_value=0.0, max_value=0.10, allow_nan=False, allow_infinity=False),
+    c1=st.floats(min_value=0.25, max_value=2.0, allow_nan=False, allow_infinity=False),
+    c2=st.floats(min_value=-2.0, max_value=2.0, allow_nan=False, allow_infinity=False),
+    target_ann=st.floats(
+        min_value=-0.20, max_value=0.30, allow_nan=False, allow_infinity=False
+    ),
+    use_empirical=st.booleans(),
+    periods_per_year=st.sampled_from([252, 52, 12]),
+)
+def test_property_bl_exact_total_return_recovery_across_rfr(
+    rfr: float,
+    c1: float,
+    c2: float,
+    target_ann: float,
+    use_empirical: bool,
+    periods_per_year: int,
+) -> None:
+    """For any risk_free_rate >= 0, periodicity, and linear equality view
+    c1 * SPY + c2 * TLT == target_ann, a 100%-confidence Black-Litterman
+    posterior must satisfy c1 * mu_SPY + c2 * mu_TLT == target_ann under
+    both EquilibriumMu and EmpiricalPrior.
+    """
+    rng = np.random.default_rng(7)
+    freq = {252: "B", 52: "W-FRI", 12: "BME"}[periods_per_year]
+    dates = pd.date_range("2025-01-02", periods=60, freq=freq)
+    rets = pd.DataFrame(
+        rng.normal(0.05 / periods_per_year, 0.005, size=(60, 3)),
+        index=dates,
+        columns=["SPY", "TLT", "GLD"],
+    )
+    u = Universe(
+        tickers=["SPY", "TLT", "GLD"],
+        metadata={"SPY": "eq", "TLT": "fi", "GLD": "alt"},
+        fees={"SPY": 0.0003, "TLT": 0.0015, "GLD": 0.0040},
+    )
+    u._returns = rets
+    u._periods_per_year = periods_per_year
+
+    c1_str = f"{c1:.6g}"
+    c2_mag_str = f"{abs(c2):.6g}"
+    target_str = f"{target_ann:.6g}"
+    c1_val = float(c1_str)
+    c2_val = -float(c2_mag_str) if c2 < 0 else float(c2_mag_str)
+    target_val = float(target_str)
+
+    sign = "-" if c2 < 0 else "+"
+    view = f"{c1_str} * SPY {sign} {c2_mag_str} * TLT == {target_str}"
+
+    ps = PriorSynthesiser(u)
+    ps.add_market_view(view, confidence=1.0)
+    prior_est = ps.build_empirical_prior() if use_empirical else None
+    bl = ps.build_black_litterman_prior(prior_estimator=prior_est, risk_free_rate=rfr)
+    bl.fit(rets)
+
+    mu_ann = bl.return_distribution_.mu * float(periods_per_year)
+    realized = c1_val * float(mu_ann[0]) + c2_val * float(mu_ann[1])
+    assert realized == pytest.approx(target_val, abs=1e-6)
+
+
 # ---------------------------------------------------------------------------
 # 2. PortfolioDeltaEngine & ConstraintBuilder Algebraic Invariants
 # ---------------------------------------------------------------------------
@@ -220,30 +389,109 @@ def test_property_delta_engine_zero_sum_drift_and_friction_identities(
     limit=st.floats(
         min_value=0.01, max_value=1.0, allow_nan=False, allow_infinity=False
     ),
+    periods_per_year=st.sampled_from([1, 4, 12, 52, 252]),
+    holding_period=st.floats(
+        min_value=1.0, max_value=252.0, allow_nan=False, allow_infinity=False
+    ),
+    raw_tx_cost=st.floats(
+        min_value=0.0, max_value=0.05, allow_nan=False, allow_infinity=False
+    ),
 )
-def test_property_constraint_builder_turnover_and_daily_fee_conversion(
-    base_weights: list[float], limit: float
+def test_property_constraint_builder_turnover_and_period_cost_scaling(
+    base_weights: list[float],
+    limit: float,
+    periods_per_year: int,
+    holding_period: float,
+    raw_tx_cost: float,
 ) -> None:
-    """Verify ConstraintBuilder.max_turnover and build() preserve simplex
-    previous_weights and convert annual decimal TER fees to daily frequency (/ 252).
+    """Verify ConstraintBuilder preserves simplex previous_weights, scales annual
+    TER fees by universe.periods_per_year, and amortizes transaction_costs by
+    holding_period.
     """
     tickers = ["A", "B", "C"]
     fees = {"A": 0.00252, "B": 0.00504, "C": 0.0}
-    u = Universe(
-        tickers=tickers,
-        metadata={"A": "g", "B": "g", "C": "g"},
-        fees=fees,
-    )
+
+    class _FreqUniverse:
+        @property
+        def tickers(self) -> list[str]:
+            return list(tickers)
+
+        @property
+        def metadata(self) -> dict[str, str]:
+            return {"A": "g", "B": "g", "C": "g"}
+
+        @property
+        def fees(self) -> dict[str, float]:
+            return dict(fees)
+
+        @property
+        def periods_per_year(self) -> int:
+            return periods_per_year
+
     weights_dict = dict(zip(tickers, base_weights))
 
-    spec = ConstraintBuilder(u).max_turnover(limit, weights_dict).build()
+    spec = (
+        ConstraintBuilder(_FreqUniverse(), holding_period=holding_period)  # type: ignore[arg-type]
+        .max_turnover(limit, weights_dict)
+        .transaction_costs(raw_tx_cost)
+        .build()
+    )
     assert spec.previous_weights is not None
     assert np.isclose(sum(spec.previous_weights.values()), 1.0, atol=1e-12)
     assert all(0.0 <= v <= 1.0 for v in spec.previous_weights.values())
     assert spec.max_turnover == limit
     assert spec.management_fees is not None
     for t in tickers:
-        assert np.isclose(spec.management_fees[t], fees[t] / 252.0, atol=1e-15)
+        assert np.isclose(
+            spec.management_fees[t],
+            fees[t] / float(periods_per_year),
+            rtol=0,
+            atol=1e-15,
+        )
+    assert isinstance(spec.transaction_costs, float)
+    assert np.isclose(
+        spec.transaction_costs, raw_tx_cost / holding_period, rtol=0, atol=1e-15
+    )
+
+
+@settings(max_examples=40, deadline=None)
+@given(
+    base_weights=simplex_weights_strategy(3),
+    drift=st.floats(
+        min_value=2e-6, max_value=0.05, allow_nan=False, allow_infinity=False
+    ),
+    sign=st.sampled_from([-1.0, 1.0]),
+)
+def test_property_constraint_builder_rejects_simplex_drift_beyond_1e6(
+    base_weights: list[float], drift: float, sign: float
+) -> None:
+    """Verify ConstraintBuilder.max_turnover rejects any weight vector whose sum
+    drifts from 1.0 by more than 1e-6 (matching PortfolioDeltaEngine).
+    """
+    tickers = ["A", "B", "C"]
+    u = Universe(
+        tickers=tickers,
+        metadata={"A": "g", "B": "g", "C": "g"},
+        fees={"A": 0.0, "B": 0.0, "C": 0.0},
+    )
+    perturbed = list(base_weights)
+    # Apply drift to a component that stays strictly inside [0.0, 1.0]
+    applied = False
+    for idx, w in enumerate(perturbed):
+        candidate = w + sign * drift
+        if 0.0 <= candidate <= 1.0:
+            perturbed[idx] = candidate
+            applied = True
+            break
+    if not applied:
+        return
+
+    weights_dict = dict(zip(tickers, perturbed))
+    if abs(sum(weights_dict.values()) - 1.0) <= 1e-6:
+        return
+
+    with pytest.raises(ValueError, match="1e-6"):
+        ConstraintBuilder(u).max_turnover(0.1, weights_dict)
 
 
 # ---------------------------------------------------------------------------
@@ -480,7 +728,7 @@ def test_property_delta_engine_flat_brokerage_accounting(
         assert np.isclose(float(row["gross_weight_traded"]), gross_w, atol=1e-12)
         flat_w = (
             (brokerage_flat / portfolio_value)
-            if (brokerage_flat > 0.0 and gross_w > 1e-12)
+            if (brokerage_flat > 0.0 and gross_w > 1e-6)
             else 0.0
         )
         expected_tc = gross_w * (brokerage_bps + slippage_bps) / 10_000.0 + flat_w
@@ -489,4 +737,40 @@ def test_property_delta_engine_flat_brokerage_accounting(
 
     assert np.isclose(
         float(total_row["transaction_cost"]), total_expected_tc, atol=1e-12
+    )
+
+
+@settings(max_examples=40, deadline=None)
+@given(
+    dust=st.floats(
+        min_value=1e-11, max_value=9e-7, allow_nan=False, allow_infinity=False
+    ),
+    brokerage_flat=st.floats(
+        min_value=1.0, max_value=50.0, allow_nan=False, allow_infinity=False
+    ),
+    portfolio_value=st.floats(
+        min_value=5_000.0, max_value=1_000_000.0, allow_nan=False, allow_infinity=False
+    ),
+)
+def test_property_delta_engine_flat_brokerage_ignores_sub_1e6_dust(
+    dust: float, brokerage_flat: float, portfolio_value: float
+) -> None:
+    """F-11: Sub-1e-6 solver dust never incurs flat brokerage tickets."""
+    tickers = ["X", "Y"]
+    u = Universe(
+        tickers=tickers, metadata={"X": "g", "Y": "g"}, fees={"X": 0.0, "Y": 0.0}
+    )
+    engine = PortfolioDeltaEngine(
+        universe=u,
+        current_weights={"X": 0.5, "Y": 0.5},
+        target_weights={"X": 0.5 + dust, "Y": 0.5 - dust},
+    )
+    fric_df = engine.calculate_net_friction(
+        brokerage_bps=0.0,
+        slippage_bps=0.0,
+        brokerage_flat=brokerage_flat,
+        portfolio_value=portfolio_value,
+    )
+    assert (
+        float(fric_df[fric_df["ticker"] == "TOTAL"]["transaction_cost"].iloc[0]) == 0.0
     )
